@@ -18,7 +18,7 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | --- | --- | --- |
 | `0x01` | `hello` | the token, as text. Must be first; anything else, or a wrong token, closes the connection |
 | `0x02` | `launch` | JSON `{cmd, name, w, h, fps, virtual_display, fresh}`: the app's path (Windows: a `.exe`, `.lnk` or `.url`; Linux: a program), its window size, the capture rate, whether it gets a display of its own; `fresh` starts it again even when it runs |
-| `0x03` | `video` | JSON `{gen, w, h, fps, kbps, yuv444}`: start a video, replacing any running |
+| `0x03` | `video` | JSON `{gen, w, h, fps, kbps, yuv444, draw_cursor}`: start a video, replacing any running. `draw_cursor` draws the pointer into the frames; without it the pointer's shape comes as `cursor` messages |
 | `0x04` | `stop_video` | none |
 | `0x05` | `idr` | none: the next frame is a keyframe |
 | `0x06` | `input` | one input packet (below); ignored while no video runs |
@@ -36,6 +36,7 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | `0x88` | `pong` | `u32` |
 | `0x90` | `config` | `[pad][u16 gen][u16 w][u16 h]` then the avcC record |
 | `0x91` | `frame` | `[u8 key][u16 gen][pad 4]` then the frame as AVCC |
+| `0x92` | `cursor` | `[u8 visible][u16 hot x][u16 hot y][u16 w][u16 h]` then the pointer's shape as a PNG (straight-alpha RGBA), nothing when hidden |
 
 ## Input
 
@@ -61,9 +62,17 @@ With `virtual_display` the app gets a display of its own at `w` by `h`: on Windo
 
 Each `video` carries a `gen` (16 bits, wrapping). `config`, `frame` and `video_ended` carry the gen of the video they belong to, and the driver drops any whose gen isn't the latest it asked for, so frames of a video already replaced never reach a decoder.
 
+## The pointer
+
+Without `draw_cursor` the host never draws its pointer into a frame. Its shape goes out as a `cursor` message at the start of each video and whenever it changes, for the viewer to show as its own pointer (a CSS cursor, say): a move costs no frame and is seen with no latency. What the host's pointer hovers still changes in the frames. A shape that inverts the screen under it, which a PNG can't say, comes black. With `draw_cursor` the shape is drawn in where the pointer is, and every move is a frame.
+
 ## Frames
 
-A `frame` message's first 8 bytes, counting its type byte, are the room `FrameRoom` names: a driver overwrites them with its own header and sends the message on as it is. What follows is AVCC (each NAL unit behind a 4-byte big-endian length), what WebCodecs' `VideoDecoder` takes with the `config` message's avcC as its description. afterglow reshapes each encoded frame from Annex B once, writing it straight into this layout; the driver copies it once, out of the socket's bytes.
+A `frame` message's first 8 bytes, counting its type byte, are the room `FrameRoom` names: a driver overwrites them with its own header and sends the message on as it is. What follows is AVCC (each NAL unit behind a 4-byte big-endian length), what WebCodecs' `VideoDecoder` takes with the `config` message's avcC as its description. afterglow writes each encoded frame straight into this layout once; the driver copies it once, out of the socket's bytes.
+
+The avcC's SPS always carries VUI `bitstream_restriction` with `max_num_reorder_frames = 0` (afterglow rewrites what the encoder made, the rest of it bit for bit). Without it a decoder infers a reorder depth from the DPB's size and holds decoded pictures back: Chromium's own decoder held two, hardware decoders hold up to sixteen. With it each frame is shown the moment it's decoded. No stream afterglow makes has B-frames, so the restriction is true.
+
+A frame is made when the screen changes, within the video's rate (the first change after a quiet spell at once), and again once a second when nothing does. `idr` and `stop_video` take effect at once, not at the next frame.
 
 ## Security
 

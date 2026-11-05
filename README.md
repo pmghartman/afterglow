@@ -39,13 +39,20 @@ One TCP connection on `127.0.0.1`: length-prefixed messages, a token said first,
 
 - **To the first frame:** one `launch`, one `video`. No pairing, TLS, RTSP or session setup.
 - **Each frame:** the encoder's output reshaped once into AVCC, the form WebCodecs' `VideoDecoder` takes, behind 8 bytes of room. One socket write on the host, one copy on the client, and the driver overwrites the room with its own header and forwards it as it is. No packetization, FEC or reassembly.
-- **When frames are made:** a frame is captured and encoded when the screen changes (DXGI's frame updates on Windows, XDamage on Linux), within the video's rate, and again once a second when nothing does. A keyframe is a message, not a restart.
+- **When frames are made:** a frame is captured and encoded when the screen changes (DXGI's frame updates on Windows, XDamage on Linux), within the video's rate, and again once a second when nothing does. On Linux only what changed is read and converted, straight out of the app's X framebuffer. A keyframe is a message, not a restart.
+- **The pointer:** its shape goes to the viewer as a PNG when it changes, to show as the viewer's own pointer: moving it costs no frame and lags not at all. Or, asked, it's drawn into the frames.
+- **Decoding:** every SPS says nothing is reordered, so a decoder shows each frame as it arrives instead of holding pictures back.
 - **Input:** small binary events on the same socket, injected as they arrive.
 - **Displays:** each app gets a display at the viewer's window size, so a machine with no monitor streams. The display follows the viewer through resizes, and the app keeps running between videos and viewers.
 
-Measured on Linux (Xvfb, xterm, OpenH264 at 30 fps, `bun run test:e2e`):
-- open to first frame: 90 ms, including starting the app's Xvfb;
-- a key typed to the frame showing it: 9 to 26 ms.
+Measured on Linux (Xvfb, xterm, OpenH264, 120 fps at 20 Mb/s as Phosphorus asks; `bun run bench`, p50):
+
+| | 1280x720 | 1920x1080 |
+| --- | --- | --- |
+| a key typed to the frame echoing it, at the driver | 3.6 ms | 5.8 ms |
+| a key that changes every pixel, to its frame | 7.6 ms | 13.0 ms |
+| a key typed to its frame decoded in Chromium, through Phosphorus's session | 7.7 ms | 12.0 ms |
+| open to first frame | 25 to 35 ms | 45 to 55 ms |
 
 Windows hasn't been measured on GPU hardware yet.
 
@@ -96,6 +103,8 @@ Input goes in as small arrays and leaves as afterglow's input packets ([`src/aft
 | `["k", down, code, key, chord]` | a key by its `KeyboardEvent.code` and `.key`; sent as text where the viewer's layout differs from US |
 | `["x", text]` | text typed |
 | `["clip", text]` | the viewer's clipboard: the next Ctrl+V types it |
+
+The pointer's shape comes as `sink.meta({ t: "cursor", png, x, y })` (base64 PNG, hotspot), or `{ t: "cursor", name: "none" }` when hidden, for the page to set as its CSS cursor. `drawCursor: true` has the host draw it into the frames instead (`{ t: "cursor", name: "blank" }` then hides the page's).
 
 `@phosphorus/afterglow/testing` exports `FakeAfterglow`, the link's server end on a real loopback socket, for testing a driver without a host.
 
@@ -149,15 +158,20 @@ bun run check && bun run lint && bun test
 bun run test:host && bun run test:e2e
 ```
 
+```bash
+bun run bench
+```
+
 - `bun test` runs the client's tests anywhere: the input packets and key mapping, the link's framing, `AfterglowSource` against `FakeAfterglow`, and the installer's files.
 - `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, and capture's colour conversion.
 - `test:e2e` builds the host and runs it for real (needs `Xvfb`, `xterm` and `ffmpeg`). `AfterglowSource` launches xterm on an Xvfb of the host's own and checks that:
   - it fills the display, and ffmpeg decodes the stream;
-  - a typed command runs, and the pointer is drawn where it moved;
+  - a typed command runs; the pointer's shape comes as a PNG and is never in the frames;
   - after a resize the display follows;
   - quit closes it.
 
-  Then it runs xterm on the session's own display.
+  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display.
+- `bench` builds the host and times input to frame: a key echoed and a key that flips the whole screen, at 720p and 1080p, and open to first frame.
 
 The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the archive lays it out:
 
