@@ -3,35 +3,44 @@
 //! the compiler vectorises, built twice, for AVX2 and for any x86-64, and picked once
 //! at run time.
 
-/// an I420 picture, kept and updated in place
+/// an I420 picture, kept and updated in place: w×h of it is the picture, in planes
+/// pw×ph (an encoder's whole macroblocks; black past the picture, and never drawn in)
 pub struct Yuv {
     pub w: usize,
     pub h: usize,
+    pub pw: usize,
+    pub ph: usize,
     pub buf: Vec<u8>,
 }
 
 impl Yuv {
+    #[cfg(test)]
     pub fn new(w: usize, h: usize) -> Yuv {
-        let mut y = Yuv { w, h, buf: vec![0; w * h * 3 / 2] };
+        Yuv::padded(w, h, w, h)
+    }
+
+    pub fn padded(w: usize, h: usize, pw: usize, ph: usize) -> Yuv {
+        let (pw, ph) = (pw.max(w), ph.max(h));
+        let mut y = Yuv { w, h, pw, ph, buf: vec![0; pw * ph * 3 / 2] };
         y.black();
         y
     }
 
     pub fn black(&mut self) {
-        let n = self.w * self.h;
+        let n = self.pw * self.ph;
         self.buf[..n].fill(16);
         self.buf[n..].fill(128);
     }
 
     pub fn planes(&self) -> [&[u8]; 3] {
-        let n = self.w * self.h;
+        let n = self.pw * self.ph;
         let (y, uv) = self.buf.split_at(n);
         let (u, v) = uv.split_at(n / 4);
         [y, u, v]
     }
 
     pub fn strides(&self) -> [usize; 3] {
-        [self.w, self.w / 2, self.w / 2]
+        [self.pw, self.pw / 2, self.pw / 2]
     }
 
     /// a rect of BGRX pixels (row pitch `pitch` bytes), w and h even, drawn at (x, y),
@@ -42,7 +51,7 @@ impl Yuv {
         if w == 0 || h == 0 {
             return;
         }
-        let (fw, n) = (self.w, self.w * self.h);
+        let (fw, n) = (self.pw, self.pw * self.ph);
         let cw = fw / 2;
         let (ys, uv) = self.buf.split_at_mut(n);
         let (us, vs) = uv.split_at_mut(n / 4);
@@ -233,7 +242,9 @@ pub fn scaled(px: &[u8], pitch: usize, sw: usize, sh: usize, out: &mut Yuv) {
     let xs: Vec<usize> = (0..fw).map(|x| (x * sw / fw).min(sw - 1) * 4).collect();
     let mut r0 = vec![0u8; fw * 4];
     let mut r1 = vec![0u8; fw * 4];
-    let n = w * h;
+    // rows of the planes as allocated
+    let w = out.pw;
+    let n = w * out.ph;
     let (ys, uv) = out.buf.split_at_mut(n);
     let (us, vs) = uv.split_at_mut(n / 4);
     let f = kernel();

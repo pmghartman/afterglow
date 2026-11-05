@@ -4,6 +4,7 @@
 
 pub mod log;
 
+pub mod avc;
 pub mod conf;
 pub mod h264;
 pub mod host;
