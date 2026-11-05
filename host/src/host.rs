@@ -6,6 +6,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::input::Inject;
 
+/// the account to sign in at the console when no one is, kept out of every log
+#[derive(Clone)]
+pub struct Login {
+    pub user: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Login({})", self.user)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Launch {
     /// the app's path or shortcut
@@ -25,6 +38,8 @@ pub struct Launch {
     /// Linux: a session bus of the app's own, so a single-instance app starts here
     /// rather than handing its window to a copy on the host's own screen
     pub dbus: bool,
+    /// Windows: signed in at the logon screen first when no one is signed in
+    pub login: Option<Login>,
 }
 
 #[derive(Debug)]

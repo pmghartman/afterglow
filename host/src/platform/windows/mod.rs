@@ -397,6 +397,9 @@ impl Host for Windows {
         let Some(cmd) = crate::wire::launcher_cmd(&l.cmd) else {
             return Err(LaunchError::new("not an app this host can start"));
         };
+        if let Some(login) = &l.login {
+            process::sign_in(login).map_err(LaunchError::new)?;
+        }
         self.terminate();
         let vname = if l.virtual_display { self.add_display(l) } else { None };
         if display::find(vname.as_deref()).is_none() {

@@ -23,7 +23,7 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | Type | Name | Body |
 | --- | --- | --- |
 | `0x01` | `hello` | the token, as text. Must be first; anything else, or a wrong token, closes the connection |
-| `0x02` | `launch` | JSON `{cmd, argv, name, w, h, fps, dpi, scale, dbus, virtual_display, fresh}`: the app's path (Windows: a `.exe`, `.lnk` or `.url`; Linux: a program), or on Linux `argv`, the program and its arguments; its window size, the capture rate, the display's dpi and the viewer's pixel ratio (1.5 and up: GTK and Qt told to scale), on Linux `dbus` for a session bus of its own; whether it gets a display of its own; `fresh` starts it again even when it runs |
+| `0x02` | `launch` | JSON `{cmd, argv, name, w, h, fps, dpi, scale, dbus, virtual_display, fresh}`: the app's path (Windows: a `.exe`, `.lnk` or `.url`; Linux: a program), or on Linux `argv`, the program and its arguments; its window size, the capture rate, the display's dpi and the viewer's pixel ratio (1.5 and up: GTK and Qt told to scale), on Linux `dbus` for a session bus of its own; whether it gets a display of its own; `fresh` starts it again even when it runs; on Windows `login` `{user, password}` signs in at the logon screen first when no one is signed in: the password typed once for the account the screen offers (`user` is for the log) and the launch waits up to a minute for the session. Never logged |
 | `0x03` | `video` | JSON `{gen, w, h, fps, kbps, yuv444, draw_cursor}`: start a video, replacing any running. `draw_cursor` draws the pointer into the frames; without it the pointer's shape comes as `cursor` messages |
 | `0x04` | `stop_video` | none |
 | `0x05` | `idr` | none: the next frame is a keyframe |
