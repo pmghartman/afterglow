@@ -1,54 +1,51 @@
 # afterglow host
 
-A fork of [Apollo](https://github.com/ClassicOldSong/Apollo) (itself a fork of LizardByte's [Sunshine](https://github.com/LizardByte/Sunshine)), forked at Apollo `adc5c5a0bd80831ce495434bb16aee2cd4175fb8`, cut to its Windows build: no web UI, Linux, macOS, docs or packaging.
+The streaming host, in Rust: one app at a time launched, its display captured and encoded as H.264, the viewer's input injected, all driven over one loopback link ([`docs/protocol.md`](../docs/protocol.md)). Ported from [Apollo](https://github.com/ClassicOldSong/Apollo) (itself a fork of LizardByte's [Sunshine](https://github.com/LizardByte/Sunshine)), keeping only what the link uses: no GameStream servers, web UI, tray, audio, gamepads, touch or pen.
 
-Apollo's capture (DXGI desktop duplication, Windows.Graphics.Capture), its encoders (NVENC, AMF, Quick Sync, x264), its input and its SudoVDA virtual display are kept as they are. What sat between them and a client is gone: a driver talks to afterglow over one loopback link ([`src/phos_link.cpp`](src/phos_link.cpp), framing in [`src/phos_wire.h`](src/phos_wire.h), described in [`docs/protocol.md`](../docs/protocol.md)) instead of GameStream.
+## Layout
 
-## What changed from Apollo
+| Path | What it is |
+| --- | --- |
+| `src/wire.rs` | the link's framing and the Annex B to AVCC reshaping, no platform code |
+| `src/link.rs` | the link: the token, one driver at a time, launch, videos and their generations, input, the app's exit |
+| `src/input.rs` | GameStream input packets into events; held keys repeated, everything let go when a video stops |
+| `src/conf.rs` | `afterglow.conf` (`key = value`); unknown keys ignored, so a config written for the C++ host works |
+| `src/host.rs` | what the link asks of a platform |
+| `src/platform/windows/` | DXGI desktop duplication with the pointer drawn in (`capture.rs`), the D3D11 video processor and Media Foundation's H.264 encoder (`encode.rs`), SendInput (`input.rs`), the app in a job in the console user's session (`process.rs`), SudoVDA (`vdisplay.rs`), display modes and the primary display (`display.rs`), and the service (`svc.rs`) |
+| `src/platform/x11.rs` | the same on an X server: GetImage and XFixes, OpenH264, XTest. What the end-to-end test runs |
+| `tests/link.rs` | the link on a real socket against a stand-in platform |
 
-- `src/phos_link.cpp`, `src/phos_link.h`, `src/phos_wire.h`: the link. With `phos_link_port` set, `afterglow.exe` starts none of nvhttp, confighttp, RTSP, mDNS, UPnP or the tray, and captures no audio.
-- Each encoded frame is reshaped once from Annex B into AVCC with 8 bytes of room in front and written to one socket. Input comes back as GameStream input packets, straight into `input::passthrough`. A keyframe is a message.
-- Each video carries a generation, so frames of a replaced one are dropped.
-- Apollo's service wrapper is `afterglowsvc.exe`, which starts `afterglow.exe` with the config named on its command line.
-- AMF's H.264 profile is fixed at high (Apollo's `config_t` has no profile field).
-- The CMake targets keep Apollo's names (`sunshine`, `sunshinesvc`); their outputs are `afterglow.exe` and `afterglowsvc.exe`.
+## On Windows
 
-## Config
+`afterglow.exe <afterglow.conf>` serves the link on `127.0.0.1:<phos_link_port>`. As a service, `tools\afterglowsvc.exe "<afterglow.conf>"` runs as SYSTEM and keeps `afterglow.exe` running as SYSTEM in the session at the console, restarting it when it exits or the console moves; stopping the service asks it to stop (Ctrl-C), so the app is closed and its display removed.
 
-`afterglow.exe <afterglow.conf>` reads Apollo's config format. The keys that matter here, as [`confText`](../src/afterglow/config.ts) writes them:
+An app is started as the console's signed-in user (a limited token for an admin under UAC), in a job so everything it starts is followed. With SudoVDA installed and `virtual_display` asked for, it gets a display of its own at the viewer's size, made primary with `dd_configuration_option = ensure_primary`; a machine with no monitor streams. The display follows each video's size and is removed with the app.
+
+Capture runs on whichever desktop has the input, so UAC prompts and the lock screen are streamed. Frames go through the GPU's video processor (BGRA to NV12, scaled and letterboxed, BT.709 limited range) into the encoder Media Foundation lists for that GPU (NVENC, AMF or Quick Sync register one) in low latency mode, CBR at the asked bitrate; with no hardware encoder, or `encoder = software`, Windows' own. H.264 4:4:4 isn't offered, so `yuv444` gets 4:2:0.
 
 | Key | Value |
 | --- | --- |
-| `phos_link_port` | the link's port on `127.0.0.1` (47100) |
-| `phos_link_token` | the token a driver says first, 16 characters or more |
-| `file_apps` | an empty `apps.json`: the driver names each app as it launches it |
-| `dd_configuration_option` | `ensure_primary`: an app's virtual display is the primary display while it streams |
-| `sw_preset`, `nvenc_preset`, `qsv_preset`, `amd_usage` | each encoder's lowest-latency preset |
+| `phos_link_port` | the link's port on `127.0.0.1` |
+| `phos_link_token` | what a driver says first, 16 characters or more |
+| `log_path` | the log file, truncated each start |
+| `min_log_level` | `debug`, `info`, `warning` or `error` |
+| `dd_configuration_option` | `ensure_primary`: an app's virtual display is the primary one while it streams |
+| `adapter_name` | the GPU SudoVDA renders on, by name |
+| `encoder` | `software`: skip hardware encoders |
 
-## On a machine
-
-Apps launch in the session signed in at the console. With SudoVDA installed, each gets a virtual display at the viewer's window size, so a machine with no monitor streams. The service runs as SYSTEM; keep the config and token readable by SYSTEM and Administrators only.
+The service runs as SYSTEM; keep the config and token readable by SYSTEM and Administrators only.
 
 ## Building
 
-Windows only, in MSYS2 UCRT64. The `windows` job in [`.github/workflows/release.yml`](../.github/workflows/release.yml) lists the packages, then:
-
 ```bash
-git submodule update --init --recursive
+cargo test
+cargo build --release
 ```
 
-```bash
-host/scripts/build.sh "$PWD/afterglow-out" 0.0.0
-```
+On Windows that's the host; from Linux, `--target x86_64-pc-windows-gnu` cross-builds it with mingw-w64 installed, and wine runs its tests (`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine`). On Linux it's the X11 backend: `DISPLAY` names the X server to capture.
 
-The submodules under `third-party/` are Apollo's pins. SudoVDA's signed driver DLL and `nefconc.exe` aren't in Apollo's tree; the workflow takes the driver package from Apollo's release installer and checks it against its signed catalog.
-
-`test/wire_test.cpp` needs no Windows or Apollo headers and builds anywhere:
-
-```bash
-bun run test:wire
-```
+`scripts/stage.sh OUT_DIR VERSION [TARGET]` tests, builds and stages a release as the zip lays it out. The SudoVDA driver package isn't built here: the release workflow takes it from Apollo's installer and checks it against its signed catalog.
 
 ## Licence
 
-GPL-3.0-only, as Apollo and Sunshine ([`LICENSE`](LICENSE), [`NOTICE`](NOTICE)). Each build's `SOURCE.txt` names the repository and commit it was built from. The TypeScript client in the rest of this repo is Apache-2.0 and contains none of this code.
+GPL-3.0-only ([`LICENSE`](LICENSE), [`NOTICE`](NOTICE)), as Apollo and Sunshine. Each build's `SOURCE.txt` names the repository and commit it was built from. The TypeScript client in the rest of this repo is Apache-2.0 and contains none of this code.

@@ -1,6 +1,6 @@
 // @phosphorus/afterglow: streaming a Windows host's apps to a viewer. Two sources, one
 // contract (source.ts):
-//   AfterglowSource drives afterglow (host/), the fork of Apollo, over one loopback link
+//   AfterglowSource drives afterglow (host/), the Rust host, over one loopback link
 //   GlowSource drives a host's own Sunshine or Apollo over GameStream (glow/)
 // Each hands back H.264 as AVCC with room for the driver's header in front
 

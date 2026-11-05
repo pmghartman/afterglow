@@ -1,10 +1,11 @@
 # manual release, as phosphorus's, and the repo's only workflow: vVERSION, one past the
 # highest vMAJOR.MINOR tag (minor, or major with .0). The client's checks and tests, the
-# host built on Windows, then a GitHub release with
-# afterglow-VERSION-windows-x86_64.zip, its SHA256SUMS and a build provenance
-# attestation. "Build only" stops before publishing: a way to try the Windows build.
-# The SudoVDA driver isn't in Apollo's tree: its signed package and nefconc.exe come out
-# of Apollo's release installer at APOLLO_TAG, checked against the driver's catalog
+# Rust host's tests and its end-to-end run on an X server, the host built and smoke-run
+# on Windows, then a GitHub release with afterglow-VERSION-windows-x86_64.zip, its
+# SHA256SUMS and a build provenance attestation. "Build only" stops before publishing:
+# a way to try the Windows build. The SudoVDA driver isn't built here: its signed
+# package and nefconc.exe come out of Apollo's release installer at APOLLO_TAG, checked
+# against the driver's catalog
 name: release
 
 on:
@@ -62,11 +63,12 @@ jobs:
           echo "ver=$V" | tee -a "$GITHUB_OUTPUT"
           echo "ref=$REF" | tee -a "$GITHUB_OUTPUT"
 
-  # the client typed, formatted and tested, the host's link framing built and run
+  # the client typed, formatted and tested; the host linted and tested, then run for
+  # real on Xvfb and driven by the client: xterm launched, streamed, typed into, quit
   check:
     needs: version
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -76,44 +78,40 @@ jobs:
       - run: bun run check
       - run: bun run lint
       - run: bun test
-      - run: bun run test:wire
+      - name: tools for the host's end-to-end run
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm ffmpeg nasm
+      - run: rustup toolchain install stable --profile minimal -c clippy,rustfmt && rustup default stable
+      - run: cargo fmt --manifest-path host/Cargo.toml --check
+      - run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets -- -D warnings
+      - run: bun run test:host
+      - run: bun run test:e2e
 
-  # the host, built on Windows in MSYS2 UCRT64
+  # the host, built and tested on Windows, then run as a plain process and driven over
+  # its link: notepad launched, a video's config and first frame. The runner has no GPU
+  # and no SudoVDA, so that's Microsoft's basic display and software encoder; a runner
+  # without Media Foundation or a desktop to duplicate fails it, which doesn't stop the build
   windows:
     needs: version
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 45
     defaults:
       run:
-        shell: msys2 {0}
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.version.outputs.ref }}
-          submodules: recursive
           fetch-depth: 1
-      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            git
-            mingw-w64-ucrt-x86_64-boost
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-cppwinrt
-            mingw-w64-ucrt-x86_64-curl-winssl
-            mingw-w64-ucrt-x86_64-MinHook
-            mingw-w64-ucrt-x86_64-miniupnpc
-            mingw-w64-ucrt-x86_64-nlohmann_json
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-onevpl
-            mingw-w64-ucrt-x86_64-openssl
-            mingw-w64-ucrt-x86_64-opus
-            mingw-w64-ucrt-x86_64-toolchain
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: rustup toolchain install stable --profile minimal -c clippy && rustup default stable
+      - run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets -- -D warnings
       - name: build
         env:
           VER: ${{ needs.version.outputs.ver }}
-        run: host/scripts/build.sh "$PWD/afterglow-out" "$VER"
+        run: bash host/scripts/stage.sh "$PWD/afterglow-out" "$VER"
+      - name: smoke run
+        continue-on-error: true
+        run: bun test/e2e/windows-smoke.ts afterglow-out
       # the driver package and its installer tool, out of Apollo's release
       - name: virtual display driver
         shell: pwsh

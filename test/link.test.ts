@@ -1,4 +1,4 @@
-// afterglow's local link: the framing against the layout host/src/phos_wire.h writes,
+// afterglow's local link: the framing against the layout host/src/wire.rs writes,
 // and AfterglowSource driven directly against a stand-in afterglow on a real loopback
 // socket: the token said first, the app launched, frames handed on with their room in
 // front, an earlier video's frames dropped, a keyframe asked for without a restart,

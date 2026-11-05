@@ -1,3 +1,6 @@
-©2018 Valve Corporation. Steam and the Steam logo are trademarks and/or
-registered trademarks of Valve Corporation in the U.S. and/or other countries. All
-rights reserved.
+afterglow's host is written in Rust for this repository. It follows the behaviour of
+Apollo (https://github.com/ClassicOldSong/Apollo), itself a fork of LizardByte's
+Sunshine (https://github.com/LizardByte/Sunshine), from which it was ported, and keeps
+parts of them: the virtual-key to scan-code table (src/platform/windows/input.rs) and
+SudoVDA's driver interface (src/platform/windows/vdisplay.rs). Apollo and Sunshine are
+GPL-3.0; so is this host (LICENSE).

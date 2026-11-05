@@ -1,8 +1,8 @@
 # The afterglow link
 
-One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to afterglow (`host/src/phos_link.cpp`). The framing is `host/src/phos_wire.h`, tested on its own by `host/test/wire_test.cpp`.
+One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to afterglow (`host/src/link.rs`). The framing is `host/src/wire.rs`, tested with it; `host/tests/link.rs` serves the link on a real socket.
 
-afterglow serves the link when its config sets `phos_link_port` and `phos_link_token`, and then starts none of GameStream's servers (nvhttp, the web UI, RTSP, mDNS, UPnP) and captures no audio.
+afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token. It serves nothing else and captures no audio.
 
 ## Framing
 
@@ -21,7 +21,7 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | `0x03` | `video` | JSON `{gen, w, h, fps, kbps, yuv444}`: start a video, replacing any running |
 | `0x04` | `stop_video` | none |
 | `0x05` | `idr` | none: the next frame is a keyframe |
-| `0x06` | `input` | one GameStream input packet, handed to Apollo's `input::passthrough` as it is |
+| `0x06` | `input` | one GameStream input packet (`host/src/input.rs`): mouse moves, buttons, wheels, keys as US-layout virtual keys, UTF-8 text; ignored while no video runs |
 | `0x07` | `quit` | none: ask the app to close |
 | `0x08` | `ping` | `u32`, echoed in `pong` |
 

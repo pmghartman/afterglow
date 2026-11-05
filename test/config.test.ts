@@ -1,6 +1,5 @@
-// afterglow's files as a host app writes them: the config with the link on and
-// GameStream's servers off, the token kept across starts, the driver's version, the
-// link file read back
+// afterglow's files as a host app writes them: the config with the link on, the
+// token kept across starts, the driver's version, the link file read back
 
 import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -18,7 +17,7 @@ import {
   tokenOf,
 } from "../src/index.ts";
 
-test("the config: the link on, GameStream off, the encoders' fastest presets", () => {
+test("the config: the link on, its log, the virtual display primary", () => {
   const p = pathsOf("C:\\Users\\me\\phosphorus\\state\\data\\afterglow");
   const conf = confText(p, linkPort, "ab".repeat(24));
   expect(conf.endsWith("\r\n")).toBe(true);
@@ -30,9 +29,7 @@ test("the config: the link on, GameStream off, the encoders' fastest presets", (
   );
   expect(kv.phos_link_port).toBe("47100");
   expect(kv.phos_link_token).toBe("ab".repeat(24));
-  expect(kv.system_tray).toBe("disabled");
-  expect(kv.upnp).toBe("off");
-  expect(kv.file_apps).toBe(p.apps);
+  expect(kv.log_path).toBe(p.log);
   expect(kv.dd_configuration_option).toBe("ensure_primary");
   expect(JSON.parse(appsText())).toEqual({ env: {}, apps: [] });
   expect(svcBinPath("C:\\h\\afterglow", "C:\\d\\afterglow.conf")).toBe(

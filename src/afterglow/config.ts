@@ -20,38 +20,22 @@ export const pathsOf = (data: string): AfterglowPaths => ({
   log: join(data, "afterglow.log"),
 });
 
-// the config: phosphorus's link on, nothing of GameStream's listening, the
-// encoders' lowest latency presets, and an app's virtual display made the primary
-// one while it streams so its windows open there, put back after
+// the config: the link on, the log beside it, and an app's virtual display made the
+// primary one while it streams so its windows open there. The host (host/src/conf.rs)
+// reads these keys and ignores any others, so a config written for the C++ host still works
 export function confText(p: AfterglowPaths, port: number, token: string): string {
   const kv: [string, string | number][] = [
-    ["sunshine_name", "phosphorus-afterglow"],
     ["phos_link_port", port],
     ["phos_link_token", token],
-    ["address_family", "ipv4"],
-    ["upnp", "off"],
-    ["origin_web_ui_allowed", "pc"],
-    ["system_tray", "disabled"],
-    ["file_apps", p.apps],
-    ["file_state", join(p.data, "state.json")],
-    ["credentials_file", join(p.data, "creds.json")],
-    ["pkey", join(p.data, "key.pem")],
-    ["cert", join(p.data, "cert.pem")],
     ["log_path", p.log],
     ["min_log_level", "info"],
     ["dd_configuration_option", "ensure_primary"],
-    ["sw_preset", "ultrafast"],
-    ["sw_tune", "zerolatency"],
-    ["nvenc_preset", 1],
-    ["nvenc_twopass", "disabled"],
-    ["qsv_preset", "veryfast"],
-    ["amd_usage", "ultralowlatency"],
-    ["amd_quality", "speed"],
   ];
   return `# written by phosphorus: changes here are put back on its next start\r\n${kv.map(([k, v]) => `${k} = ${v}`).join("\r\n")}\r\n`;
 }
 
-// no apps of its own: phosphorus names each one as it launches it
+// no apps of its own: the driver names each one as it launches it. The host no longer
+// reads it; kept so an installer that writes it builds unchanged
 export const appsText = () => `${JSON.stringify({ env: {}, apps: [] }, null, 2)}\n`;
 
 export const linkText = (port: number, token: string) => `${JSON.stringify({ port, token })}\n`;

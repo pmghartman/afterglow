@@ -1,6 +1,6 @@
 // the afterglow source: a window app on a Windows host, run in the session signed in
-// at its console and captured and encoded by afterglow, phosphorus's own fork of
-// Apollo installed beside it, over one loopback link. Against glow's GameStream
+// at its console and captured and encoded by afterglow, phosphorus's own host
+// installed beside it, over one loopback link. Against glow's GameStream
 // path: no pairing, no HTTPS or RTSP round trips before the first frame, no RTP to
 // rebuild frames from, no AES; the frame the encoder made is the one the viewer
 // gets, copied once. The app runs on between videos and viewers, as with glow

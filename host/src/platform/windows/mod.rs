@@ -1,0 +1,329 @@
+//! The Windows host: apps started in the console's session, each on a SudoVDA display
+//! of its own where the driver is installed, captured with DXGI, encoded by Media
+//! Foundation, driven with SendInput.
+
+mod capture;
+mod display;
+mod encode;
+mod input;
+mod process;
+pub mod svc;
+mod vdisplay;
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
+use windows::Win32::Media::timeBeginPeriod;
+use windows::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+};
+use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
+use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+use windows::core::{BOOL, GUID, PWSTR};
+
+use crate::conf::Conf;
+use crate::host::{Ctl, Host, Launch, LaunchError, Out, VideoCfg};
+use crate::input::Inject;
+use crate::{debug, info, warn};
+
+/// the display afterglow's apps get: one id, so Windows keeps its settings
+const DISPLAY_GUID: GUID = GUID::from_u128(0x5d1b0f7a_3c55_4e8b_9d2e_af7e0c6b1a01);
+const DISPLAY_SERIAL: &str = "5D1B0F7A-3C55";
+
+pub(crate) fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+pub(crate) fn from_wide(w: &[u16]) -> String {
+    String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())])
+}
+
+static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+pub fn on_shutdown(flag: Arc<AtomicBool>) {
+    let _ = SHUTDOWN.set(flag);
+    unsafe extern "system" fn handler(ev: u32) -> BOOL {
+        if let Some(f) = SHUTDOWN.get() {
+            f.store(true, Ordering::SeqCst);
+        }
+        // the process ends when this returns for these: time for the app and display to be put away
+        if ev == CTRL_CLOSE_EVENT || ev == CTRL_LOGOFF_EVENT || ev == CTRL_SHUTDOWN_EVENT {
+            thread::sleep(Duration::from_secs(5));
+        }
+        matches!(ev, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT)
+            .into()
+    }
+    // SAFETY: the handler only stores to an atomic and sleeps
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(handler), true);
+    }
+}
+
+struct Running {
+    app: Option<process::App>,
+    /// the virtual display's GDI name, while the app has one
+    vdisplay: Option<String>,
+}
+
+pub struct Windows {
+    conf: Conf,
+    vda: Mutex<Option<vdisplay::Vda>>,
+    run: Mutex<Running>,
+    input: input::WinInput,
+}
+
+impl Windows {
+    pub fn open(conf: &Conf) -> Result<Arc<Windows>, String> {
+        // SAFETY: process-wide settings made once at start
+        unsafe {
+            // DXGI duplication wants per-monitor DPI awareness
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            timeBeginPeriod(1);
+            // without it (a Windows Server lacking the feature) the link still serves; videos fail
+            if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {
+                warn!("Media Foundation won't start, so nothing can be encoded: {e}");
+            }
+        }
+        if process::running_as_system() {
+            info!("running as SYSTEM: apps start as the console's user");
+        }
+        let vda = vdisplay::Vda::open().map_err(|e| warn!("no virtual displays: {e}")).ok();
+        Ok(Arc::new(Windows {
+            conf: conf.clone(),
+            vda: Mutex::new(vda),
+            run: Mutex::new(Running { app: None, vdisplay: None }),
+            input: input::WinInput::default(),
+        }))
+    }
+
+    fn vda_ok(&self) -> bool {
+        let mut v = self.vda.lock().unwrap();
+        if !v.as_ref().is_some_and(|d| d.ok()) {
+            // the driver installed or restarted since: try it again
+            *v = vdisplay::Vda::open().ok();
+        }
+        v.as_ref().is_some_and(|d| d.ok())
+    }
+
+    fn add_display(&self, l: &Launch) -> Option<String> {
+        if !self.vda_ok() {
+            return None;
+        }
+        let v = self.vda.lock().unwrap();
+        let vda = v.as_ref()?;
+        if !self.conf.adapter.is_empty() {
+            match display::adapter_luid(&self.conf.adapter) {
+                Some(luid) if vda.set_render_adapter(luid) => {}
+                _ => warn!("the virtual display can't render on {}", self.conf.adapter),
+            }
+        }
+        let millihz = l.fps * 1000;
+        match vda.add(DISPLAY_GUID, l.w, l.h, millihz, "Phosphorus", DISPLAY_SERIAL) {
+            Ok(name) => {
+                info!("virtual display {name}: {}x{}@{}", l.w, l.h, l.fps);
+                display::set_mode(&name, l.w, l.h, millihz);
+                if self.conf.primary {
+                    display::make_primary(&name);
+                }
+                Some(name)
+            }
+            Err(e) => {
+                warn!("{e}");
+                // added or not, it's removed with the app
+                vda.remove(DISPLAY_GUID);
+                None
+            }
+        }
+    }
+
+    fn remove_display(&self) {
+        if let Some(v) = self.vda.lock().unwrap().as_ref() {
+            if v.remove(DISPLAY_GUID) {
+                info!("virtual display removed");
+            }
+        }
+    }
+
+    /// capture and encode one display until stopped or lost
+    fn stream(&self, v: &VideoCfg, ctl: &Ctl, out: Out, name: Option<&str>) -> Result<bool, String> {
+        let Some(o) = display::find(name) else { return Err("no display to capture".into()) };
+        *self.input.rect.lock().unwrap() = input::Rect {
+            left: o.rect.left,
+            top: o.rect.top,
+            w: o.rect.right - o.rect.left,
+            h: o.rect.bottom - o.rect.top,
+        };
+        let (dev, ctx) =
+            capture::device_for(&o).map_err(|e| format!("no Direct3D device on {}: {e}", o.adapter_name))?;
+        let mut dup = match capture::Dup::new(&o, &dev, &ctx) {
+            Ok(d) => d,
+            Err(capture::Lost::Again) => return Ok(true),
+            Err(capture::Lost::Wait(why)) => {
+                debug!("{why}");
+                thread::sleep(Duration::from_millis(200));
+                return Ok(true);
+            }
+            Err(capture::Lost::Fail(why)) => return Err(why),
+        };
+        let force_sw = self.conf.encoder == "software";
+        let mut enc = encode::Encoder::new(&dev, &ctx, &dup.comp, dup.w, dup.h, v, o.luid, force_sw)?;
+        info!("capturing {} ({}x{}) on {}", o.name, dup.w, dup.h, o.adapter_name);
+        let period = Duration::from_secs_f64(1.0 / v.fps as f64);
+        let mut first = true;
+        // a change captured and not yet encoded: a display faster than the video waits its turn
+        let mut pending = false;
+        let mut next_slot = Instant::now();
+        let mut last = Instant::now();
+        while !ctl.stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let wait = if pending { next_slot.saturating_duration_since(now) } else { period };
+            match dup.next(wait.as_millis().clamp(1, 1000) as u32) {
+                Ok(capture::Got::Frame) => pending = true,
+                Ok(capture::Got::Timeout) => {}
+                Err(capture::Lost::Again) => return Ok(true),
+                Err(capture::Lost::Wait(why)) => {
+                    debug!("{why}");
+                    thread::sleep(Duration::from_millis(100));
+                    return Ok(true);
+                }
+                Err(capture::Lost::Fail(why)) => return Err(why),
+            }
+            if first && !pending {
+                // no picture captured yet
+                continue;
+            }
+            let idr = ctl.idr.swap(false, Ordering::Relaxed) || first;
+            let now = Instant::now();
+            // a change in its slot, a keyframe asked, or once a second the last frame again to keep the stream alive
+            let due = (pending && now >= next_slot) || idr || last.elapsed() >= Duration::from_secs(1);
+            if !due {
+                continue;
+            }
+            pending = false;
+            last = now;
+            next_slot = (next_slot + period).max(now);
+            for (au, key) in enc.encode(idr)? {
+                first = false;
+                if !out(&au, key) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl Inject for Windows {
+    fn mouse_abs(&self, x: f32, y: f32) {
+        self.input.mouse_abs(x, y)
+    }
+    fn mouse_rel(&self, dx: i32, dy: i32) {
+        self.input.mouse_rel(dx, dy)
+    }
+    fn button(&self, b: u8, down: bool) {
+        self.input.button(b, down)
+    }
+    fn scroll(&self, a: i32) {
+        self.input.scroll(a)
+    }
+    fn hscroll(&self, a: i32) {
+        self.input.hscroll(a)
+    }
+    fn key(&self, vk: u8, down: bool) {
+        self.input.key(vk, down)
+    }
+    fn text(&self, s: &str) {
+        self.input.text(s)
+    }
+}
+
+impl Host for Windows {
+    fn hostname(&self) -> String {
+        let mut buf = [0u16; 256];
+        let mut n = buf.len() as u32;
+        // SAFETY: buf sized as n says
+        if unsafe { GetComputerNameExW(ComputerNameDnsHostname, Some(PWSTR(buf.as_mut_ptr())), &mut n) }.is_ok() {
+            from_wide(&buf[..n as usize])
+        } else {
+            String::new()
+        }
+    }
+
+    fn virtual_display(&self) -> bool {
+        self.vda_ok()
+    }
+
+    fn launch(&self, l: &Launch) -> Result<(), LaunchError> {
+        let Some(cmd) = crate::wire::launcher_cmd(&l.cmd) else {
+            return Err(LaunchError::new("not an app this host can start"));
+        };
+        self.terminate();
+        let vname = if l.virtual_display { self.add_display(l) } else { None };
+        if display::find(vname.as_deref()).is_none() {
+            if vname.is_some() {
+                self.remove_display();
+            }
+            return Err(LaunchError { code: Some(503), error: "no display or encoder to capture with".into() });
+        }
+        let cwd = Path::new(&l.cmd).parent().filter(|p| p.is_dir()).and_then(|p| p.to_str()).map(str::to_string);
+        match process::App::start(&cmd, cwd.as_deref()) {
+            Ok(app) => {
+                *self.run.lock().unwrap() = Running { app: Some(app), vdisplay: vname };
+                Ok(())
+            }
+            Err(e) => {
+                if vname.is_some() {
+                    self.remove_display();
+                }
+                Err(LaunchError::new(e))
+            }
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.run.lock().unwrap().app.as_ref().is_some_and(|a| a.running())
+    }
+
+    fn terminate(&self) {
+        let (app, vd) = {
+            let mut r = self.run.lock().unwrap();
+            (r.app.take(), r.vdisplay.take())
+        };
+        if let Some(a) = app {
+            a.terminate(Duration::from_secs(5));
+        }
+        if vd.is_some() {
+            self.remove_display();
+        }
+    }
+
+    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: Out) -> Result<(), String> {
+        let name = self.run.lock().unwrap().vdisplay.clone();
+        // the virtual display follows the viewer's window: the app redraws at its size
+        if let Some(n) = &name {
+            display::set_mode(n, v.w, v.h, v.fps * 1000);
+        }
+        let mut fails = 0u32;
+        // set up again after each loss (a mode change, a desktop switch) until stopped
+        while !ctl.stop.load(Ordering::Relaxed) {
+            match self.stream(v, ctl, &mut *out, name.as_deref()) {
+                Ok(false) => return Ok(()),
+                Ok(true) => fails = 0,
+                Err(e) => {
+                    fails += 1;
+                    // a display coming up after a mode change takes a moment; past that it's gone
+                    if fails > 20 {
+                        return Err(e);
+                    }
+                    debug!("{e}: again");
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        Ok(())
+    }
+}

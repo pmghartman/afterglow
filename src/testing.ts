@@ -1,6 +1,6 @@
 // a stand-in afterglow for tests: the link's server end on a real loopback socket,
 // recording what it was sent and answering as afterglow would. Its frame and config
-// builders lay out messages as host/src/phos_wire.h writes them
+// builders lay out messages as host/src/wire.rs writes them
 
 import { In, LinkReader, message, Out } from "./afterglow/link.ts";
 

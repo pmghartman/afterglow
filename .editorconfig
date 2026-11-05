@@ -8,8 +8,8 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 2
 
-[host/**.{c,cpp,h}]
-indent_size = 2
+[*.rs]
+indent_size = 4
 
 [*.bat]
 end_of_line = crlf

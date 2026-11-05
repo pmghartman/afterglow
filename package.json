@@ -1,7 +1,7 @@
 {
   "name": "@phosphorus/afterglow",
   "version": "0.0.0",
-  "description": "Stream a Windows host's apps as low-latency H.264: afterglow, a fork of Apollo driven over one loopback link, and glow, a GameStream client",
+  "description": "Stream a Windows host's apps as low-latency H.264: afterglow, a host driven over one loopback link, and glow, a GameStream client",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
@@ -22,7 +22,8 @@
   "scripts": {
     "check": "tsc --noEmit -p .",
     "test": "bun test",
-    "test:wire": "mkdir -p build && c++ -std=c++20 -Wall -Wextra -Werror -Ihost/src host/test/wire_test.cpp -o build/wire_test && ./build/wire_test",
+    "test:host": "cargo test --manifest-path host/Cargo.toml",
+    "test:e2e": "cargo build --release --manifest-path host/Cargo.toml && AFTERGLOW_BIN=host/target/release/afterglow bun test test/e2e",
     "fmt": "biome check --write .",
     "lint": "biome ci ."
   },
