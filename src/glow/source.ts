@@ -3,7 +3,7 @@
 // later one (a new size, a new rate, a viewer back) resumes it, the app running on
 // through any gap. A keyframe is a control message away, never a restart
 
-import type { Opened, Sink, Source, Video, VideoSink } from "../session.ts";
+import type { Opened, Sink, Source, Video, VideoSink } from "../source.ts";
 import type { Identity } from "./cert.ts";
 import { InputPacker } from "./input.ts";
 import { cancel, type Host, serverInfo } from "./lumen.ts";

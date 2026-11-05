@@ -1,9 +1,10 @@
-// afterglow's files as phosphorus writes them: its config, its empty app list and the
-// link file the frontend reads. afterglow (native/afterglow) is phosphorus's fork of
-// Apollo, shipped in every Windows release under afterglow/ and set up on each host
-// by win/afterglow.ts; these are the parts that don't touch Windows, so they're tested
-// anywhere
+// afterglow's files as the app that installs it writes them: its config, its empty
+// app list and the link file the driver reads to find it. Plain text and paths, no
+// Windows calls, so a host app's installer is tested anywhere; installing the service
+// and the SudoVDA driver is the host app's own (phosphorus: packages/host/host/src/win/afterglow.ts)
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { LinkAddr } from "./link.ts";
 
 // the link's port: one of its own, clear of GameStream's 47984-48010 should the
 // host also run a Sunshine or Apollo
@@ -71,4 +72,17 @@ export function tokenOf(linkFileText: string, fresh: () => string): string {
 // the INF's DriverVer: which SudoVDA the release carries
 export function driverVer(inf: string): string {
   return /^\s*DriverVer\s*=\s*([^\r\n;]+)/im.exec(inf)?.[1]?.trim() ?? "";
+}
+
+// the link's address out of a link file, undefined when afterglow isn't set up there
+export function readLink(file: string): LinkAddr | undefined {
+  try {
+    const j = JSON.parse(readFileSync(file, "utf8"));
+    const port = Number(j?.port);
+    const token = String(j?.token ?? "");
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || token.length < 16) return undefined;
+    return { port, token };
+  } catch {
+    return undefined;
+  }
 }

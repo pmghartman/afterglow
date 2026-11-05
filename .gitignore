@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+
+# CMake and the wire test's output
+/build/
+/host/build/
+
+# a staged host build (host/scripts/build.sh OUT_DIR)
+/afterglow-out/

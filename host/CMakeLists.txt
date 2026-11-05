@@ -11,7 +11,7 @@ endif()
 
 project(Afterglow VERSION 0.0.0
         DESCRIPTION "Phosphorus's streaming host, forked from Apollo"
-        HOMEPAGE_URL "https://github.com/pmghartman/phosphorus")
+        HOMEPAGE_URL "https://github.com/pmghartman/afterglow")
 
 set(PROJECT_LICENSE "GPL-3.0-only")
 set(PROJECT_FQDN "dev.phosphorus.afterglow")

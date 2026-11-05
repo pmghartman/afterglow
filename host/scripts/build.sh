@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # afterglow built and staged, in an MSYS2 UCRT64 shell (its packages in
-# .github/workflows/afterglow.yml): afterglow.exe and its service, the shaders it
+# .github/workflows/host.yml): afterglow.exe and its service, the shaders it
 # compiles at run time, zlib1.dll that OpenSSL loads, the licence and where the
 # source is. The signed SudoVDA driver package is staged by the workflow after it.
 # usage: build.sh OUT_DIR [VERSION]
@@ -19,7 +19,7 @@ cmake -B build -G Ninja -S . \
 # the CMake targets keep Apollo's names; their outputs are afterglow.exe and afterglowsvc.exe
 ninja -C build sunshine sunshinesvc
 
-# the link's own tests, the one part built from phosphorus's sources alone
+# the link's own tests, the one part built from afterglow's own sources alone
 c++ -std=c++20 -Wall -Wextra -Werror -Isrc test/wire_test.cpp -o build/wire_test.exe
 ./build/wire_test.exe
 
@@ -32,12 +32,20 @@ cp src_assets/windows/drivers/sudovda/install.bat src_assets/windows/drivers/sud
 cp "$(dirname "$(command -v cmake)")/zlib1.dll" "$OUT/"
 cp LICENSE "$OUT/LICENSE.txt"
 cp NOTICE "$OUT/NOTICE.txt"
+REPO=${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pmghartman/afterglow}
 cat > "$OUT/SOURCE.txt" <<TXT
+afterglow $VER: phosphorus's streaming host, a fork of Apollo
+(https://github.com/ClassicOldSong/Apollo), itself a fork of LizardByte's Sunshine.
+GNU General Public License version 3 (LICENSE.txt). Its complete source, with the
+changes made to it, is host/ in $REPO
+at commit ${GITHUB_SHA:-unknown} (tag v$VER), its submodules at the commits pinned there.
+TXT
 afterglow $VER: phosphorus's streaming host, a fork of Apollo
 (https://github.com/ClassicOldSong/Apollo), itself a fork of LizardByte's Sunshine.
 GNU General Public License version 3 (LICENSE.txt). Its complete source, with the
 changes phosphorus made, is native/afterglow in https://github.com/pmghartman/phosphorus
 at commit ${GITHUB_SHA:-unknown}.
 TXT
+echo "$VER" > "$OUT/VERSION"
 strip "$OUT/afterglow.exe" "$OUT/tools/afterglowsvc.exe" || true
 ls -la "$OUT" "$OUT/tools"

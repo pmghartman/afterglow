@@ -3,7 +3,7 @@
  * @brief afterglow's local link to phosphorus: its message framing and the H.264
  * reshaping done once here so phosphorus copies each frame once. Pure C++, no
  * Apollo or platform headers, so it is built and tested on its own
- * (native/afterglow/test/wire_test.cpp).
+ * (test/wire_test.cpp).
  *
  * A message: u32 little-endian length of what follows, then one type byte, then the
  * body. Frames and parameter sets go out shaped for the viewer: 8 bytes in front that
@@ -36,7 +36,7 @@ namespace phos::wire {
 
   // afterglow to phosphorus
   enum class out_t : std::uint8_t {
-    ready = 0x81,  // json: version, virtual_display, encoder, hostname
+    ready = 0x81,  // json: version, virtual_display, hostname, running
     launched = 0x82,  // json: ok, error, resumed
     exited = 0x83,  // json: the app is gone
     video_ended = 0x84,  // json: gen, why

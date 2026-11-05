@@ -1,0 +1,98 @@
+# manual release, as phosphorus's: vVERSION, one past the highest vMAJOR.MINOR tag (minor,
+# or major with .0). The client's checks, the host built for Windows at that version,
+# then on the release afterglow-VERSION-windows-x86_64.zip with its SHA256SUMS and a
+# signed build provenance attestation. Phosphorus pins the client by this tag and installs
+# the zip of the same version, verified with `gh attestation verify`
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      major:
+        description: "Bump Major Version"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# one release at a time: the next version is read off the tags
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      ver: ${{ steps.v.outputs.ver }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: next version
+        id: v
+        env:
+          MAJOR: ${{ inputs.major }}
+        run: |
+          L=$(git ls-remote --tags origin | sed -n 's|.*refs/tags/v\([0-9]*\.[0-9]*\)$|\1|p' | sort -t. -k1,1n -k2,2n | tail -1)
+          L=${L:-0.0}
+          if [ "$MAJOR" = true ]; then V=$(( ${L%.*} + 1 )).0
+          else V=${L%.*}.$(( ${L#*.} + 1 ))
+          fi
+          echo "ver=$V" | tee -a "$GITHUB_OUTPUT"
+
+  ci:
+    needs: prep
+    uses: ./.github/workflows/ci.yml
+
+  host:
+    needs: prep
+    uses: ./.github/workflows/host.yml
+    with:
+      version: ${{ needs.prep.outputs.ver }}
+
+  release:
+    needs: [prep, ci, host]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VER: ${{ needs.prep.outputs.ver }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: afterglow-windows-x86_64
+          path: stage
+      - name: package
+        run: |
+          mkdir -p out
+          ZIP=afterglow-$VER-windows-x86_64.zip
+          (cd stage && zip -qr9 "../out/$ZIP" .)
+          (cd out && sha256sum "$ZIP" > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/afterglow-${{ env.VER }}-windows-x86_64.zip
+      # the notes: how to use this version, GitHub's list of what changed under them
+      - name: notes
+        run: |
+          {
+            echo "**Client:** \`\"@phosphorus/afterglow\": \"github:$GITHUB_REPOSITORY#v$VER\"\`"
+            echo
+            echo "**Host:** \`afterglow-$VER-windows-x86_64.zip\`, verified with:"
+            echo
+            echo '```bash'
+            echo "gh attestation verify afterglow-$VER-windows-x86_64.zip --repo $GITHUB_REPOSITORY"
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: v${{ env.VER }}
+          name: afterglow ${{ env.VER }}
+          target_commitish: ${{ github.sha }}
+          body_path: ${{ runner.temp }}/notes.md
+          generate_release_notes: true
+          files: out/*

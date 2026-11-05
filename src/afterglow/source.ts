@@ -6,7 +6,7 @@
 // gets, copied once. The app runs on between videos and viewers, as with glow
 
 import { InputPacker } from "../glow/input.ts";
-import type { Opened, Sink, Source, Video, VideoSink } from "../session.ts";
+import type { Opened, Sink, Source, Video, VideoSink } from "../source.ts";
 import { configOf, frameOf, In, jsonOf, Link, type LinkAddr, Out } from "./link.ts";
 
 export type AfterglowTarget = {

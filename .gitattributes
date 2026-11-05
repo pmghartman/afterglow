@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Windows batch files as cmd.exe expects them
+host/**/*.bat text eol=crlf

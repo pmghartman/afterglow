@@ -1,0 +1,30 @@
+# the host's (host/) dependencies, pinned where Apollo pins them; only its Windows build
+# fetches them (actions/checkout with submodules: recursive)
+[submodule "host/third-party/build-deps"]
+	path = host/third-party/build-deps
+	url = https://github.com/LizardByte/build-deps.git
+	branch = dist
+[submodule "host/third-party/libdisplaydevice"]
+	path = host/third-party/libdisplaydevice
+	url = https://github.com/LizardByte/libdisplaydevice.git
+[submodule "host/third-party/moonlight-common-c"]
+	path = host/third-party/moonlight-common-c
+	url = https://github.com/ClassicOldSong/moonlight-common-c.git
+[submodule "host/third-party/nanors"]
+	path = host/third-party/nanors
+	url = https://github.com/sleepybishop/nanors.git
+[submodule "host/third-party/nv-codec-headers"]
+	path = host/third-party/nv-codec-headers
+	url = https://github.com/FFmpeg/nv-codec-headers.git
+[submodule "host/third-party/nvapi-open-source-sdk"]
+	path = host/third-party/nvapi-open-source-sdk
+	url = https://github.com/LizardByte/nvapi-open-source-sdk.git
+[submodule "host/third-party/Simple-Web-Server"]
+	path = host/third-party/Simple-Web-Server
+	url = https://github.com/ClassicOldSong/Simple-Web-Server.git
+[submodule "host/third-party/tray"]
+	path = host/third-party/tray
+	url = https://github.com/LizardByte/tray.git
+[submodule "host/third-party/ViGEmClient"]
+	path = host/third-party/ViGEmClient
+	url = https://github.com/LizardByte/Virtual-Gamepad-Emulation-Client.git

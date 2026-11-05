@@ -1,7 +1,7 @@
-// the local link to afterglow, phosphorus's fork of Apollo (native/afterglow): one
+// the local link to afterglow, phosphorus's fork of Apollo (host/ in this repo): one
 // loopback TCP connection in place of GameStream's HTTPS, RTSP, ENet and RTP. A
 // message is a u32 little-endian length of what follows, a type byte, the body
-// (native/afterglow/src/phos_wire.h is the other side). Frames come already shaped
+// (host/src/phos_wire.h is the other side). Frames come already shaped
 // for the viewer: 8 bytes of room for its header, then AVCC, so each is copied once,
 // out of the socket's bytes into its own message
 
