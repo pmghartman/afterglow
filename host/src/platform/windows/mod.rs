@@ -294,6 +294,7 @@ impl Windows {
         let mut next_refine = Instant::now();
         let mut coarse = false;
         let mut stats = Stats::new();
+        let started = Instant::now();
         while !ctl.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
             let refine_at = (changed_at + REFINE_AFTER).max(next_slot).max(next_refine);
@@ -328,7 +329,9 @@ impl Windows {
                     return Ok(false);
                 }
             }
-            if !sent && !pending {
+            if !sent && !pending && started.elapsed() < FIRST_FRAME {
+                // an idle display presents nothing until something draws: past a moment, a
+                // black keyframe, so the viewer has the config and a picture
                 continue;
             }
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
@@ -399,6 +402,12 @@ impl Windows {
 
 /// how long the screen is still before what was coded coarsely is refined
 const REFINE_AFTER: Duration = Duration::from_millis(60);
+
+/// how long an app whose job emptied before any window of it showed is still waited for
+const LAUNCHER_GRACE: Duration = Duration::from_secs(10);
+
+/// how long a video waits for duplication's first frame before a black keyframe goes out
+const FIRST_FRAME: Duration = Duration::from_millis(250);
 
 /// the calling thread registered with the multimedia scheduler (MMCSS) as capture
 /// work, for as long as this lives: the scheduler runs it ahead of ordinary threads so
@@ -560,16 +569,33 @@ impl Host for Windows {
     }
 
     fn running(&self) -> bool {
-        self.run.lock().unwrap().app.as_ref().is_some_and(|a| a.running())
+        let r = self.run.lock().unwrap();
+        let Some(app) = r.app.as_ref() else { return false };
+        if app.running() {
+            return true;
+        }
+        // its job empty: a window of it up still runs it (an app already running took
+        // the launch, a broker started the real one), and a launcher that's gone has a
+        // moment to show one
+        r.follower.as_ref().is_some_and(|f| f.windows() > 0 || (!f.ever() && f.age() < LAUNCHER_GRACE))
     }
 
     fn terminate(&self) {
-        let (app, vd) = {
+        let (app, vd, follower) = {
             let mut r = self.run.lock().unwrap();
-            // stopped before the job it reads is closed
-            drop(r.follower.take());
-            (r.app.take(), r.vdisplay.take())
+            (r.app.take(), r.vdisplay.take(), r.follower.take())
         };
+        if let Some(f) = &follower {
+            // windows from outside the job asked to close, as the job's are
+            if f.close_adopted() > 0 {
+                let t0 = Instant::now();
+                while f.adopted_left() > 0 && t0.elapsed() < Duration::from_secs(5) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        // stopped before the job it reads is closed
+        drop(follower);
         if let Some(a) = app {
             a.terminate(Duration::from_secs(5));
         }

@@ -12,12 +12,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -30,9 +30,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindowAsync, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW,
-    WS_THICKFRAME,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindowAsync, WM_CLOSE, WS_CAPTION, WS_CHILD,
+    WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PWSTR};
 
@@ -40,10 +40,22 @@ use super::display;
 use super::input::sync_desktop;
 use crate::{info, warn};
 
+/// what the follower knows of the app's windows, for the host to ask
+#[derive(Default)]
+struct Seen {
+    /// the app's windows up now, and whether it ever had one
+    windows: AtomicUsize,
+    ever: AtomicBool,
+    /// windows of processes outside the job taken as the app's
+    adopted: Mutex<Vec<isize>>,
+}
+
 /// the app's windows followed on their own thread until dropped
 pub struct Follower {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    seen: Arc<Seen>,
+    started: Instant,
 }
 
 impl Follower {
@@ -54,11 +66,53 @@ impl Follower {
         let (s, job) = (stop.clone(), job.0 as usize);
         // SAFETY: fills the struct it's given
         let launched = unsafe { GetSystemTimeAsFileTime() };
+        let seen = Arc::new(Seen::default());
+        let out = seen.clone();
         let thread = thread::Builder::new()
             .name("windows".into())
-            .spawn(move || follow(HANDLE(job as *mut c_void), &display, &s, ticks(launched)))
+            .spawn(move || follow(HANDLE(job as *mut c_void), &display, &s, ticks(launched), &out))
             .ok();
-        Follower { stop, thread }
+        Follower { stop, thread, seen, started: Instant::now() }
+    }
+
+    /// the app's windows up now
+    pub fn windows(&self) -> usize {
+        self.seen.windows.load(Ordering::Relaxed)
+    }
+
+    /// whether a window of the app's has ever shown
+    pub fn ever(&self) -> bool {
+        self.seen.ever.load(Ordering::Relaxed)
+    }
+
+    /// since the launch
+    pub fn age(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// the windows taken from outside the job asked to close, as their close button
+    /// would: their processes weren't started by afterglow, so they're never ended. How
+    /// many were asked
+    pub fn close_adopted(&self) -> usize {
+        let hs = self.seen.adopted.lock().unwrap().clone();
+        let mut n = 0;
+        for h in hs {
+            let h = HWND(h as *mut c_void);
+            // SAFETY: a message posted to a window that may have gone, which only fails
+            unsafe {
+                if IsWindow(Some(h)).as_bool() && PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// adopted windows still up
+    pub fn adopted_left(&self) -> usize {
+        let hs = self.seen.adopted.lock().unwrap();
+        // SAFETY: IsWindow takes any value
+        hs.iter().filter(|&&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool()).count()
     }
 }
 
@@ -121,7 +175,7 @@ fn process_of(pid: u32) -> Option<(String, u64)> {
     }
 }
 
-fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64) {
+fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Seen) {
     // onto the app's desktop before COM: a thread with a window of its own can't change desktops
     sync_desktop();
     // SAFETY: balanced below; the taskbar's object lives in an apartment
@@ -174,6 +228,9 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64) {
                     };
                     if ours {
                         let first = seen.insert(h.0 as isize);
+                        if first && adopted.contains(&pid) {
+                            out.adopted.lock().unwrap().push(h.0 as isize);
+                        }
                         place(h, kind, mon, first, taskbar.as_ref());
                     }
                 }
@@ -202,6 +259,10 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64) {
         }
         // SAFETY: IsWindow takes any value
         seen.retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
+        out.windows.store(seen.len(), Ordering::Relaxed);
+        if !seen.is_empty() {
+            out.ever.store(true, Ordering::Relaxed);
+        }
         thread::sleep(Duration::from_millis(100));
     }
     drop(taskbar);
