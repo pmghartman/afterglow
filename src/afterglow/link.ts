@@ -159,6 +159,8 @@ export class Link {
   private queue: Uint8Array[] = [];
   private closed = false;
   private waiting = new Map<number, ((m: Uint8Array) => void)[]>();
+  // what each wait does when the link closes first: fail at once, not at its timeout
+  private failers = new Set<(e: Error) => void>();
   ready?: Ready;
 
   constructor(
@@ -206,18 +208,24 @@ export class Link {
   // the next message of this type, or an error past the time
   next(type: number, timeoutMs: number): Promise<Uint8Array> {
     return new Promise((res, rej) => {
-      const t = setTimeout(() => {
+      if (this.closed) return rej(new Error("afterglow closed the link"));
+      const fail = (e: Error) => {
+        clearTimeout(t);
         const l = this.waiting.get(type) ?? [];
         this.waiting.set(
           type,
           l.filter((f) => f !== done),
         );
-        rej(new Error(this.closed ? "afterglow closed the link" : "afterglow didn't answer"));
-      }, timeoutMs);
+        this.failers.delete(fail);
+        rej(e);
+      };
+      const t = setTimeout(() => fail(new Error("afterglow didn't answer")), timeoutMs);
       const done = (m: Uint8Array) => {
         clearTimeout(t);
+        this.failers.delete(fail);
         res(m);
       };
+      this.failers.add(fail);
       const l = this.waiting.get(type) ?? [];
       l.push(done);
       this.waiting.set(type, l);
@@ -268,6 +276,7 @@ export class Link {
     this.closed = true;
     this.sock?.end();
     this.pipe?.close();
+    for (const f of [...this.failers]) f(new Error(`afterglow closed the link: ${why}`));
     this.ev.closed(why);
   }
 }

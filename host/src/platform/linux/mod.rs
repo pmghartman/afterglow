@@ -587,6 +587,15 @@ impl Host for Linux {
         }
     }
 
+    fn release(&self) {
+        // one being started finished first, then gone with the one that was there
+        let t0 = Instant::now();
+        while self.spare.starting.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(self.spare.slot.lock().unwrap().take());
+    }
+
     fn exit_info(&self) -> serde_json::Value {
         self.ended.lock().unwrap().clone()
     }

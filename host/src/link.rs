@@ -202,10 +202,10 @@ impl<H: Host> Link<H> {
             c.close();
         }
         *self.notes_to.lock().unwrap() = None;
-        if st.launched {
-            self.host.terminate();
-            st.launched = false;
-        }
+        // ended whether it was still running or not: an app that exited leaves its display
+        self.host.terminate();
+        st.launched = false;
+        self.host.release();
     }
 
     /// serve on 127.0.0.1:port until shutdown is raised
@@ -264,6 +264,8 @@ impl<H: Host> Link<H> {
             info!("the app exited");
             st.launched = false;
             self.stop_video(&mut st);
+            // what's left of it (its display) put away now, how it ended kept to tell
+            self.host.terminate();
             if let Some(c) = &st.current {
                 c.json(msg_out::EXITED, self.host.exit_info());
             }

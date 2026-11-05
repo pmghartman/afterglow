@@ -280,4 +280,24 @@ describe("afterglow source", () => {
     expect(fake.sent(In.quit).length).toBe(0);
     expect(d.exits).toEqual([""]);
   });
+
+  test("a transport that closes before ready: the open fails at once", async () => {
+    let closes: (() => void)[] = [];
+    const t0 = performance.now();
+    const src = new AfterglowSource({
+      transport: () => ({
+        write: () => queueMicrotask(() => closes.forEach((f) => f())),
+        onData: () => {},
+        onClose: (f) => void closes.push(f),
+        close: () => {
+          closes = [];
+        },
+      }),
+      target: "",
+      argv: ["x"],
+      virtualDisplay: true,
+    });
+    await expect(src.open(opened(640, 480), new Driver())).rejects.toThrow("afterglow closed the link");
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
 });

@@ -141,6 +141,9 @@ pub trait Host: Inject + Send + Sync + 'static {
     fn close(&self) -> bool {
         false
     }
+    /// everything kept ahead of the next launch let go (a spare display): afterglow is
+    /// going
+    fn release(&self) {}
     /// how the app ended, once it has: `{code, log, error}`, any of them
     fn exit_info(&self) -> serde_json::Value {
         serde_json::json!({})
