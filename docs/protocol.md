@@ -4,7 +4,7 @@ One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to 
 
 afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token. It serves nothing else and captures no audio.
 
-Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version>` and what it serves (`stdio argv notes clipboard raise close cursor`), for a driver probing a host.
+Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version>` and what it serves (`stdio argv notes clipboard raise close cursor`, and `icons` on Windows), for a driver probing a host.
 
 ## Framing
 
@@ -85,6 +85,20 @@ A `frame` message's first 8 bytes, counting its type byte, are the room `FrameRo
 The avcC's SPS always carries VUI `bitstream_restriction` with `max_num_reorder_frames = 0` (afterglow rewrites what the encoder made, the rest of it bit for bit). Without it a decoder infers a reorder depth from the DPB's size and holds decoded pictures back: Chromium's own decoder held two, hardware decoders hold up to sixteen. With it each frame is shown the moment it's decoded. No stream afterglow makes has B-frames, so the restriction is true.
 
 A frame is made when the screen changes, within the video's rate (the first change after a quiet spell at once), and again once a second when nothing does. `idr` and `stop_video` take effect at once, not at the next frame.
+
+## Icons
+
+`afterglow --icons` is not part of the link: it is a batch extractor for app icons, run as the viewer's login (over ssh, for Phosphorus). A build that has it lists `icons` in `--features` (Windows; a Linux build lists nothing and `--icons` answers every spec with `null`).
+
+stdin is the specs, either one per line (blank lines skipped) or one JSON array of strings. stdout is one JSON line per spec, `{"k": <the spec as given>, "png": <base64 PNG> | null}`, written as each finishes (so not in input order; match on `k`). The icon is 48x48 RGBA with alpha. A miss, an unknown spec or a file that isn't there is `"png": null` and never an error; the exit code is 0 when the input was read, 2 for a malformed JSON array. Specs run on a few threads at once; `AFTERGLOW_ICON_THREADS` sets how many (1 to 32).
+
+| Spec | Icon |
+| --- | --- |
+| `f:<path>` | the file's shell icon. A OneDrive or other cloud placeholder (offline, recall on open or on data access) is read by its attributes only and never hydrated |
+| `a:<path>` | the icon for the path's file attributes and extension, the file never touched |
+| `b:` | the recycle bin |
+| `u:<AUMID>` | a Store app's tile logo: the `Square44x44Logo` of `<family>!<app>` in its package manifest, the 48px unplated file first, then 48px, scale 200, scale 100, any. The file's own PNG bytes, not resized |
+| `l:<path>,<index>` | an icon resource (`.exe`, `.dll`, `.ico`) at 48px. The index may be negative (a resource id); without `,<index>` it is 0. Environment variables are not expanded |
 
 ## Security
 
