@@ -632,12 +632,19 @@ impl Host for Windows {
         if let (true, false, Some(seen), Some(rect)) =
             (self.app_capture(), v.draw_cursor, seen, name.as_deref().and_then(display::rect_of))
         {
-            match grab::Helper::start() {
-                Ok(h) => match h.video(v, ctl, &mut *out, rect, || seen.pids(), || seen.taken()) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => warn!("the app's windows couldn't be captured ({e}): its display is, instead"),
-                },
-                Err(e) => warn!("no capture process ({e}): the app's display is captured instead"),
+            // the video is the display's rectangle, pixel for pixel: the pointer lands there,
+            // and the keyboard goes to the app's windows
+            *self.input.rect.lock().unwrap() =
+                input::Rect { left: rect.left, top: rect.top, w: rect.right - rect.left, h: rect.bottom - rect.top };
+            *self.input.app.lock().unwrap() = Some(seen.clone());
+            let r = match grab::Helper::start() {
+                Ok(h) => h.video(v, ctl, &mut *out, rect, || seen.pids(), || seen.taken()),
+                Err(e) => Err(format!("no capture process ({e})")),
+            };
+            *self.input.app.lock().unwrap() = None;
+            match r {
+                Ok(()) => return Ok(()),
+                Err(e) => warn!("the app's windows couldn't be captured ({e}): its display is, instead"),
             }
         }
         let mut fails = 0u32;

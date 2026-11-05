@@ -3,17 +3,21 @@
 //! codes, text as UTF-16 units.
 
 use std::mem::size_of;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::GENERIC_ALL;
+use windows::Win32::Foundation::{GENERIC_ALL, HWND};
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_ACCESS_FLAGS, DF_ALLOWOTHERACCOUNTHOOK, OpenInputDesktop, SetThreadDesktop,
 };
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    BringWindowToTop, GW_HWNDNEXT, GetForegroundWindow, GetSystemMetrics, GetTopWindow, GetWindow,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SetForegroundWindow, XBUTTON1, XBUTTON2,
 };
 
+use super::wm::Seen;
 use crate::input::Inject;
 
 /// a US-layout virtual key's scan code (Apollo's table, from Sunshine's)
@@ -48,6 +52,58 @@ pub struct Rect {
 #[derive(Default)]
 pub struct WinInput {
     pub rect: Mutex<Rect>,
+    /// while the app's windows alone are streamed, what they are: the keyboard is given
+    /// back to them whenever a key or click comes and something else has it (the console's
+    /// own user, a toast, another app)
+    pub app: Mutex<Option<Arc<Seen>>>,
+}
+
+/// the app's top window, in front of the others, if something else has the keyboard
+fn app_window(seen: &Seen) -> Option<HWND> {
+    let pids = seen.pids();
+    let taken = seen.taken();
+    let ours = |h: HWND| {
+        let mut pid = 0u32;
+        // SAFETY: a query on a window that may have gone, which only fails
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        pid != 0 && pids.contains(&pid) || taken.contains(&(h.0 as isize))
+    };
+    // SAFETY: window queries, each on a handle that may have gone, which only fail
+    unsafe {
+        let fg = GetForegroundWindow();
+        if !fg.is_invalid() && ours(fg) {
+            return None;
+        }
+        // the app's highest visible top-level window, in z-order
+        let mut h = GetTopWindow(None).ok()?;
+        for _ in 0..4096 {
+            if IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() && ours(h) {
+                return Some(h);
+            }
+            h = GetWindow(h, GW_HWNDNEXT).ok()?;
+        }
+        None
+    }
+}
+
+/// h given the keyboard, from a process that isn't in front: the thread in front lets its
+/// input state be shared while it's asked, as Windows allows a process that just sent input
+fn bring(h: HWND) {
+    // SAFETY: plain window and thread calls; the threads are attached only for the call
+    unsafe {
+        if SetForegroundWindow(h).as_bool() {
+            return;
+        }
+        let fg = GetForegroundWindow();
+        let them = GetWindowThreadProcessId(fg, None);
+        let me = GetCurrentThreadId();
+        let attached = them != 0 && them != me && AttachThreadInput(me, them, true).as_bool();
+        let _ = BringWindowToTop(h);
+        let _ = SetForegroundWindow(h);
+        if attached {
+            let _ = AttachThreadInput(me, them, false);
+        }
+    }
 }
 
 /// the calling thread moved to the desktop that has the input now
@@ -96,6 +152,16 @@ fn extended(vk: u8) -> bool {
         vk,
         0x5b | 0x5c | 0xa5 | 0xa3 | 0x2d | 0x2e | 0x24 | 0x23 | 0x21 | 0x22 | 0x26 | 0x28 | 0x25 | 0x27 | 0x6f | 0x5d
     )
+}
+
+impl WinInput {
+    /// the app's windows given the keyboard back if they lost it
+    fn focus(&self) {
+        let seen = self.app.lock().unwrap().clone();
+        if let Some(h) = seen.as_deref().and_then(app_window) {
+            bring(h);
+        }
+    }
 }
 
 impl Inject for WinInput {
@@ -148,6 +214,9 @@ impl Inject for WinInput {
     }
 
     fn key(&self, vk: u8, down: bool) {
+        if down {
+            self.focus();
+        }
         let scan = VK_TO_SCAN[vk as usize] as u16;
         // as a scan code where there's one, for games that read those; else the key itself
         let (mut flags, wvk) = if scan != 0 { (KEYEVENTF_SCANCODE, 0) } else { (KEYBD_EVENT_FLAGS(0), vk as u16) };
@@ -165,6 +234,7 @@ impl Inject for WinInput {
         let mut inputs: Vec<INPUT> = units.iter().map(|&u| keyboard(0, u, KEYEVENTF_UNICODE)).collect();
         inputs.extend(units.iter().map(|&u| keyboard(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)));
         if !inputs.is_empty() {
+            self.focus();
             send(&inputs);
         }
     }
