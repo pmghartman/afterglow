@@ -24,6 +24,7 @@
     "test": "bun test",
     "test:host": "cargo test --manifest-path host/Cargo.toml",
     "test:e2e": "cargo build --release --manifest-path host/Cargo.toml && AFTERGLOW_BIN=host/target/release/afterglow bun test test/e2e",
+    "bench": "cargo build --release --manifest-path host/Cargo.toml && AFTERGLOW_BIN=host/target/release/afterglow bun test/e2e/bench.ts",
     "fmt": "biome check --write .",
     "lint": "biome ci ."
   },

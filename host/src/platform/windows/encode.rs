@@ -548,7 +548,7 @@ impl Encoder {
             buf.Lock(&mut p, None, Some(&mut len))?;
             let mut au = std::slice::from_raw_parts(p, len as usize).to_vec();
             buf.Unlock()?;
-            if key && !crate::wire::nals_of(&au).iter().any(|n| n.ty == 7) {
+            if key && !crate::h264::split(&au).iter().any(|n| crate::h264::nal_type(n) == 7) {
                 if self.seq.is_empty() {
                     self.seq = self.sequence_header();
                 }

@@ -61,7 +61,7 @@ features = [
 # What CI and a Linux machine run the real link against
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-openh264 = "0.9"
+openh264-sys2 = "0.9"
 x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xtest", "xfixes"] }
 
 [profile.release]

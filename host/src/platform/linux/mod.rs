@@ -5,6 +5,8 @@
 //! OpenH264; input injected with XTest. The app is a process group of its own.
 
 mod capture;
+mod convert;
+mod encode;
 mod xserver;
 
 use std::collections::HashMap;
@@ -14,11 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use openh264::OpenH264API;
-use openh264::encoder::{
-    BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, RateControlMode, UsageType, VuiConfig,
-};
-use openh264::formats::YUVSlices;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -26,7 +23,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::conf::Conf;
-use crate::host::{Ctl, Host, Launch, LaunchError, Out, VideoCfg};
+use crate::host::{Ctl, Host, Launch, LaunchError, Sink, VideoCfg};
 use crate::input::Inject;
 use crate::{debug, info, warn};
 use xserver::{Display, Xvfb};
@@ -44,6 +41,8 @@ struct Xi {
     conn: RustConnection,
     root: u32,
     keys: Keys,
+    /// the screen's size, kept so a pointer move is one request and no round trip
+    size: (u16, u16),
 }
 
 struct App {
@@ -59,6 +58,42 @@ pub struct Linux {
     session: Option<Display>,
     app: Mutex<Option<App>>,
     xi: Mutex<Option<Xi>>,
+    spare: Spare,
+}
+
+/// an Xvfb started ahead of the launch that takes it: half of an app's time to its first
+/// frame was its X server coming up. Another is started as soon as one is taken
+#[derive(Clone)]
+struct Spare {
+    bin: String,
+    slot: Arc<Mutex<Option<Xvfb>>>,
+    starting: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Spare {
+    fn refill(&self) {
+        if self.starting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        let _ = thread::Builder::new().name("spare-xvfb".into()).spawn(move || {
+            let x = Xvfb::start(&me.bin, xserver::MAX.0, xserver::MAX.1);
+            match x {
+                Ok(x) => *me.slot.lock().unwrap() = Some(x),
+                Err(e) => warn!("no spare X server: {e}"),
+            }
+            me.starting.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// the spare, if one is up and still serving, set to w×h
+    fn take(&self, w: u16, h: u16) -> Option<Xvfb> {
+        let mut x = self.slot.lock().unwrap().take()?;
+        if w > xserver::MAX.0 || h > xserver::MAX.1 || !x.alive() || x.fit(w, h).is_err() {
+            return None;
+        }
+        Some(x)
+    }
 }
 
 fn keys_of(conn: &RustConnection) -> Result<Keys, String> {
@@ -90,7 +125,8 @@ fn xi_for(d: &Display) -> Result<Xi, String> {
     let root = conn.setup().roots[screen].root;
     conn.xtest_get_version(2, 2).map_err(|e| e.to_string())?.reply().map_err(|_| format!("{} has no XTEST", d.name))?;
     let keys = keys_of(&conn)?;
-    Ok(Xi { conn, root, keys })
+    let size = conn.get_geometry(root).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
+    Ok(Xi { conn, root, keys, size: (size.width, size.height) })
 }
 
 fn which(bin: &str) -> bool {
@@ -107,6 +143,7 @@ impl Linux {
             name,
             cookie: None,
             auth: None,
+            fb: None,
         });
         if !which(&xvfb_bin) {
             warn!("no {xvfb_bin}: apps get no display of their own");
@@ -114,7 +151,18 @@ impl Linux {
         if let Some(s) = &session {
             info!("the session's display: {}", s.name);
         }
-        Ok(Arc::new(Linux { xvfb_bin, session, app: Mutex::new(None), xi: Mutex::new(None) }))
+        let spare = Spare { bin: xvfb_bin.clone(), slot: Arc::default(), starting: Arc::default() };
+        if which(&xvfb_bin) {
+            spare.refill();
+        }
+        Ok(Arc::new(Linux { xvfb_bin, session, app: Mutex::new(None), xi: Mutex::new(None), spare }))
+    }
+
+    /// the size the screen input lands on now is
+    fn screen_is(&self, w: u16, h: u16) {
+        if let Some(xi) = self.xi.lock().unwrap().as_mut() {
+            xi.size = (w, h);
+        }
     }
 
     fn with_xi(&self, f: impl FnOnce(&mut Xi)) {
@@ -213,14 +261,10 @@ fn keysym_of(vk: u8) -> Option<u32> {
     })
 }
 
-fn screen_of(xi: &Xi) -> (u16, u16) {
-    xi.conn.get_geometry(xi.root).ok().and_then(|c| c.reply().ok()).map_or((1, 1), |g| (g.width, g.height))
-}
-
 impl Inject for Linux {
     fn mouse_abs(&self, x: f32, y: f32) {
         self.with_xi(|xi| {
-            let (w, h) = screen_of(xi);
+            let (w, h) = xi.size;
             let px = (x * (w.max(2) - 1) as f32).round() as i16;
             let py = (y * (h.max(2) - 1) as f32).round() as i16;
             fake(xi, xproto::MOTION_NOTIFY_EVENT, 0, px, py);
@@ -285,7 +329,6 @@ impl Inject for Linux {
                 };
                 tap(xi, sym);
             }
-            let _ = xi.conn.sync();
         });
     }
 }
@@ -310,8 +353,12 @@ impl Host for Linux {
         }
         self.terminate();
         let (xvfb, display) = if l.virtual_display && self.virtual_display() {
-            let x = Xvfb::start(&self.xvfb_bin, l.w as u16, l.h as u16)
-                .map_err(|e| LaunchError { code: Some(503), error: e })?;
+            let x = match self.spare.take(l.w as u16, l.h as u16) {
+                Some(x) => x,
+                None => Xvfb::start(&self.xvfb_bin, l.w as u16, l.h as u16)
+                    .map_err(|e| LaunchError { code: Some(503), error: e })?,
+            };
+            self.spare.refill();
             let d = x.display.clone();
             (Some(x), d)
         } else {
@@ -372,94 +419,214 @@ impl Host for Linux {
         drop(app.xvfb.take());
     }
 
-    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: Out) -> Result<(), String> {
+    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
         let (display, own) = {
             let a = self.app.lock().unwrap();
             let Some(app) = a.as_ref() else { return Err("no app is running".into()) };
             (app.display.clone(), app.xvfb.is_some())
         };
         let mut grab = capture::Grab::new(&display)?;
+        ctl.on_wake(grab.waker());
         // the app's own display follows the viewer's window: the app redraws at its size
         if own {
             let (conn, screen) = display.connect()?;
             let root = conn.setup().roots[screen].root;
             xserver::resize(&conn, root, v.w as u16, v.h as u16);
-            grab.geometry()?;
         }
-        let threads = thread::available_parallelism().map_or(1, |n| n.get()).min(4) as u16;
-        let cfg = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(v.kbps * 1000))
-            .max_frame_rate(FrameRate::from_hz(v.fps as f32))
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .skip_frames(false)
-            .num_threads(threads)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(0))
-            .vui(VuiConfig::bt709());
-        let mut enc =
-            Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| format!("no encoder: {e}"))?;
+        grab.geometry()?;
+        self.screen_is(grab.w, grab.h);
         let (w, h) = (v.w as usize, v.h as usize);
-        let mut yuv = vec![0u8; w * h * 3 / 2];
+        let mut enc = encode::H264::new(w, h, v.fps, v.kbps, threads_for(w, h))?;
+        let mut yuv = convert::Yuv::new(w, h);
         let period = Duration::from_secs_f64(1.0 / v.fps as f64);
-        // the screen as last read, and with the pointer drawn
-        let (mut screen, mut frame) = (Vec::new(), Vec::new());
-        let mut cursor_at = None;
-        let (mut sent, mut screen_dirty, mut pending) = (false, true, true);
+        let keepalive = Duration::from_secs(1);
+        let t0 = Instant::now();
+        let mut ch = capture::Changes::default();
+        let full = |g: &capture::Grab| capture::Rect { x: 0, y: 0, w: g.w, h: g.h };
+        let mut dirty = vec![full(&grab)];
+        // the pointer: its shape sent as it changes, or drawn in where it is
+        let mut img = grab.cursor_image();
+        if !v.draw_cursor {
+            if let Some(c) = &img {
+                if !out.cursor(&capture::cursor_of(c)) {
+                    return Ok(());
+                }
+            }
+        }
+        let mut at: Option<(i16, i16)> = None;
+        let mut drawn: Option<capture::Rect> = None;
+        let (mut sent, mut pending) = (false, true);
         let mut next_slot = Instant::now();
         let mut last = Instant::now();
-        let mut frames = 0u64;
+        let mut stats = Stats::new();
+        let mut scratch = Vec::new();
         while !ctl.stop.load(Ordering::Relaxed) {
-            let wait = if pending { next_slot.saturating_duration_since(Instant::now()) } else { period };
-            if grab.wait(wait.max(Duration::from_millis(1)))? {
-                screen_dirty = true;
-                pending = true;
+            let now = Instant::now();
+            let mut until = if pending { next_slot } else { last + keepalive }.saturating_duration_since(now);
+            if v.draw_cursor {
+                // the pointer is looked for each slot: its moves draw nothing on the screen
+                until = until.min(period);
             }
-            let cursor = grab.cursor();
-            let at = cursor.as_ref().map(|c| (c.x, c.y, c.cursor_serial));
-            if at != cursor_at {
-                cursor_at = at;
-                pending = true;
+            ch.damage.clear();
+            (ch.resized, ch.cursor, ch.woken) = (false, false, false);
+            grab.wait(Some(until), &mut ch)?;
+            if ch.resized {
+                self.screen_is(grab.w, grab.h);
+                yuv.black();
+                dirty.clear();
+                dirty.push(full(&grab));
             }
+            dirty.append(&mut ch.damage);
+            if ch.cursor {
+                img = grab.cursor_image();
+                if !v.draw_cursor {
+                    if let Some(c) = &img {
+                        if !out.cursor(&capture::cursor_of(c)) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if v.draw_cursor {
+                let now_at = grab.pointer();
+                if now_at != at || ch.cursor {
+                    at = now_at;
+                    dirty.extend(drawn.take());
+                    pending = true;
+                }
+            }
+            pending |= !dirty.is_empty();
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
             let now = Instant::now();
             // a change in its slot, a keyframe asked, or once a second the last frame again
-            if !((pending && now >= next_slot) || idr || last.elapsed() >= Duration::from_secs(1)) {
+            if !((pending && now >= next_slot) || idr || now >= last + keepalive) {
                 continue;
             }
-            if screen_dirty {
-                grab.geometry()?;
-                grab.grab(&mut screen)?;
-                screen_dirty = false;
+            let t1 = Instant::now();
+            let (gw, gh) = (grab.w, grab.h);
+            let mut px_done = 0u64;
+            if (gw as usize, gh as usize) == (w, h) {
+                capture::coalesce(&mut dirty, gw, gh);
+                grab.read(&dirty, |r, px, pitch| {
+                    yuv.put(px, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+                    px_done += r.w as u64 * r.h as u64;
+                })?;
+                if let (true, Some(c), Some(p)) = (v.draw_cursor, &img, at) {
+                    if let Some(r) = capture::cursor_rect(c, p, gw, gh) {
+                        grab.read(&[r], |r, px, pitch| {
+                            scratch.clear();
+                            scratch.extend_from_slice(px);
+                            capture::draw_cursor(&mut scratch, pitch, r, c, p);
+                            yuv.put(&scratch, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+                        })?;
+                        drawn = Some(r);
+                    }
+                }
+            } else {
+                // a display that isn't the video's size: all of it, scaled in
+                let r = full(&grab);
+                grab.read(&[r], |r, px, pitch| {
+                    scratch.clear();
+                    scratch.extend_from_slice(px);
+                    if let (true, Some(c), Some(p)) = (v.draw_cursor, &img, at) {
+                        capture::draw_cursor(&mut scratch, pitch, r, c, p);
+                    }
+                    convert::scaled(&scratch, pitch, r.w as usize, r.h as usize, &mut yuv);
+                })?;
+                px_done = gw as u64 * gh as u64;
             }
-            let (sw, sh) = (grab.w as usize, grab.h as usize);
-            frame.clear();
-            frame.extend_from_slice(&screen);
-            if let Some(c) = &cursor {
-                capture::draw_cursor(&mut frame, sw, sh, c);
-            }
-            capture::to_i420(&frame, sw, sh, &mut yuv, w, h);
+            dirty.clear();
             pending = false;
             last = now;
             next_slot = (next_slot + period).max(now);
-            if idr {
-                enc.force_intra_frame();
-            }
-            let (ys, uv) = yuv.split_at(w * h);
-            let (us, vs) = uv.split_at(w * h / 4);
-            let src = YUVSlices::new((ys, us, vs), (w, h), (w, w / 2, w / 2));
-            let bits = enc.encode(&src).map_err(|e| format!("the encoder failed: {e}"))?;
-            let key = matches!(bits.frame_type(), FrameType::IDR | FrameType::I);
-            let au = bits.to_vec();
-            if au.is_empty() {
+            let t2 = Instant::now();
+            let mut nals = Vec::new();
+            let key = enc.encode(yuv.planes(), yuv.strides(), t0.elapsed().as_millis() as i64, idr, &mut nals)?;
+            let t3 = Instant::now();
+            if nals.is_empty() {
                 continue;
             }
             sent = true;
-            frames += 1;
-            if !out(&au, key) {
+            let bytes: usize = nals.iter().map(|n| n.len()).sum();
+            if !out.frame(&nals, key) {
                 break;
             }
+            stats.frame(px_done, bytes, t2 - t1, t3 - t2, t3.elapsed());
         }
-        debug!("video: {frames} frames encoded");
+        stats.log();
         Ok(())
+    }
+}
+
+/// encoder threads (one slice each) for a size: one for small pictures, where a
+/// thread's hand-off costs more than it saves; two at 720p, three at 1080p and up (four
+/// measured no faster than three, with the X server and the app wanting cores too)
+fn threads_for(w: usize, h: usize) -> usize {
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    let want = if w * h >= 1920 * 1080 {
+        3
+    } else if w * h >= 1280 * 720 {
+        2
+    } else {
+        1
+    };
+    want.min(cores.saturating_sub(1)).max(1)
+}
+
+/// where a video's time goes, logged every few seconds at debug
+struct Stats {
+    since: Instant,
+    frames: u32,
+    px: u64,
+    bytes: u64,
+    grab: Duration,
+    enc: Duration,
+    send: Duration,
+    worst: Duration,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats {
+            since: Instant::now(),
+            frames: 0,
+            px: 0,
+            bytes: 0,
+            grab: Duration::ZERO,
+            enc: Duration::ZERO,
+            send: Duration::ZERO,
+            worst: Duration::ZERO,
+        }
+    }
+
+    fn frame(&mut self, px: u64, bytes: usize, grab: Duration, enc: Duration, send: Duration) {
+        self.frames += 1;
+        self.px += px;
+        self.bytes += bytes as u64;
+        self.grab += grab;
+        self.enc += enc;
+        self.send += send;
+        self.worst = self.worst.max(grab + enc + send);
+        if self.since.elapsed() >= Duration::from_secs(5) {
+            self.log();
+        }
+    }
+
+    fn log(&mut self) {
+        if self.frames > 0 {
+            let n = self.frames as f64;
+            let us = |d: Duration| d.as_secs_f64() * 1e6 / n;
+            debug!(
+                "video: {} frames, {:.0} px read a frame; a frame's read+convert {:.0} us, encode {:.0} us, send {:.0} us, worst {} us; {:.1} KiB a frame",
+                self.frames,
+                self.px as f64 / n,
+                us(self.grab),
+                us(self.enc),
+                us(self.send),
+                self.worst.as_micros(),
+                self.bytes as f64 / n / 1024.0
+            );
+        }
+        *self = Stats::new();
     }
 }

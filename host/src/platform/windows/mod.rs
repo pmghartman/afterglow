@@ -28,7 +28,7 @@ use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetP
 use windows::core::{BOOL, GUID, PWSTR};
 
 use crate::conf::Conf;
-use crate::host::{Ctl, Host, Launch, LaunchError, Out, VideoCfg};
+use crate::host::{Ctl, Host, Launch, LaunchError, Sink, VideoCfg};
 use crate::input::Inject;
 use crate::{debug, info, warn};
 
@@ -162,7 +162,7 @@ impl Windows {
     }
 
     /// capture and encode one display until stopped or lost
-    fn stream(&self, v: &VideoCfg, ctl: &Ctl, out: Out, name: Option<&str>) -> Result<bool, String> {
+    fn stream(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink, name: Option<&str>) -> Result<bool, String> {
         let Some(o) = display::find(name) else { return Err("no display to capture".into()) };
         *self.input.rect.lock().unwrap() = input::Rect {
             left: o.rect.left,
@@ -172,7 +172,7 @@ impl Windows {
         };
         let (dev, ctx) =
             capture::device_for(&o).map_err(|e| format!("no Direct3D device on {}: {e}", o.adapter_name))?;
-        let mut dup = match capture::Dup::new(&o, &dev, &ctx) {
+        let mut dup = match capture::Dup::new(&o, &dev, &ctx, v.draw_cursor) {
             Ok(d) => d,
             Err(capture::Lost::Again) => return Ok(true),
             Err(capture::Lost::Wait(why)) => {
@@ -200,7 +200,7 @@ impl Windows {
             // what the encoder finished since, sent as soon as it's out
             for (au, key) in enc.poll()? {
                 stats.au(au.len());
-                if !out(&au, key) {
+                if !out.frame(&crate::h264::split(&au), key) {
                     return Ok(false);
                 }
             }
@@ -227,6 +227,14 @@ impl Windows {
                 }
                 Err(capture::Lost::Fail(why)) => return Err(why),
             }
+            // the pointer's shape to the viewer as it changes, not drawn in
+            if !v.draw_cursor {
+                if let Some(c) = dup.cursor() {
+                    if !out.cursor(&c) {
+                        return Ok(false);
+                    }
+                }
+            }
             if !sent && !pending {
                 // no picture captured yet
                 continue;
@@ -249,12 +257,38 @@ impl Windows {
             sent = true;
             for (au, key) in made {
                 stats.au(au.len());
-                if !out(&au, key) {
+                if !out.frame(&crate::h264::split(&au), key) {
                     return Ok(false);
                 }
             }
         }
         Ok(false)
+    }
+}
+
+/// the calling thread registered with the multimedia scheduler (MMCSS) as capture
+/// work, for as long as this lives: the scheduler runs it ahead of ordinary threads so
+/// a busy machine doesn't delay a frame by a scheduling quantum
+struct Mmcss(windows::Win32::Foundation::HANDLE);
+
+impl Mmcss {
+    fn capture() -> Option<Mmcss> {
+        let mut idx = 0u32;
+        // SAFETY: registers this thread; reverted in Drop on the same thread
+        unsafe {
+            windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(windows::core::w!("Capture"), &mut idx)
+                .ok()
+                .map(Mmcss)
+        }
+    }
+}
+
+impl Drop for Mmcss {
+    fn drop(&mut self) {
+        // SAFETY: the handle AvSetMmThreadCharacteristicsW gave this thread
+        unsafe {
+            let _ = windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0);
+        }
     }
 }
 
@@ -407,8 +441,9 @@ impl Host for Windows {
         }
     }
 
-    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: Out) -> Result<(), String> {
+    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
         com_init();
+        let _mmcss = Mmcss::capture();
         let name = self.run.lock().unwrap().vdisplay.clone();
         // the virtual display follows the viewer's window: the app redraws at its size
         if let Some(n) = &name {

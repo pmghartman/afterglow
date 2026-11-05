@@ -7,7 +7,7 @@ name = "afterglow"
 version = "0.0.0"
 dependencies = [
  "libc",
- "openh264",
+ "openh264-sys2",
  "serde_json",
  "windows",
  "windows-service",
@@ -19,12 +19,6 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
-
-[[package]]
-name = "bytemuck"
-version = "1.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "cc"
@@ -131,16 +125,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openh264"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e54411f498088327bf5c45d2de7e5b0ed25875ee3be5800485afe45da7206bff"
-dependencies = [
- "openh264-sys2",
- "wide",
-]
-
-[[package]]
 name = "openh264-sys2"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -186,15 +170,6 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
-]
-
-[[package]]
-name = "safe_arch"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
-dependencies = [
- "bytemuck",
 ]
 
 [[package]]
@@ -290,16 +265,6 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
-]
-
-[[package]]
-name = "wide"
-version = "1.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
-dependencies = [
- "bytemuck",
- "safe_arch",
 ]
 
 [[package]]
