@@ -41,12 +41,34 @@ fn chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
 
 /// w×h straight-alpha RGBA, rows top to bottom, as a PNG
 pub fn rgba(w: u32, h: u32, px: &[u8]) -> Vec<u8> {
+    encode(w, h, px, false)
+}
+
+/// the same, deflated: smaller for what is stored once and sent many times (icons)
+pub fn rgba_z(w: u32, h: u32, px: &[u8]) -> Vec<u8> {
+    encode(w, h, px, true)
+}
+
+fn encode(w: u32, h: u32, px: &[u8], deflate: bool) -> Vec<u8> {
     let row = w as usize * 4;
     let mut raw = Vec::with_capacity((row + 1) * h as usize);
     for r in px.chunks_exact(row).take(h as usize) {
         raw.push(0);
         raw.extend_from_slice(r);
     }
+    let z = if deflate { miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6) } else { stored(&raw) };
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn stored(raw: &[u8]) -> Vec<u8> {
     let mut z = vec![0x78, 0x01];
     let blocks = raw.chunks(65535);
     let n = blocks.len().max(1);
@@ -59,16 +81,8 @@ pub fn rgba(w: u32, h: u32, px: &[u8]) -> Vec<u8> {
         z.extend_from_slice(&(!(b.len() as u16)).to_le_bytes());
         z.extend_from_slice(b);
     }
-    z.extend_from_slice(&adler32(&raw).to_be_bytes());
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&w.to_be_bytes());
-    ihdr.extend_from_slice(&h.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-    chunk(&mut out, b"IDAT", &z);
-    chunk(&mut out, b"IEND", &[]);
-    out
+    z.extend_from_slice(&adler32(raw).to_be_bytes());
+    z
 }
 
 #[cfg(test)]
@@ -79,6 +93,14 @@ mod tests {
     fn checksums_as_zlib_and_png_have_them() {
         assert_eq!(crc32(b"IEND"), 0xae42_6082);
         assert_eq!(adler32(b"Wikipedia"), 0x11e6_0398);
+    }
+
+    #[test]
+    fn a_deflated_png_keeps_its_layout() {
+        let p = rgba_z(48, 48, &[7u8; 48 * 48 * 4]);
+        assert_eq!(&p[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&p[16..24], &[0, 0, 0, 48, 0, 0, 0, 48]);
+        assert!(p.len() < 400);
     }
 
     #[test]

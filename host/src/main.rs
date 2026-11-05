@@ -1,21 +1,26 @@
 //! afterglow <afterglow.conf>: the link served until shutdown
 //! afterglow --stdio: one driver on stdin and stdout (ssh's), the app ended with it
+//! afterglow --icons: app icons for the specs on stdin, a JSON line each on stdout
 //! afterglow --features: what this build serves, one line, for a driver probing a host
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use afterglow::link::{Link, PROTO, VERSION};
-use afterglow::{conf, error, info, log, platform};
+use afterglow::{conf, error, icons, info, log, platform};
 
-/// what a driver can count on from this build
-const FEATURES: &str = "stdio argv notes clipboard raise close cursor";
+/// what a driver can count on from this build; icons is Windows only
+const FEATURES: &str = if cfg!(windows) {
+    "stdio argv notes clipboard raise close cursor icons"
+} else {
+    "stdio argv notes clipboard raise close cursor"
+};
 
 fn main() {
     let arg = std::env::args().nth(1);
     let Some(path) = arg.filter(|a| a != "--help") else {
         eprintln!(
-            "usage: afterglow <afterglow.conf>\n       afterglow --stdio\n       afterglow --version | --features"
+            "usage: afterglow <afterglow.conf>\n       afterglow --stdio\n       afterglow --icons < specs\n       afterglow --version | --features"
         );
         std::process::exit(2);
     };
@@ -23,6 +28,7 @@ fn main() {
         "--version" => return println!("afterglow {VERSION}"),
         "--features" => return println!("afterglow {VERSION} proto={PROTO} {FEATURES}"),
         "--stdio" => return stdio(),
+        "--icons" => std::process::exit(icons::run()),
         _ => {}
     }
     let conf = match std::fs::read_to_string(&path)

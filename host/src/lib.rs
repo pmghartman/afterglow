@@ -7,6 +7,7 @@ pub mod log;
 pub mod conf;
 pub mod h264;
 pub mod host;
+pub mod icons;
 pub mod input;
 pub mod link;
 pub mod platform;
