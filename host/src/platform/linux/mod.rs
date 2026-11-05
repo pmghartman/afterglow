@@ -5,7 +5,7 @@
 //! OpenH264; input injected with XTest. The app is a process group of its own.
 
 mod capture;
-mod convert;
+
 mod encode;
 mod wm;
 mod xserver;
@@ -24,6 +24,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::conf::Conf;
+use crate::convert;
 use crate::host::{Ctl, Host, Launch, LaunchError, Notes, Sink, VideoCfg};
 use crate::input::Inject;
 use crate::{debug, info, warn};

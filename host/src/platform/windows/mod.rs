@@ -172,7 +172,10 @@ impl Windows {
         };
         let (dev, ctx) =
             capture::device_for(&o).map_err(|e| format!("no Direct3D device on {}: {e}", o.adapter_name))?;
-        let mut dup = match capture::Dup::new(&o, &dev, &ctx, v.draw_cursor) {
+        // afterglow's own encoder unless Media Foundation's is asked for, or the pointer is
+        // drawn in (the GPU composes it)
+        let own = !matches!(self.conf.encoder.as_str(), "hardware" | "mf" | "software") && !v.draw_cursor;
+        let mut dup = match capture::Dup::new(&o, &dev, &ctx, v.draw_cursor, own) {
             Ok(d) => d,
             Err(capture::Lost::Again) => return Ok(true),
             Err(capture::Lost::Wait(why)) => {
@@ -182,6 +185,10 @@ impl Windows {
             }
             Err(capture::Lost::Fail(why)) => return Err(why),
         };
+        if own {
+            info!("capturing {} ({}x{}) on {}, afterglow's own encoder", o.name, dup.w, dup.h, o.adapter_name);
+            return self.stream_own(v, ctl, out, &mut dup);
+        }
         let force_sw = self.conf.encoder == "software";
         let mut enc = encode::Encoder::new(&dev, &ctx, &dup.comp, dup.w, dup.h, v, o.luid, force_sw)?;
         info!("capturing {} ({}x{}) on {}", o.name, dup.w, dup.h, o.adapter_name);
@@ -265,6 +272,133 @@ impl Windows {
         Ok(false)
     }
 }
+
+impl Windows {
+    /// the display encoded by afterglow's own encoder (crate::avc): at the video's size
+    /// only the rectangles duplication says changed are read back, converted and coded
+    /// (at another size, all of it scaled in); what's coarse is refined once the
+    /// screen is still. As the Linux host's
+    fn stream_own(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink, dup: &mut capture::Dup) -> Result<bool, String> {
+        let (w, h) = (v.w as usize, v.h as usize);
+        let cores = thread::available_parallelism().map_or(1, |n| n.get());
+        let mut enc = crate::avc::Encoder::new(w, h, v.fps, cores);
+        let mut rate = crate::avc::Rate::new(v.kbps, v.fps);
+        let (pw, ph) = enc.padded();
+        let mut yuv = crate::convert::Yuv::padded(w, h, pw, ph);
+        let period = Duration::from_secs_f64(1.0 / v.fps as f64);
+        let keepalive = Duration::from_secs(1);
+        let (mut sent, mut pending) = (false, false);
+        let mut next_slot = Instant::now();
+        let mut last = Instant::now();
+        let mut changed_at = Instant::now();
+        let mut next_refine = Instant::now();
+        let mut coarse = false;
+        let mut stats = Stats::new();
+        while !ctl.stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let refine_at = (changed_at + REFINE_AFTER).max(next_slot).max(next_refine);
+            let until = if pending {
+                next_slot
+            } else if coarse {
+                refine_at.min(last + keepalive)
+            } else {
+                last + keepalive
+            };
+            // short enough that a keyframe or a stop asked is seen soon
+            let wait = until.saturating_duration_since(now).min(Duration::from_millis(8));
+            match dup.next(wait.as_millis() as u32) {
+                Ok(capture::Got::Frame) => {
+                    pending = true;
+                    stats.captured += 1;
+                }
+                Ok(capture::Got::Timeout) => {}
+                Err(capture::Lost::Again) => {
+                    info!("the capture was lost; set up again");
+                    return Ok(true);
+                }
+                Err(capture::Lost::Wait(why)) => {
+                    debug!("{why}");
+                    thread::sleep(Duration::from_millis(100));
+                    return Ok(true);
+                }
+                Err(capture::Lost::Fail(why)) => return Err(why),
+            }
+            if let Some(c) = dup.cursor() {
+                if !out.cursor(&c) {
+                    return Ok(false);
+                }
+            }
+            if !sent && !pending {
+                continue;
+            }
+            let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
+            let now = Instant::now();
+            let change = (pending && now >= next_slot) || idr;
+            let alive = now >= last + keepalive;
+            let refine = !change && !pending && coarse && now >= refine_at;
+            if !(change || alive || refine) {
+                continue;
+            }
+            if change {
+                let lost = |e| match e {
+                    capture::Lost::Fail(why) | capture::Lost::Wait(why) => why,
+                    capture::Lost::Again => "the capture was lost".to_string(),
+                };
+                if (dup.w, dup.h) == (v.w, v.h) {
+                    dup.read(|r, px, pitch| {
+                        yuv.put(px, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+                        enc.mark(r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+                    })
+                    .map_err(lost)?;
+                } else {
+                    let (sw, sh) = (dup.w as usize, dup.h as usize);
+                    dup.read_whole(|px, pitch| crate::convert::scaled(px, pitch, sw, sh, &mut yuv)).map_err(lost)?;
+                    enc.mark_all();
+                }
+                pending = false;
+                next_slot = (next_slot + period).max(now);
+            }
+            last = now;
+            let [y, u, vv] = yuv.planes();
+            let frame = crate::avc::Frame { y, u, v: vv };
+            let (opts, act) = if refine {
+                let fine =
+                    if enc.coarse(crate::avc::QP_LEGIBLE) > 0 { crate::avc::QP_READ } else { crate::avc::QP_FINE };
+                (
+                    crate::avc::Opts { idr: false, qp: fine, refine: Some((fine, rate.refine_bytes())), always: false },
+                    0.0,
+                )
+            } else {
+                let (mbs, act) = enc.activity(&frame, idr);
+                (crate::avc::Opts { idr, qp: rate.qp(mbs, act), refine: None, always: alive && !change }, act)
+            };
+            let t0 = Instant::now();
+            let d = enc.encode(&frame, &opts);
+            stats.encoded(t0.elapsed());
+            rate.seen(&d, opts.qp, act);
+            if !d.frame {
+                continue;
+            }
+            sent = true;
+            stats.au(d.bytes);
+            if !out.frame(&enc.nals(), d.key) {
+                return Ok(false);
+            }
+            if change {
+                changed_at = now;
+            }
+            if refine {
+                next_refine = now + period;
+            }
+            coarse = enc.coarse(crate::avc::QP_FINE) > 0;
+            stats.tick(0);
+        }
+        Ok(false)
+    }
+}
+
+/// how long the screen is still before what was coded coarsely is refined
+const REFINE_AFTER: Duration = Duration::from_millis(60);
 
 /// the calling thread registered with the multimedia scheduler (MMCSS) as capture
 /// work, for as long as this lives: the scheduler runs it ahead of ordinary threads so
