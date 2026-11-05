@@ -6,7 +6,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pmghartman/afterglow/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/pmghartman/afterglow/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <a href="https://github.com/pmghartman/afterglow/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/pmghartman/afterglow?style=flat-square&color=a371f7"></a>
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20GPL--3.0-f0883e?style=flat-square">
 </p>
@@ -158,7 +157,7 @@ Format with `bun run fmt`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Releases
 
-Manual, as Phosphorus's: run **release** from the Actions tab (optionally **Bump Major Version**, or **Build only** to try the Windows build without publishing). [`release.yml`](.github/workflows/release.yml) takes the version one past the highest `vMAJOR.MINOR` tag, runs CI, builds the host at that version, and publishes `vX.Y` with the host zip, its `SHA256SUMS` and a build provenance attestation; the notes list the merged pull requests.
+Manual, as Phosphorus's: run **release** from the Actions tab (optionally **Bump Major Version**, or **Build only** to try the Windows build without publishing). [`release.yml`](.github/workflows/release.yml) takes the version one past the highest `vMAJOR.MINOR` tag, runs the checks and tests, builds the host at that version, and publishes `vX.Y` with the host zip, its `SHA256SUMS` and a build provenance attestation; the notes list the merged pull requests.
 
 Consumers pin the client by that tag. Phosphorus installs the host zip of the version its pin names, so bumping the pin moves both.
 

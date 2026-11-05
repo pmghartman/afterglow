@@ -1,5 +1,6 @@
-# manual release, as phosphorus's: vVERSION, one past the highest vMAJOR.MINOR tag (minor,
-# or major with .0). CI, the host built on Windows, then a GitHub release with
+# manual release, as phosphorus's, and the repo's only workflow: vVERSION, one past the
+# highest vMAJOR.MINOR tag (minor, or major with .0). The client's checks and tests, the
+# host built on Windows, then a GitHub release with
 # afterglow-VERSION-windows-x86_64.zip, its SHA256SUMS and a build provenance
 # attestation. "Build only" stops before publishing: a way to try the Windows build.
 # The SudoVDA driver isn't in Apollo's tree: its signed package and nefconc.exe come out
@@ -51,8 +52,18 @@ jobs:
           fi
           echo "ver=$V" | tee -a "$GITHUB_OUTPUT"
 
-  ci:
-    uses: ./.github/workflows/ci.yml
+  # the client typed, formatted and tested, the host's link framing built and run
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run lint
+      - run: bun test
+      - run: bun run test:wire
 
   # the host, built on Windows in MSYS2 UCRT64
   windows:
@@ -134,7 +145,7 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: [version, ci, windows]
+    needs: [version, check, windows]
     if: ${{ !inputs.build_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
