@@ -159,6 +159,8 @@ Format with `bun run fmt`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Manual, as Phosphorus's: run **release** from the Actions tab (optionally **Bump Major Version**, or **Build only** to try the Windows build without publishing). [`release.yml`](.github/workflows/release.yml) takes the version one past the highest `vMAJOR.MINOR` tag, runs the checks and tests, builds the host at that version, and publishes `vX.Y` with the host zip, its `SHA256SUMS` and a build provenance attestation; the notes list the merged pull requests.
 
+A `vX.Y` tag pushed by hand is released instead, built from its own commit, when it has no release yet.
+
 Consumers pin the client by that tag. Phosphorus installs the host zip of the version its pin names, so bumping the pin moves both.
 
 ## Licence

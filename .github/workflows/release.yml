@@ -39,25 +39,38 @@ jobs:
     timeout-minutes: 5
     outputs:
       ver: ${{ steps.v.outputs.ver }}
+      ref: ${{ steps.v.outputs.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # a tag pushed by hand with no release yet is released as it is, from its commit;
+      # otherwise the next version, from this run's commit
       - id: v
         env:
           MAJOR: ${{ inputs.major }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           L=$(git ls-remote --tags origin | sed -n 's|.*refs/tags/v\([0-9]*\.[0-9]*\)$|\1|p' | sort -t. -k1,1n -k2,2n | tail -1)
-          L=${L:-0.0}
-          if [ "$MAJOR" = true ]; then V=$(( ${L%.*} + 1 )).0
-          else V=${L%.*}.$(( ${L#*.} + 1 ))
+          if [ -n "$L" ] && ! gh release view "v$L" >/dev/null 2>&1; then
+            # the tag's commit (an annotated tag's ^{} line sorts after it)
+            V=$L REF=$(git ls-remote origin "refs/tags/v$L" "refs/tags/v$L^{}" | sort -k2 | tail -1 | cut -f1)
+          else
+            L=${L:-0.0} REF=$GITHUB_SHA
+            if [ "$MAJOR" = true ]; then V=$(( ${L%.*} + 1 )).0
+            else V=${L%.*}.$(( ${L#*.} + 1 ))
+            fi
           fi
           echo "ver=$V" | tee -a "$GITHUB_OUTPUT"
+          echo "ref=$REF" | tee -a "$GITHUB_OUTPUT"
 
   # the client typed, formatted and tested, the host's link framing built and run
   check:
+    needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.version.outputs.ref }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
       - run: bun run check
@@ -76,6 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.version.outputs.ref }}
           submodules: recursive
           fetch-depth: 1
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
@@ -186,7 +200,7 @@ jobs:
         with:
           tag_name: v${{ env.VER }}
           name: afterglow ${{ env.VER }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ needs.version.outputs.ref }}
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
           files: out/*
