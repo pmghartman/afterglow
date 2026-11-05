@@ -261,13 +261,16 @@ jobs:
             tar -C stage/linux-$a -czf "out/afterglow-$VER-linux-$a.tar.gz" .
           done
           (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
-      # the manifest of the archives above, signed (prehashed Ed25519, as minisign -S)
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          no-cache: true
+      # the manifest of the archives above, signed (prehashed Ed25519, as minisign -S) by
+      # scripts/sign.ts, which takes the key as phosphorus keeps it
       - name: manifest
         env:
           KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
           [ -n "$KEY" ] || { echo "::error::secret UPDATE_SIGNING_KEY is not set"; exit 1; }
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           for f in out/afterglow-*.zip out/afterglow-*.tar.gz; do
             # each archive carries the version it is
             n=$(basename "$f")
