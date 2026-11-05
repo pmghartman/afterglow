@@ -140,7 +140,7 @@ pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32) -> bool {
     } else if millihz % 1000 > 0 {
         (millihz / 1000, millihz / 1000 + 1)
     } else {
-        (millihz / 1000, millihz / 1000 - 1)
+        (millihz / 1000, (millihz / 1000).saturating_sub(1).max(1))
     };
     dm.dmPelsWidth = w;
     dm.dmPelsHeight = h;

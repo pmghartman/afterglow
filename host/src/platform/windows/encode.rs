@@ -22,12 +22,16 @@ use super::capture::texture;
 use crate::host::VideoCfg;
 use crate::{debug, info, warn};
 
+/// NV12 textures the encoder's input cycles through
+const RING: usize = 4;
+
 /// BGRA at the capture's size in, NV12 at the video's size out
 struct Convert {
     vctx: ID3D11VideoContext,
     vp: ID3D11VideoProcessor,
     input: ID3D11VideoProcessorInputView,
-    output: ID3D11VideoProcessorOutputView,
+    /// one per texture of the encoder's ring
+    outputs: Vec<ID3D11VideoProcessorOutputView>,
 }
 
 impl Convert {
@@ -38,7 +42,7 @@ impl Convert {
         src: &ID3D11Texture2D,
         sw: u32,
         sh: u32,
-        dst: &ID3D11Texture2D,
+        dst: &[ID3D11Texture2D],
         w: u32,
         h: u32,
         fps: u32,
@@ -69,12 +73,16 @@ impl Convert {
                 },
             };
             vdev.CreateVideoProcessorInputView(src, &en, &iv, Some(&mut input))?;
-            let mut output = None;
             let ov = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
             };
-            vdev.CreateVideoProcessorOutputView(dst, &en, &ov, Some(&mut output))?;
+            let mut outputs = Vec::new();
+            for t in dst {
+                let mut o = None;
+                vdev.CreateVideoProcessorOutputView(t, &en, &ov, Some(&mut o))?;
+                outputs.push(o.unwrap());
+            }
             if let Ok(v1) = vctx.cast::<ID3D11VideoContext1>() {
                 v1.VideoProcessorSetStreamColorSpace1(&vp, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
                 v1.VideoProcessorSetOutputColorSpace1(&vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
@@ -108,11 +116,12 @@ impl Convert {
                 },
             };
             vctx.VideoProcessorSetOutputBackgroundColor(&vp, true, &black);
-            Ok(Convert { vctx, vp, input: input.unwrap(), output: output.unwrap() })
+            Ok(Convert { vctx, vp, input: input.unwrap(), outputs })
         }
     }
 
-    fn run(&self) -> Result<()> {
+    /// into the ring's texture i
+    fn run(&self, i: usize) -> Result<()> {
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             pInputSurface: ManuallyDrop::new(Some(self.input.clone())),
@@ -120,7 +129,7 @@ impl Convert {
         };
         let streams = [stream];
         // SAFETY: the views belong to this processor's device
-        let r = unsafe { self.vctx.VideoProcessorBlt(&self.vp, &self.output, 0, &streams) };
+        let r = unsafe { self.vctx.VideoProcessorBlt(&self.vp, &self.outputs[i], 0, &streams) };
         let [mut s] = streams;
         // SAFETY: the clone taken above, released once
         unsafe { ManuallyDrop::drop(&mut s.pInputSurface) };
@@ -132,8 +141,9 @@ fn type_info(sub: GUID) -> MFT_REGISTER_TYPE_INFO {
     MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: sub }
 }
 
-/// the encoders Media Foundation lists, the first activated that will
-fn find(hardware: bool, luid: LUID) -> Option<(IMFTransform, String)> {
+/// the encoders Media Foundation lists for this GPU (or the software ones), best first,
+/// with their names
+fn list(hardware: bool, luid: LUID) -> Vec<(IMFActivate, String)> {
     let (input, output) = (type_info(MFVideoFormat_NV12), type_info(MFVideoFormat_H264));
     let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut n = 0u32;
@@ -141,10 +151,14 @@ fn find(hardware: bool, luid: LUID) -> Option<(IMFTransform, String)> {
     unsafe {
         let r = if hardware {
             let mut attrs = None;
-            MFCreateAttributes(&mut attrs, 1).ok()?;
-            let attrs = attrs?;
+            if MFCreateAttributes(&mut attrs, 1).is_err() {
+                return Vec::new();
+            }
+            let Some(attrs) = attrs else { return Vec::new() };
             let bytes = std::slice::from_raw_parts(&luid as *const LUID as *const u8, size_of::<LUID>());
-            attrs.SetBlob(&MFT_ENUM_ADAPTER_LUID, bytes).ok()?;
+            if attrs.SetBlob(&MFT_ENUM_ADAPTER_LUID, bytes).is_err() {
+                return Vec::new();
+            }
             MFTEnum2(
                 MFT_CATEGORY_VIDEO_ENCODER,
                 MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
@@ -164,29 +178,30 @@ fn find(hardware: bool, luid: LUID) -> Option<(IMFTransform, String)> {
                 &mut n,
             )
         };
-        if r.is_err() || list.is_null() {
-            return None;
+        if let Err(e) = r {
+            debug!("no {} encoders listed: {e}", if hardware { "hardware" } else { "software" });
+            return Vec::new();
+        }
+        if list.is_null() {
+            return Vec::new();
         }
         let acts: Vec<Option<IMFActivate>> = (0..n as usize).map(|i| (*list.add(i)).take()).collect();
         CoTaskMemFree(Some(list as *const c_void));
-        for a in acts.into_iter().flatten() {
-            let name = {
+        acts.into_iter()
+            .flatten()
+            .map(|a| {
                 let mut p = windows::core::PWSTR::null();
                 let mut len = 0;
-                if a.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut p, &mut len).is_ok() {
+                let name = if a.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut p, &mut len).is_ok() {
                     let s = p.to_string().unwrap_or_default();
                     CoTaskMemFree(Some(p.0 as *const c_void));
                     s
                 } else {
                     "an encoder".to_string()
-                }
-            };
-            match a.ActivateObject::<IMFTransform>() {
-                Ok(t) => return Some((t, name)),
-                Err(e) => debug!("{name} wouldn't start: {e}"),
-            }
-        }
-        None
+                };
+                (a, name)
+            })
+            .collect()
     }
 }
 
@@ -218,10 +233,14 @@ fn video_type(sub: GUID, v: &VideoCfg) -> Result<IMFMediaType> {
 pub struct Encoder {
     ctx: ID3D11DeviceContext,
     convert: Convert,
-    nv12: ID3D11Texture2D,
+    /// the encoder's input: a ring, so a frame it still reads isn't drawn over
+    ring: Vec<ID3D11Texture2D>,
+    next: usize,
     /// a software encoder's input: the NV12 frame read back
     staging: Option<ID3D11Texture2D>,
     mft: IMFTransform,
+    /// what made it: shut down with it, freeing its hardware session
+    activate: IMFActivate,
     events: Option<IMFMediaEventGenerator>,
     codec: Option<ICodecAPI>,
     /// async: inputs the encoder has asked for and not yet been given
@@ -250,73 +269,86 @@ impl Encoder {
         software: bool,
     ) -> std::result::Result<Encoder, String> {
         let e = |e: windows::core::Error| e.to_string();
-        let nv12 = texture(
-            dev,
-            v.w,
-            v.h,
-            DXGI_FORMAT_NV12,
-            D3D11_BIND_RENDER_TARGET,
-            D3D11_USAGE_DEFAULT,
-            D3D11_CPU_ACCESS_FLAG(0),
-        )
-        .map_err(e)?;
-        let convert = Convert::new(dev, ctx, src, sw, sh, &nv12, v.w, v.h, v.fps)
+        let nv12 = |bind: D3D11_BIND_FLAG| {
+            texture(dev, v.w, v.h, DXGI_FORMAT_NV12, bind, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0))
+        };
+        let mut ring = Vec::new();
+        for _ in 0..RING {
+            // shader-readable for encoders that sample their input; not every GPU allows it for NV12
+            let t = nv12(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)
+                .or_else(|_| nv12(D3D11_BIND_RENDER_TARGET))
+                .map_err(e)?;
+            ring.push(t);
+        }
+        let convert = Convert::new(dev, ctx, src, sw, sh, &ring, v.w, v.h, v.fps)
             .map_err(|x| format!("the video processor: {x}"))?;
         let mut tried = Vec::new();
         for hw in [true, false] {
             if hw && software {
                 continue;
             }
-            let Some((mft, name)) = find(hw, luid) else { continue };
-            match Self::setup(dev, &mft, v, hw) {
-                Ok((events, codec, mgr, staging_needed)) => {
-                    let staging = if staging_needed {
-                        Some(
-                            texture(
-                                dev,
-                                v.w,
-                                v.h,
-                                DXGI_FORMAT_NV12,
-                                D3D11_BIND_FLAG(0),
-                                D3D11_USAGE_STAGING,
-                                D3D11_CPU_ACCESS_READ,
-                            )
-                            .map_err(e)?,
+            for (activate, name) in list(hw, luid) {
+                // SAFETY: activation of a listed encoder
+                let mft = match unsafe { activate.ActivateObject::<IMFTransform>() } {
+                    Ok(t) => t,
+                    Err(x) => {
+                        debug!("{name} wouldn't start: {x}");
+                        tried.push(name);
+                        continue;
+                    }
+                };
+                let (events, codec, mgr, staging_needed) = match Self::setup(dev, &mft, v, hw) {
+                    Ok(r) => r,
+                    Err(x) => {
+                        warn!("{name} couldn't be set up: {x}");
+                        // SAFETY: the encoder activated above, released
+                        unsafe {
+                            let _ = activate.ShutdownObject();
+                        }
+                        tried.push(name);
+                        continue;
+                    }
+                };
+                let staging = if staging_needed {
+                    Some(
+                        texture(
+                            dev,
+                            v.w,
+                            v.h,
+                            DXGI_FORMAT_NV12,
+                            D3D11_BIND_FLAG(0),
+                            D3D11_USAGE_STAGING,
+                            D3D11_CPU_ACCESS_READ,
                         )
-                    } else {
-                        None
-                    };
-                    // SAFETY: stream info of a configured encoder
-                    let info = unsafe { mft.GetOutputStreamInfo(0) }.map_err(e)?;
-                    let provides = info.dwFlags
-                        & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32
-                        != 0;
-                    let mut enc = Encoder {
-                        ctx: ctx.clone(),
-                        convert,
-                        nv12,
-                        staging,
-                        mft,
-                        events,
-                        codec,
-                        credits: 0,
-                        provides,
-                        out_size: info.cbSize.max(v.w * v.h * 3 / 2),
-                        seq: Vec::new(),
-                        n: 0,
-                        period: 10_000_000 / v.fps as i64,
-                        w: v.w,
-                        h: v.h,
-                        _mgr: mgr,
-                    };
-                    enc.seq = enc.sequence_header();
-                    info!("encoding with {name}{}", if hw { "" } else { " (software)" });
-                    return Ok(enc);
-                }
-                Err(x) => {
-                    warn!("{name} couldn't be set up: {x}");
-                    tried.push(name);
-                }
+                        .map_err(e)?,
+                    )
+                } else {
+                    None
+                };
+                let mut enc = Encoder {
+                    ctx: ctx.clone(),
+                    convert,
+                    ring,
+                    next: 0,
+                    staging,
+                    mft,
+                    activate,
+                    events,
+                    codec,
+                    credits: 0,
+                    provides: false,
+                    out_size: 0,
+                    seq: Vec::new(),
+                    n: 0,
+                    period: 10_000_000 / v.fps as i64,
+                    w: v.w,
+                    h: v.h,
+                    _mgr: mgr,
+                };
+                enc.stream_info().map_err(e)?;
+                enc.seq = enc.sequence_header();
+                info!("encoding with {name}{}", if hw { "" } else { " (software)" });
+                return Ok(enc);
             }
         }
         Err(if tried.is_empty() {
@@ -324,6 +356,16 @@ impl Encoder {
         } else {
             format!("no H.264 encoder would start: {}", tried.join(", "))
         })
+    }
+
+    /// whether the encoder makes its own output samples, and how big ours must be
+    fn stream_info(&mut self) -> Result<()> {
+        // SAFETY: stream info of a configured encoder
+        let info = unsafe { self.mft.GetOutputStreamInfo(0) }?;
+        self.provides =
+            info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32 != 0;
+        self.out_size = info.cbSize.max(self.w * self.h * 3 / 2);
+        Ok(())
     }
 
     #[allow(clippy::type_complexity)]
@@ -411,30 +453,43 @@ impl Encoder {
     }
 
     fn input_sample(&mut self) -> Result<IMFSample> {
-        // SAFETY: COM calls; the staging texture is mapped only while copied from
+        let i = self.next;
+        self.next = (self.next + 1) % self.ring.len();
+        self.convert.run(i)?;
+        let nv12 = &self.ring[i];
+        // SAFETY: COM calls; the staging texture is unmapped on every path once mapped
         unsafe {
-            self.convert.run()?;
             let buf = match &self.staging {
-                None => MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &self.nv12, 0, false)?,
+                None => {
+                    let b = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false)?;
+                    // some encoders refuse a buffer whose length says it's empty
+                    if let Ok(n) = b.GetMaxLength() {
+                        let _ = b.SetCurrentLength(n);
+                    }
+                    b
+                }
                 Some(st) => {
-                    self.ctx.CopyResource(st, &self.nv12);
+                    self.ctx.CopyResource(st, nv12);
                     let mut m = D3D11_MAPPED_SUBRESOURCE::default();
                     self.ctx.Map(st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
                     let (w, h) = (self.w as usize, self.h as usize);
-                    let size = w * h * 3 / 2;
-                    let mb = MFCreateMemoryBuffer(size as u32)?;
-                    let mut p = std::ptr::null_mut();
-                    mb.Lock(&mut p, None, None)?;
-                    let src = m.pData as *const u8;
-                    let pitch = m.RowPitch as usize;
-                    // Y rows, then the interleaved UV rows below them
-                    for r in 0..h + h / 2 {
-                        std::ptr::copy_nonoverlapping(src.add(r * pitch), p.add(r * w), w);
-                    }
-                    mb.Unlock()?;
-                    mb.SetCurrentLength(size as u32)?;
+                    let copied = (|| -> Result<IMFMediaBuffer> {
+                        let size = w * h * 3 / 2;
+                        let mb = MFCreateMemoryBuffer(size as u32)?;
+                        let mut p = std::ptr::null_mut();
+                        mb.Lock(&mut p, None, None)?;
+                        let src = m.pData as *const u8;
+                        let pitch = m.RowPitch as usize;
+                        // Y rows, then the interleaved UV rows below them
+                        for r in 0..h + h / 2 {
+                            std::ptr::copy_nonoverlapping(src.add(r * pitch), p.add(r * w), w);
+                        }
+                        mb.Unlock()?;
+                        mb.SetCurrentLength(size as u32)?;
+                        Ok(mb)
+                    })();
                     self.ctx.Unmap(st, 0);
-                    mb
+                    copied?
                 }
             };
             let s = MFCreateSample()?;
@@ -475,6 +530,7 @@ impl Encoder {
                     // the encoder settled its output: take the type it offers
                     let t = self.mft.GetOutputAvailableType(0, 0)?;
                     self.mft.SetOutputType(0, &t, 0)?;
+                    self.stream_info()?;
                     self.seq = self.sequence_header();
                     return Ok(true);
                 }
@@ -521,13 +577,35 @@ impl Encoder {
         }
     }
 
-    /// the composed frame encoded: whatever access units came out
+    /// the composed frame encoded: whatever access units came out by now. An
+    /// asynchronous encoder's later output comes from poll
     pub fn encode(&mut self, idr: bool) -> std::result::Result<Vec<(Vec<u8>, bool)>, String> {
         self.encode_inner(idr).map_err(|e| format!("the encoder failed: {e}"))
     }
 
+    /// what an asynchronous encoder has made since, without waiting
+    pub fn poll(&mut self) -> std::result::Result<Vec<(Vec<u8>, bool)>, String> {
+        let mut out = Vec::new();
+        self.drain_events(&mut out).map_err(|e| format!("the encoder failed: {e}"))?;
+        Ok(out)
+    }
+
     fn encode_inner(&mut self, idr: bool) -> Result<Vec<(Vec<u8>, bool)>> {
         let mut out = Vec::new();
+        if self.events.is_some() {
+            // asynchronous: the frame converted only once the encoder asks for one, so
+            // nothing it still reads is drawn over
+            let t0 = Instant::now();
+            while self.credits == 0 {
+                self.drain_events(&mut out)?;
+                if self.credits == 0 {
+                    if t0.elapsed() > Duration::from_secs(2) {
+                        return Err(windows::core::Error::new(E_NOTIMPL, "the encoder stopped asking for frames"));
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+            }
+        }
         if idr {
             if let Some(c) = &self.codec {
                 // SAFETY: a plain setting
@@ -541,23 +619,13 @@ impl Encoder {
             while self.pull(&mut out)? {}
             return Ok(out);
         }
-        // asynchronous: given the frame when it asks, its output waited for briefly
-        let t0 = Instant::now();
-        while self.credits == 0 {
-            self.drain_events(&mut out)?;
-            if self.credits == 0 {
-                if t0.elapsed() > Duration::from_secs(2) {
-                    return Err(windows::core::Error::new(E_NOTIMPL, "the encoder stopped asking for frames"));
-                }
-                std::thread::sleep(Duration::from_micros(500));
-            }
-        }
         self.credits -= 1;
         // SAFETY: an input the encoder asked for
         unsafe { self.mft.ProcessInput(0, &sample, 0)? };
+        // its output, if it comes quickly; otherwise poll collects it
         let t1 = Instant::now();
         let before = out.len();
-        while out.len() == before && t1.elapsed() < Duration::from_millis(100) {
+        while out.len() == before && t1.elapsed() < Duration::from_millis(20) {
             self.drain_events(&mut out)?;
             if out.len() == before {
                 std::thread::sleep(Duration::from_micros(200));
@@ -578,6 +646,7 @@ impl Drop for Encoder {
                     let _ = s.Shutdown();
                 }
             }
+            let _ = self.activate.ShutdownObject();
         }
     }
 }

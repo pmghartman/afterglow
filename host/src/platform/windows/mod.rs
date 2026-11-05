@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::Media::timeBeginPeriod;
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
 };
@@ -40,6 +41,14 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
 
 pub(crate) fn from_wide(w: &[u16]) -> String {
     String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())])
+}
+
+/// COM on this thread, as Media Foundation's encoder activation needs; already there is fine
+fn com_init() {
+    // SAFETY: balanced by the thread's end; S_FALSE (already initialised) is ignored
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
 }
 
 static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -78,6 +87,7 @@ pub struct Windows {
 
 impl Windows {
     pub fn open(conf: &Conf) -> Result<Arc<Windows>, String> {
+        com_init();
         // SAFETY: process-wide settings made once at start
         unsafe {
             // DXGI duplication wants per-monitor DPI awareness
@@ -173,15 +183,23 @@ impl Windows {
         let mut enc = encode::Encoder::new(&dev, &ctx, &dup.comp, dup.w, dup.h, v, o.luid, force_sw)?;
         info!("capturing {} ({}x{}) on {}", o.name, dup.w, dup.h, o.adapter_name);
         let period = Duration::from_secs_f64(1.0 / v.fps as f64);
-        let mut first = true;
+        // a frame given to the encoder yet: until then every capture is the keyframe's
+        let mut sent = false;
         // a change captured and not yet encoded: a display faster than the video waits its turn
         let mut pending = false;
         let mut next_slot = Instant::now();
         let mut last = Instant::now();
         while !ctl.stop.load(Ordering::Relaxed) {
+            // what the encoder finished since, sent as soon as it's out
+            for (au, key) in enc.poll()? {
+                if !out(&au, key) {
+                    return Ok(false);
+                }
+            }
             let now = Instant::now();
             let wait = if pending { next_slot.saturating_duration_since(now) } else { period };
-            match dup.next(wait.as_millis().clamp(1, 1000) as u32) {
+            // short: the wait holds the device the encoder shares
+            match dup.next(wait.as_millis().clamp(1, 4) as u32) {
                 Ok(capture::Got::Frame) => pending = true,
                 Ok(capture::Got::Timeout) => {}
                 Err(capture::Lost::Again) => return Ok(true),
@@ -192,11 +210,11 @@ impl Windows {
                 }
                 Err(capture::Lost::Fail(why)) => return Err(why),
             }
-            if first && !pending {
+            if !sent && !pending {
                 // no picture captured yet
                 continue;
             }
-            let idr = ctl.idr.swap(false, Ordering::Relaxed) || first;
+            let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
             let now = Instant::now();
             // a change in its slot, a keyframe asked, or once a second the last frame again to keep the stream alive
             let due = (pending && now >= next_slot) || idr || last.elapsed() >= Duration::from_secs(1);
@@ -206,8 +224,9 @@ impl Windows {
             pending = false;
             last = now;
             next_slot = (next_slot + period).max(now);
-            for (au, key) in enc.encode(idr)? {
-                first = false;
+            let made = enc.encode(idr)?;
+            sent = true;
+            for (au, key) in made {
                 if !out(&au, key) {
                     return Ok(false);
                 }
@@ -302,6 +321,7 @@ impl Host for Windows {
     }
 
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: Out) -> Result<(), String> {
+        com_init();
         let name = self.run.lock().unwrap().vdisplay.clone();
         // the virtual display follows the viewer's window: the app redraws at its size
         if let Some(n) = &name {

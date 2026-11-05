@@ -18,6 +18,9 @@ use windows::Win32::System::JobObjects::{
     JobObjectBasicProcessIdList, QueryInformationJobObject, TerminateJobObject,
 };
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS, EnumDesktopWindows, OpenDesktopW,
+};
 use windows::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
@@ -76,14 +79,31 @@ impl App {
     pub fn start(cmd: &str, cwd: Option<&str>) -> Result<App, String> {
         // SAFETY: every handle and buffer here is owned by this function or the App it returns
         unsafe {
-            let job = CreateJobObjectW(None, PCWSTR::null()).map_err(|e| e.to_string())?;
+            // the console user's token first: no one signed in, nothing made to clean up
+            let token = if running_as_system() { Some(user_token()?) } else { None };
+            let job = match CreateJobObjectW(None, PCWSTR::null()) {
+                Ok(j) => j,
+                Err(e) => {
+                    if let Some(t) = token {
+                        let _ = CloseHandle(t);
+                    }
+                    return Err(e.to_string());
+                }
+            };
+            let fail = |e: windows::core::Error| {
+                if let Some(t) = token {
+                    let _ = CloseHandle(t);
+                }
+                let _ = CloseHandle(job);
+                e.to_string()
+            };
             let mut size = 0usize;
             let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
             let mut attr_buf = vec![0u8; size];
             let attrs = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut c_void);
-            InitializeProcThreadAttributeList(Some(attrs), 1, None, &mut size).map_err(|e| e.to_string())?;
+            InitializeProcThreadAttributeList(Some(attrs), 1, None, &mut size).map_err(fail)?;
             let jobs = [job];
-            UpdateProcThreadAttribute(
+            if let Err(e) = UpdateProcThreadAttribute(
                 attrs,
                 0,
                 PROC_THREAD_ATTRIBUTE_JOB_LIST,
@@ -91,8 +111,10 @@ impl App {
                 size_of::<HANDLE>(),
                 None,
                 None,
-            )
-            .map_err(|e| e.to_string())?;
+            ) {
+                DeleteProcThreadAttributeList(attrs);
+                return Err(fail(e));
+            }
             let mut desktop = wide("winsta0\\default");
             let mut si = STARTUPINFOEXW::default();
             si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -103,14 +125,14 @@ impl App {
             let cwd_p = cwd_w.as_ref().map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr()));
             let base = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
             let mut pi = PROCESS_INFORMATION::default();
-            let system = running_as_system();
             let mut r = Err(windows::core::Error::empty());
+            let mut env: *mut c_void = std::ptr::null_mut();
+            if let Some(t) = token {
+                let _ = CreateEnvironmentBlock(&mut env, Some(t), false);
+            }
             // out of afterglow's own job first; a job that allows no breakaway keeps it in
-            for flags in [base | CREATE_BREAKAWAY_FROM_JOB, base] {
-                r = if system {
-                    let token = user_token()?;
-                    let mut env: *mut c_void = std::ptr::null_mut();
-                    let _ = CreateEnvironmentBlock(&mut env, Some(token), false);
+            for (attempt, flags) in [base | CREATE_BREAKAWAY_FROM_JOB, base].into_iter().enumerate() {
+                r = if let Some(token) = token {
                     // as the user, so their mapped drives and profile resolve
                     let _ = ImpersonateLoggedOnUser(token);
                     let r = CreateProcessAsUserW(
@@ -127,10 +149,6 @@ impl App {
                         &mut pi,
                     );
                     let _ = RevertToSelf();
-                    if !env.is_null() {
-                        let _ = DestroyEnvironmentBlock(env);
-                    }
-                    let _ = CloseHandle(token);
                     r
                 } else {
                     CreateProcessW(
@@ -147,8 +165,18 @@ impl App {
                     )
                 };
                 if r.is_ok() {
+                    if attempt > 0 {
+                        // inside afterglow's job: under the service, the app ends when afterglow does
+                        warn!("the app couldn't leave afterglow's job: it ends with afterglow");
+                    }
                     break;
                 }
+            }
+            if !env.is_null() {
+                let _ = DestroyEnvironmentBlock(env);
+            }
+            if let Some(t) = token {
+                let _ = CloseHandle(t);
             }
             DeleteProcThreadAttributeList(attrs);
             if let Err(e) = r {
@@ -216,10 +244,25 @@ impl App {
                 }
                 true.into()
             }
-            super::input::sync_desktop();
-            // SAFETY: the callback reads pids only during this call
+            // the app's windows are on the user's desktop, whichever has the input now
+            let name = wide("Default");
+            // SAFETY: the callback reads pids only during this call; the desktop is closed after
             unsafe {
-                let _ = EnumWindows(Some(close), LPARAM(&pids as *const Vec<u32> as isize));
+                let l = LPARAM(&pids as *const Vec<u32> as isize);
+                match OpenDesktopW(
+                    PCWSTR(name.as_ptr()),
+                    DESKTOP_CONTROL_FLAGS(0),
+                    false,
+                    DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0,
+                ) {
+                    Ok(d) => {
+                        let _ = EnumDesktopWindows(Some(d), Some(close), l);
+                        let _ = CloseDesktop(d);
+                    }
+                    Err(_) => {
+                        let _ = EnumWindows(Some(close), l);
+                    }
+                }
             }
             let t0 = Instant::now();
             while self.running() && t0.elapsed() < wait {
