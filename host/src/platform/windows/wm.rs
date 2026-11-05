@@ -9,6 +9,10 @@
 //! seconds after the launch, a window of a process started since then is taken as the
 //! app's too; and what was seen (or wasn't) is logged, so a launch that shows nothing
 //! on its display says why.
+//!
+//! An app attached to (a process already running, docs/protocol.md "The desktop") is
+//! followed by its pid instead, and when it's let go its windows are put back where
+//! they were before it was attached.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -23,18 +27,21 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::JobObjects::IsProcessInJob;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS, EnumDesktopWindows, OpenDesktopW,
+};
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindowAsync, WM_CLOSE, WS_CAPTION, WS_CHILD,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
+    GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW,
+    SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPlacement,
+    SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
-use windows::core::{BOOL, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use super::display;
 use super::input::sync_desktop;
@@ -50,6 +57,14 @@ struct Seen {
     adopted: Mutex<Vec<isize>>,
 }
 
+/// whose windows are the app's
+enum Owner {
+    /// everything in a job (a handle's value: the job outlives the follower)
+    Job(usize),
+    /// a process attached to, not started here
+    Pid(u32),
+}
+
 /// the app's windows followed on their own thread until dropped
 pub struct Follower {
     stop: Arc<AtomicBool>,
@@ -61,16 +76,26 @@ pub struct Follower {
 impl Follower {
     /// the windows of everything in job kept to the display by this GDI name
     pub fn start(job: HANDLE, display: String) -> Follower {
-        let stop = Arc::new(AtomicBool::new(false));
         // a handle isn't Send: its value crosses, the job outlives the follower
-        let (s, job) = (stop.clone(), job.0 as usize);
+        Self::spawn(Owner::Job(job.0 as usize), display)
+    }
+
+    /// the windows of a process attached to kept to the display; put back where they
+    /// were when the follower is dropped
+    pub fn attach(pid: u32, display: String) -> Follower {
+        Self::spawn(Owner::Pid(pid), display)
+    }
+
+    fn spawn(owner: Owner, display: String) -> Follower {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
         // SAFETY: fills the struct it's given
         let launched = unsafe { GetSystemTimeAsFileTime() };
         let seen = Arc::new(Seen::default());
         let out = seen.clone();
         let thread = thread::Builder::new()
             .name("windows".into())
-            .spawn(move || follow(HANDLE(job as *mut c_void), &display, &s, ticks(launched), &out))
+            .spawn(move || follow(&owner, &display, &s, ticks(launched), &out))
             .ok();
         Follower { stop, thread, seen, started: Instant::now() }
     }
@@ -175,7 +200,7 @@ fn process_of(pid: u32) -> Option<(String, u64)> {
     }
 }
 
-fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Seen) {
+fn follow(owner: &Owner, display: &str, stop: &AtomicBool, launched: u64, out: &Seen) {
     // onto the app's desktop before COM: a thread with a window of its own can't change desktops
     sync_desktop();
     // SAFETY: balanced below; the taskbar's object lives in an apartment
@@ -191,6 +216,10 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
     let mut adopted: HashSet<u32> = HashSet::new();
     let mut looked: HashMap<u32, bool> = HashMap::new();
     let (mut own_shown, mut said_none, mut said_lost) = (false, false, false);
+    // an attached app's windows as they were before they were first placed, and those
+    // told to the taskbar as fullscreen: both undone when it's let go
+    let mut placed: Vec<(isize, WINDOWPLACEMENT)> = Vec::new();
+    let mut marked: Vec<isize> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         match display::rect_of(display) {
             Some(mon) => {
@@ -198,40 +227,56 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
                 let early = t0.elapsed() < ADOPT_FOR && !own_shown;
                 let mut strangers = Vec::new();
                 for (h, kind, pid) in top_windows() {
-                    let ours = if in_job(h, job) {
-                        own_shown = true;
-                        true
-                    } else if adopted.contains(&pid) {
-                        true
-                    } else {
-                        if early {
-                            // started since the launch, and not the shell's: the app's
-                            let take = *looked.entry(pid).or_insert_with(|| {
-                                process_of(pid).is_some_and(|(exe, started)| {
-                                    let take = started + 20_000_000 >= launched && !SHELL.contains(&exe.as_str());
-                                    if take {
-                                        info!(
-                                            "windows of {exe} (pid {pid}), started since the launch, taken as the app's"
-                                        );
-                                    }
-                                    take
-                                })
-                            });
-                            if take {
-                                adopted.insert(pid);
+                    let ours = match owner {
+                        Owner::Pid(p) => {
+                            own_shown |= *p == pid;
+                            *p == pid
+                        }
+                        Owner::Job(job) if in_job(h, HANDLE(*job as *mut c_void)) => {
+                            own_shown = true;
+                            true
+                        }
+                        Owner::Job(_) if adopted.contains(&pid) => true,
+                        Owner::Job(_) => {
+                            if early {
+                                // started since the launch, and not the shell's: the app's
+                                let take = *looked.entry(pid).or_insert_with(|| {
+                                    process_of(pid).is_some_and(|(exe, started)| {
+                                        let take = started + 20_000_000 >= launched && !SHELL.contains(&exe.as_str());
+                                        if take {
+                                            info!(
+                                                "windows of {exe} (pid {pid}), started since the launch, taken as the app's"
+                                            );
+                                        }
+                                        take
+                                    })
+                                });
+                                if take {
+                                    adopted.insert(pid);
+                                }
                             }
+                            if !adopted.contains(&pid) && !said_none {
+                                strangers.push(pid);
+                            }
+                            adopted.contains(&pid)
                         }
-                        if !adopted.contains(&pid) && !said_none {
-                            strangers.push(pid);
-                        }
-                        adopted.contains(&pid)
                     };
                     if ours {
                         let first = seen.insert(h.0 as isize);
                         if first && adopted.contains(&pid) {
                             out.adopted.lock().unwrap().push(h.0 as isize);
                         }
-                        place(h, kind, mon, first, taskbar.as_ref());
+                        if first && matches!(owner, Owner::Pid(_)) {
+                            let mut wp =
+                                WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+                            // SAFETY: wp sized as its length says
+                            if unsafe { GetWindowPlacement(h, &mut wp) }.is_ok() {
+                                placed.push((h.0 as isize, wp));
+                            }
+                        }
+                        if place(h, kind, mon, first, taskbar.as_ref()) {
+                            marked.push(h.0 as isize);
+                        }
                     }
                 }
                 if seen.is_empty() && !said_none && t0.elapsed() >= NONE_YET {
@@ -265,6 +310,23 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
         }
         thread::sleep(Duration::from_millis(100));
     }
+    for h in marked {
+        let h = HWND(h as *mut c_void);
+        // SAFETY: a window that may have gone, which only fails
+        if let (Some(t), true) = (taskbar.as_ref(), unsafe { IsWindow(Some(h)) }.as_bool()) {
+            let _ = unsafe { t.MarkFullscreenWindow(h, false) };
+        }
+    }
+    // an attached app's windows back where they were: it runs on, on the console's display
+    for (h, wp) in placed {
+        let h = HWND(h as *mut c_void);
+        // SAFETY: as above; the placement is the one this window had
+        unsafe {
+            if IsWindow(Some(h)).as_bool() {
+                let _ = SetWindowPlacement(h, &wp);
+            }
+        }
+    }
     drop(taskbar);
     if com {
         // SAFETY: the CoInitializeEx above
@@ -287,39 +349,78 @@ fn top_windows() -> Vec<(HWND, Kind, u32)> {
     unsafe {
         let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut Vec<HWND> as isize));
     }
+    all.into_iter().filter_map(|h| shown(h).map(|(k, pid)| (h, k, pid))).collect()
+}
+
+/// a window someone would call one of an app's: visible, top-level, not a tool window,
+/// not cloaked, a main window or a dialog (not a caption-less popup an app places
+/// itself); what would be done with it, and its process
+fn shown(h: HWND) -> Option<(Kind, u32)> {
+    // SAFETY: queries on a window handle; a window gone since answers false or fails
+    unsafe {
+        if !IsWindowVisible(h).as_bool() {
+            return None;
+        }
+        let style = GetWindowLongW(h, GWL_STYLE) as u32;
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        // menus, tooltips and other tool windows follow their owner
+        if style & WS_CHILD.0 != 0 || ex & WS_EX_TOOLWINDOW.0 != 0 {
+            return None;
+        }
+        let mut cloaked = 0u32;
+        if DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4).is_ok() && cloaked != 0 {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        let owned = GetWindow(h, GW_OWNER).is_ok_and(|o| !o.is_invalid());
+        let captioned = style & WS_CAPTION.0 == WS_CAPTION.0;
+        let kind = if !owned && style & WS_THICKFRAME.0 != 0 {
+            Kind::Fill
+        } else if captioned || !owned {
+            Kind::Centre
+        } else {
+            // an owned popup without a caption (a dropdown, a flyout): placed by the app
+            return None;
+        };
+        Some((kind, pid))
+    }
+}
+
+/// the windows on the user's desktop (Default, whichever has the input now) as the
+/// follower sees them, topmost first: each with its process and title. Only reads:
+/// no message is sent, so a hung window can't hold it
+pub fn listed() -> Vec<(HWND, u32, String)> {
+    let mut all: Vec<HWND> = Vec::new();
+    let name = super::wide("Default");
+    // SAFETY: collect only pushes to the Vec whose address it's given; the desktop is
+    // closed after
+    unsafe {
+        let l = LPARAM(&mut all as *mut Vec<HWND> as isize);
+        match OpenDesktopW(
+            PCWSTR(name.as_ptr()),
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0,
+        ) {
+            Ok(d) => {
+                let _ = EnumDesktopWindows(Some(d), Some(collect), l);
+                let _ = CloseDesktop(d);
+            }
+            Err(_) => {
+                let _ = EnumWindows(Some(collect), l);
+            }
+        }
+    }
     let mut out = Vec::new();
     for h in all {
-        // SAFETY: queries on a window handle; a window gone since answers false or fails
-        unsafe {
-            if !IsWindowVisible(h).as_bool() {
-                continue;
-            }
-            let style = GetWindowLongW(h, GWL_STYLE) as u32;
-            let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
-            // menus, tooltips and other tool windows follow their owner
-            if style & WS_CHILD.0 != 0 || ex & WS_EX_TOOLWINDOW.0 != 0 {
-                continue;
-            }
-            let mut cloaked = 0u32;
-            if DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4).is_ok()
-                && cloaked != 0
-            {
-                continue;
-            }
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(h, Some(&mut pid));
-            let owned = GetWindow(h, GW_OWNER).is_ok_and(|o| !o.is_invalid());
-            let captioned = style & WS_CAPTION.0 == WS_CAPTION.0;
-            let kind = if !owned && style & WS_THICKFRAME.0 != 0 {
-                Kind::Fill
-            } else if captioned || !owned {
-                Kind::Centre
-            } else {
-                // an owned popup without a caption (a dropdown, a flyout): placed by the app
-                continue;
-            };
-            out.push((h, kind, pid));
-        }
+        let Some((_, pid)) = shown(h) else { continue };
+        let mut buf = [0u16; 512];
+        // SAFETY: buf as long as passed; InternalGetWindowText reads the window's text
+        // without asking its thread
+        let n = unsafe { InternalGetWindowText(h, &mut buf) }.max(0) as usize;
+        let title: String = String::from_utf16_lossy(&buf[..n.min(buf.len())]).chars().take(300).collect();
+        out.push((h, pid, title));
     }
     out
 }
@@ -346,7 +447,9 @@ fn frame(h: HWND, wr: RECT) -> RECT {
     if ok { fb } else { wr }
 }
 
-fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarList2>) {
+/// the window placed on the display; true when it was told to the taskbar as fullscreen
+fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarList2>) -> bool {
+    let mut marked = false;
     let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
     // SAFETY: window calls on a handle that may have gone, which only fail; async ones
     // never wait on a hung app
@@ -355,11 +458,11 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
             // maximized stops at the taskbar, minimized can't be got back without one:
             // restored, and filled on the next pass
             let _ = ShowWindowAsync(h, SW_RESTORE);
-            return;
+            return false;
         }
         let mut wr = RECT::default();
         if GetWindowRect(h, &mut wr).is_err() {
-            return;
+            return false;
         }
         let fb = frame(h, wr);
         match kind {
@@ -377,7 +480,7 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
                 if first {
                     // the taskbar goes under it while it's in front
                     if let Some(t) = taskbar {
-                        let _ = t.MarkFullscreenWindow(h, true);
+                        marked = t.MarkFullscreenWindow(h, true).is_ok();
                     }
                 }
             }
@@ -398,4 +501,5 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
             let _ = SetForegroundWindow(h);
         }
     }
+    marked
 }

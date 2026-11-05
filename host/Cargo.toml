@@ -44,10 +44,12 @@ features = [
   "Win32_Storage_Packaging_Appx",
   "Win32_System_Com",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Environment",
   "Win32_System_IO",
   "Win32_System_JobObjects",
   "Win32_System_Ole",
+  "Win32_System_Pipes",
   "Win32_System_RemoteDesktop",
   "Win32_System_StationsAndDesktops",
   "Win32_System_SystemInformation",
@@ -66,7 +68,7 @@ features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 openh264-sys2 = "0.9"
-x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xtest", "xfixes"] }
+x11rb = { version = "0.14", features = ["damage", "randr", "res", "shm", "xtest", "xfixes"] }
 
 [profile.release]
 codegen-units = 1

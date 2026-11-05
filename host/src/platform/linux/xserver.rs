@@ -71,6 +71,11 @@ pub struct Xvfb {
     pub wm: Option<Wm>,
 }
 
+/// tests with an Xvfb of their own, one at a time: two servers coming up with their
+/// framebuffers beside the encoder's tests starve each other
+#[cfg(test)]
+pub static ONE_XVFB: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// the framebuffer Xvfb gets: what a viewer's size can grow to without a new server
 pub const MAX: (u16, u16) = (3840, 2160);
 

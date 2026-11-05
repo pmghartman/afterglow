@@ -3,6 +3,7 @@
 //! Foundation, driven with SendInput.
 
 mod capture;
+mod desk;
 mod display;
 mod encode;
 mod input;
@@ -35,6 +36,11 @@ use crate::{debug, info, warn};
 /// the display afterglow's apps get: one id, so Windows keeps its settings
 const DISPLAY_GUID: GUID = GUID::from_u128(0x5d1b0f7a_3c55_4e8b_9d2e_af7e0c6b1a01);
 const DISPLAY_SERIAL: &str = "5D1B0F7A-3C55";
+
+/// `afterglow --delete`: a delete done as whoever runs it (docs/protocol.md, "The desktop")
+pub fn delete_main() -> i32 {
+    desk::delete_main()
+}
 
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
@@ -73,8 +79,29 @@ pub fn on_shutdown(flag: Arc<AtomicBool>) {
     }
 }
 
+/// a process attached to: not started here, so never ended here when let go
+struct Attached {
+    pid: u32,
+    /// opened to wait on
+    process: windows::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: a process handle may be waited on and closed from any thread
+unsafe impl Send for Attached {}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        // SAFETY: the handle this owns
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.process);
+        }
+    }
+}
+
 struct Running {
     app: Option<process::App>,
+    /// or a process already running, taken as the app
+    attached: Option<Attached>,
     /// the virtual display's GDI name, while the app has one
     vdisplay: Option<String>,
     /// the app's windows kept to that display
@@ -108,7 +135,7 @@ impl Windows {
         Ok(Arc::new(Windows {
             conf: conf.clone(),
             vda: Mutex::new(vda),
-            run: Mutex::new(Running { app: None, vdisplay: None, follower: None }),
+            run: Mutex::new(Running { app: None, attached: None, vdisplay: None, follower: None }),
             input: input::WinInput::default(),
         }))
     }
@@ -556,7 +583,7 @@ impl Host for Windows {
             Ok(app) => {
                 // on a display of its own, the app alone: its windows fill it, the desktop unseen
                 let follower = vname.clone().map(|n| wm::Follower::start(app.job(), n));
-                *self.run.lock().unwrap() = Running { app: Some(app), vdisplay: vname, follower };
+                *self.run.lock().unwrap() = Running { app: Some(app), attached: None, vdisplay: vname, follower };
                 Ok(())
             }
             Err(e) => {
@@ -570,6 +597,11 @@ impl Host for Windows {
 
     fn running(&self) -> bool {
         let r = self.run.lock().unwrap();
+        if let Some(a) = &r.attached {
+            // while it runs and, on a display of its own, while a window of it is up there
+            return desk::alive(a.process)
+                && r.follower.as_ref().is_none_or(|f| f.windows() > 0 || (!f.ever() && f.age() < LAUNCHER_GRACE));
+        }
         let Some(app) = r.app.as_ref() else { return false };
         if app.running() {
             return true;
@@ -581,10 +613,19 @@ impl Host for Windows {
     }
 
     fn terminate(&self) {
-        let (app, vd, follower) = {
+        let (app, attached, vd, follower) = {
             let mut r = self.run.lock().unwrap();
-            (r.app.take(), r.vdisplay.take(), r.follower.take())
+            (r.app.take(), r.attached.take(), r.vdisplay.take(), r.follower.take())
         };
+        if let Some(a) = attached {
+            // not started here: let go, its windows put back, still running
+            drop(follower);
+            info!("let go of pid {}: it runs on", a.pid);
+            if vd.is_some() {
+                self.remove_display();
+            }
+            return;
+        }
         if let Some(f) = &follower {
             // windows from outside the job asked to close, as the job's are
             if f.close_adopted() > 0 {
@@ -602,6 +643,49 @@ impl Host for Windows {
         if vd.is_some() {
             self.remove_display();
         }
+    }
+
+    fn features(&self) -> Vec<&'static str> {
+        // an app attached to is closed by its windows; a launched one is ended with its job
+        if self.run.lock().unwrap().attached.is_some() { vec!["close"] } else { Vec::new() }
+    }
+
+    fn close(&self) -> bool {
+        let pid = self.run.lock().unwrap().attached.as_ref().map(|a| a.pid);
+        pid.is_some_and(|p| desk::close_windows(p) > 0)
+    }
+
+    fn desk_features(&self) -> Vec<&'static str> {
+        vec!["processes", "attach", "delete"]
+    }
+
+    fn processes(&self, all: bool) -> Result<Vec<crate::desk::Proc>, String> {
+        desk::processes(all)
+    }
+
+    fn attach(&self, pid: u32, started: Option<u64>, shell: bool, l: &Launch) -> Result<(), LaunchError> {
+        let process = desk::take(pid, started, shell).map_err(LaunchError::new)?;
+        let a = Attached { pid, process };
+        self.terminate();
+        let vname = if l.virtual_display { self.add_display(l) } else { None };
+        if display::find(vname.as_deref()).is_none() {
+            if vname.is_some() {
+                self.remove_display();
+            }
+            return Err(LaunchError { code: Some(503), error: "no display or encoder to capture with".into() });
+        }
+        // on a display of its own its windows are moved there and fill it, as a launched app's
+        let follower = vname.clone().map(|n| wm::Follower::attach(pid, n));
+        *self.run.lock().unwrap() = Running { app: None, attached: Some(a), vdisplay: vname, follower };
+        Ok(())
+    }
+
+    fn end(&self, e: &crate::desk::End) -> Result<crate::desk::Ended, String> {
+        desk::end(e)
+    }
+
+    fn delete(&self, path: &str, permanent: bool) -> Result<bool, String> {
+        desk::delete(path, permanent, &self.conf.delete_roots)
     }
 
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {

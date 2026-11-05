@@ -22,6 +22,16 @@ pub mod input {
     pub const RAISE: u8 = 0x0a;
     /// ask the app to close as its own close button does
     pub const CLOSE: u8 = 0x0b;
+    /// JSON `{all, id}`: the user's processes, answered by output::PROCESSES
+    pub const PROCESSES: u8 = 0x0c;
+    /// JSON `{pid, started, shell, w, h, ...}`: a running process taken as the app,
+    /// answered by output::LAUNCHED
+    pub const ATTACH: u8 = 0x0d;
+    /// JSON `{pid, started, kill, shell, wait_ms, id}`: a process closed or killed,
+    /// answered by output::ENDED
+    pub const END: u8 = 0x0e;
+    /// JSON `{path, permanent, id}`: a file deleted, answered by output::DELETED
+    pub const DELETE: u8 = 0x0f;
 }
 
 /// afterglow to driver
@@ -32,7 +42,13 @@ pub mod output {
     pub const VIDEO_ENDED: u8 = 0x84;
     /// JSON `{t, ...}`: the app's title, its windows, the host's clipboard
     pub const NOTE: u8 = 0x85;
+    /// JSON `{ok, id, list}` or `{ok: false, id, error}`
+    pub const PROCESSES: u8 = 0x86;
+    /// JSON `{ok, id, pid, how, gone}` or `{ok: false, id, pid, error}`
+    pub const ENDED: u8 = 0x87;
     pub const PONG: u8 = 0x88;
+    /// JSON `{ok, id, path, recycled}` or `{ok: false, id, path, error}`
+    pub const DELETED: u8 = 0x89;
     /// `[type][pad][u16 vgen][u16 w][u16 h]` then avcC
     pub const CONFIG: u8 = 0x90;
     /// `[type][key][u16 vgen][pad 4]` then AVCC

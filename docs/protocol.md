@@ -4,7 +4,7 @@ One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to 
 
 afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token. It serves nothing else and captures no audio.
 
-Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version> proto=<n>` and what it serves (`stdio argv notes clipboard raise close cursor`, and `icons` on Windows), for a driver probing a host.
+Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version> proto=<n>` and what it serves (`stdio argv notes clipboard raise close cursor processes delete`, and `icons` and `attach` on Windows), for a driver probing a host.
 
 ## Protocol number
 
@@ -33,17 +33,24 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | `0x09` | `clip` | the viewer's clipboard, UTF-8: the app's own paste pastes it |
 | `0x0a` | `raise` | `u32` LE: a window from a `windows` note to the front |
 | `0x0b` | `close` | none: ask the app to close as its own close button does (it may ask to save first); `exited` follows when it has. Where the host can't, as `quit` |
+| `0x0c` | `processes` | JSON `{all, id}`: the user's processes, answered by `processes` (see [The desktop](#the-desktop)) |
+| `0x0d` | `attach` | JSON `{pid, started, shell, name, w, h, fps, dpi, scale, virtual_display}`: a process already running taken as the app, nothing started; answered by `launched` |
+| `0x0e` | `end` | JSON `{pid, started, kill, shell, wait_ms, id}`: one of the user's processes asked to close, or killed; answered by `ended` |
+| `0x0f` | `delete` | JSON `{path, permanent, id}`: a file or folder in the user's folders deleted, to the Recycle Bin (Linux: the trash) unless `permanent`; answered by `deleted` |
 
 ## afterglow to driver
 
 | Type | Name | Body |
 | --- | --- | --- |
-| `0x81` | `ready` | JSON `{version, proto, virtual_display, hostname, running}`, after a good `hello` |
-| `0x82` | `launched` | JSON `{ok, resumed, ms, features}` or `{ok: false, error, code}`. `features`: what this app can be asked besides input, some of `notes`, `clipboard`, `raise`, `close` |
+| `0x81` | `ready` | JSON `{version, proto, virtual_display, hostname, running, features}`, after a good `hello`. `features`: what the host's desktop can be asked, some of `processes`, `attach`, `delete` |
+| `0x82` | `launched` | JSON `{ok, resumed, attached, ms, features}` or `{ok: false, attached, error, code}`, for a `launch` or an `attach` (`attached: true`). `features`: what this app can be asked besides input, some of `notes`, `clipboard`, `raise`, `close`, then what the desktop can (as `ready`'s) |
 | `0x83` | `exited` | JSON `{code, log, error}`, any of them: the app is gone, its exit code, the last of what it wrote, why when it never showed a window |
 | `0x84` | `video_ended` | JSON `{gen, why}`: the capture stopped by itself |
 | `0x85` | `note` | JSON: `{t: "title", s}` the main window's title, `{t: "windows", list: [[id, title]], main}` the app's windows, `{t: "clip", s}` what the app copied. Each as it changes, and all again when a driver comes |
+| `0x86` | `processes` | JSON `{ok, id, list}` or `{ok: false, id, error}` |
+| `0x87` | `ended` | JSON `{ok, id, pid, how, gone}` or `{ok: false, id, pid, error}` |
 | `0x88` | `pong` | `u32` |
+| `0x89` | `deleted` | JSON `{ok, id, path, recycled}` or `{ok: false, id, path, error}` |
 | `0x90` | `config` | `[pad][u16 gen][u16 w][u16 h]` then the avcC record |
 | `0x91` | `frame` | `[u8 key][u16 gen][pad 4]` then the frame as AVCC |
 | `0x92` | `cursor` | `[u8 visible][u16 hot x][u16 hot y][u16 w][u16 h]` then the pointer's shape as a PNG (straight-alpha RGBA), nothing when hidden |
@@ -106,6 +113,48 @@ stdin is the specs, either one per line (blank lines skipped) or one JSON array 
 | `u:<AUMID>` | a Store app's tile logo: the `Square44x44Logo` of `<family>!<app>` in its package manifest, the 48px unplated file first, then 48px, scale 200, scale 100, any. The file's own PNG bytes, not resized |
 | `l:<path>,<index>` | an icon resource (`.exe`, `.dll`, `.ico`) at 48px. The index may be negative (a resource id); without `,<index>` it is 0. Environment variables are not expanded |
 
+## The desktop
+
+Besides the app, a driver can see the user's processes, take one already running as the app, end one, and delete a file the desktop shows (an icon's file, say, as `--icons` drew it). A host that can lists the words in `ready`'s and `launched`'s `features` and in `--features`: `processes` (`processes` and `end`), `attach` (Windows), `delete`. A host without them answers each with `ok: false`. Like everything on the link, they're served only after a good `hello`: the token on TCP, or over `--stdio`, where ssh let the driver in.
+
+`processes`, `end` and `delete` are each answered on their own once done, while input and video go on, with the ask's `id` (any JSON value) echoed so a driver with several out matches each reply to its ask (`Link.processes`, `Link.end`, `Link.delete` do).
+
+Everything is done with the console user's rights and touches nothing else. On Windows afterglow runs as SYSTEM under the service: their processes are those whose token is the console user's, in the console's session; a process is opened to be ended while impersonating them, so what they couldn't end, afterglow can't; a delete is done by `afterglow --delete` started as them, so the Recycle Bin is theirs. On Linux afterglow runs as the user (over ssh, or as their service), and their processes are those whose owner they are. Each action is logged (what was asked, of what, and how it went; never the token).
+
+### `processes`
+
+`{all}`: without `all`, the processes with a visible top-level window, a main window or dialog of an app (Windows: not a tool window, not cloaked; Linux: those the window manager manages on the app's display and the session's `$DISPLAY`, by `_NET_WM_PID` or, where an app set none, the X server's own word for its client); with `all`, every process of the user's after them. The list's entries:
+
+| Field | |
+| --- | --- |
+| `pid`, `ppid` | the process and its parent |
+| `exe` | its executable's full path; empty when it can't be read |
+| `name` | its executable's file name (Windows) or its command name (Linux, as `ps` shows) |
+| `started` | when it started, ms since the Unix epoch: with the pid, which process it is |
+| `windows` | `[[id, title]]`, topmost first: the HWND on Windows, the X window on Linux |
+
+Processes with windows come first, in the order of their topmost window, then the rest by name.
+
+### `attach`
+
+`{pid, started, shell}` and a launch's own fields (`name`, `w`, `h`, `fps`, `dpi`, `scale`, `virtual_display`): the process (one of the user's, with a window up) becomes the app, as if it had been launched, and nothing is started. Any app before it is ended (or, attached, let go) first. With `virtual_display` its windows are moved to a display of its own and kept there as a launched app's are (main windows fill it, dialogs centred); without, the console's display is streamed. It's answered by `launched`, `attached: true`, its `features` including `close`. Windows only.
+
+It's running while the process is (and, on a display of its own, while a window of it is up there). Not started by afterglow, it's never ended by it unasked: `quit`, a new `launch` or `attach`, or afterglow stopping lets it go, its windows put back where they were and the display removed, still running. `close` asks it to close (`WM_CLOSE` to its windows); `end` ends it. Either way `exited` follows when it's gone.
+
+### `end`
+
+`{pid, started, kill, shell, wait_ms}`. Without `kill`, asked to close as its close buttons would: on Windows `WM_CLOSE` to its windows (refused when it has none: ask with `kill`), on Linux `_NET_CLOSE_WINDOW` through the display's window manager (afterglow's own takes it too), or `WM_DELETE_WINDOW` to each window where there's none, and `SIGTERM` for a process with no window. With `kill`, ended at once (`TerminateProcess`; `SIGKILL`). Either may be refused by the process: it may ask to save first, or ignore `SIGTERM`. `wait_ms` (default 5000, 2000 with `kill`, at most 30000) is how long afterglow waits for it to go before it answers.
+
+`ended` says `how` (`closed`, `terminated`, `killed`) and whether it was `gone` by the end of the wait. With `started` (from the list), a process by that pid that started at another time isn't the one meant and is left alone (`pid N is another process now`).
+
+Never ended: a process that isn't the user's (another user's, SYSTEM's, root's); one of the session's own (`csrss`, `winlogon`, `lsass`, `lsaiso`, `dwm`, `smss`, `services`, `wininit`, `fontdrvhost`, `logonui`, `sihost`, `svchost`, `userinit`; `systemd`, `sshd`, `dbus-daemon`, the X server, the session manager); afterglow itself, and on Linux what it runs under (ending ssh's shell would cut the link). The desktop shell (`explorer.exe`, `gnome-shell`, `plasmashell`, `kwin`, ...) only with `shell: true`. The same goes for `attach`.
+
+### `delete`
+
+`{path, permanent}`: an absolute path, nothing `.` or `..` in it. Without `permanent` it goes to the Recycle Bin (Windows: the shell's own delete, `IFileOperation` with `FOFX_RECYCLEONDELETE`, as Explorer's), or on Linux to the user's trash as a file manager puts it there (`$XDG_DATA_HOME/Trash`, a `.trashinfo` beside it). Where there's no bin (a network share) or the trash is on another filesystem, it's refused: ask with `permanent`. On Windows, something too big for the Recycle Bin brings up the shell's own question on the host's screen before it would be deleted for good. With `permanent`, it's deleted for good, a folder with all it holds. `deleted` says whether it was `recycled`.
+
+Only what's within the user's folders: on Windows their profile, their Desktop (wherever it's redirected) and the Public Desktop; on Linux their home. The config's `delete_roots` adds folders (a list as `PATH` is: `;` between on Windows, `:` on Linux; over `--stdio`, `AFTERGLOW_DELETE_ROOTS`). The path's folder is resolved first (links, junctions, short names) and the item itself isn't: a link is deleted, not what it names. One of those folders itself, or what holds one, is never deleted.
+
 ## Security
 
-The link listens on loopback only. The token (16 characters or more; `phos_link_token`) is, as Phosphorus writes it, 48 hex characters from a CSPRNG, written by the installer into a folder only SYSTEM and Administrators can read. Anyone holding it can launch apps and type into the console's session, so treat it as a credential.
+The link listens on loopback only. The token (16 characters or more; `phos_link_token`) is, as Phosphorus writes it, 48 hex characters from a CSPRNG, written by the installer into a folder only SYSTEM and Administrators can read. Anyone holding it can launch apps and type into the console's session, end the console user's processes and delete their files, so treat it as a credential.

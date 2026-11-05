@@ -64,7 +64,7 @@ pub fn running_as_system() -> bool {
 }
 
 /// the console user's token, with their own elevation (a limited one for an admin under UAC)
-fn user_token() -> Result<HANDLE, String> {
+pub(crate) fn user_token() -> Result<HANDLE, String> {
     // SAFETY: plain Win32 calls
     unsafe {
         let session = WTSGetActiveConsoleSessionId();
@@ -74,6 +74,101 @@ fn user_token() -> Result<HANDLE, String> {
         let mut token = HANDLE::default();
         WTSQueryUserToken(session, &mut token).map_err(|e| format!("no one is signed in at the console: {e}"))?;
         Ok(token)
+    }
+}
+
+/// a program started in the console's session on its desktop (as its user when this
+/// is SYSTEM), its stdin and stdout piped: its process, what writes to its stdin, what
+/// reads its stdout
+pub fn spawn_piped(cmd: &str) -> Result<(HANDLE, std::fs::File, std::fs::File), String> {
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::System::Threading::{STARTF_USESTDHANDLES, STARTUPINFOW};
+    // SAFETY: every handle here is closed or handed to the Files returned
+    unsafe {
+        let token = if running_as_system() { Some(user_token()?) } else { None };
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        let (mut in_r, mut in_w, mut out_r, mut out_w) =
+            (HANDLE::default(), HANDLE::default(), HANDLE::default(), HANDLE::default());
+        let close_all = |hs: &[HANDLE]| {
+            for &h in hs {
+                if !h.is_invalid() {
+                    let _ = CloseHandle(h);
+                }
+            }
+        };
+        if let Err(e) = CreatePipe(&mut in_r, &mut in_w, Some(&sa), 0) {
+            close_all(&[token.unwrap_or_default()]);
+            return Err(e.to_string());
+        }
+        if let Err(e) = CreatePipe(&mut out_r, &mut out_w, Some(&sa), 0) {
+            close_all(&[in_r, in_w, token.unwrap_or_default()]);
+            return Err(e.to_string());
+        }
+        // our ends stay ours
+        let _ = SetHandleInformation(in_w, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+        let _ = SetHandleInformation(out_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+        let mut desktop = wide("winsta0\\default");
+        let si = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop.as_mut_ptr()),
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: in_r,
+            hStdOutput: out_w,
+            hStdError: HANDLE::default(),
+            ..Default::default()
+        };
+        let mut cmdline = wide(cmd);
+        let mut env: *mut c_void = std::ptr::null_mut();
+        if let Some(t) = token {
+            let _ = CreateEnvironmentBlock(&mut env, Some(t), false);
+        }
+        let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+        let mut pi = PROCESS_INFORMATION::default();
+        let r = match token {
+            Some(t) => CreateProcessAsUserW(
+                Some(t),
+                PCWSTR::null(),
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                true,
+                flags,
+                (!env.is_null()).then_some(env as *const c_void),
+                PCWSTR::null(),
+                &si,
+                &mut pi,
+            ),
+            None => CreateProcessW(
+                PCWSTR::null(),
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                true,
+                flags,
+                None,
+                PCWSTR::null(),
+                &si,
+                &mut pi,
+            ),
+        };
+        if !env.is_null() {
+            let _ = DestroyEnvironmentBlock(env);
+        }
+        // the child's ends are the child's now
+        close_all(&[in_r, out_w, token.unwrap_or_default()]);
+        if let Err(e) = r {
+            close_all(&[in_w, out_r]);
+            return Err(format!("{cmd} didn't start: {e}"));
+        }
+        let _ = CloseHandle(pi.hThread);
+        Ok((pi.hProcess, std::fs::File::from_raw_handle(in_w.0 as _), std::fs::File::from_raw_handle(out_r.0 as _)))
     }
 }
 

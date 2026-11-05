@@ -110,6 +110,19 @@ const src = new AfterglowSource({
 
 The app's title and windows come as `sink.meta({ t: "title" | "windows" })`, what it copies as `sink.say({ t: "clip" })`; `["clip", text]` makes the viewer's clipboard the app's, `["raise", id]` brings a window forward, `close()` asks it to close as its close button would.
 
+The host's desktop is the link's too, once it's open ([The desktop](docs/protocol.md#the-desktop)): the user's processes and their windows, one already running taken as the app (Windows), one closed or killed, a file the desktop shows deleted to the Recycle Bin (Linux: the trash). Each acts with the console user's rights alone, and `ready.features` says which the host has.
+
+```ts
+const link = new Link({ port, token }, { message: () => {}, closed: () => {} });
+const { features } = await link.open(); // ["processes", "attach", "delete"] on Windows
+const list = await link.processes(); // windowed ones, topmost first; processes(true) for all
+await link.end(pid, { started }); // its windows asked to close; { kill: true } ends it at once
+await link.delete("C:\\Users\\me\\Desktop\\old.lnk"); // to the Recycle Bin; delete(path, true) for good
+
+// stream a process already running: its windows moved to a display of their own
+const src = new AfterglowSource({ link: { port, token }, target: "", attach: { pid, started }, virtualDisplay: true });
+```
+
 Input goes in as small arrays and leaves as afterglow's input packets ([`src/afterglow/input.ts`](src/afterglow/input.ts)):
 
 | Message | Meaning |
@@ -181,14 +194,14 @@ bun run bench
 ```
 
 - `bun test` runs the client's tests anywhere: the input packets and key mapping, the link's framing, `AfterglowSource` against `FakeAfterglow`, and the installer's files.
-- `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, capture's colour conversion, and the encoder: its streams decoded by `ffmpeg` (where it's installed) to exactly the pictures it reconstructed, keyframes, skips, slices, cropping, refinement and every qp.
+- `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, the desktop's rules (which processes are never ended, which paths may be deleted) and on Linux its processes, windows on a real Xvfb, the trash, capture's colour conversion, and the encoder: its streams decoded by `ffmpeg` (where it's installed) to exactly the pictures it reconstructed, keyframes, skips, slices, cropping, refinement and every qp.
 - `test:e2e` builds the host and runs it for real (needs `Xvfb`, `xterm` and `ffmpeg`). `AfterglowSource` launches xterm on an Xvfb of the host's own and checks that:
   - it fills the display, and ffmpeg decodes the stream;
   - a typed command runs; the pointer's shape comes as a PNG and is never in the frames;
   - after a resize the display follows;
   - quit closes it.
 
-  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display. Over `--stdio`: an app by its argv, its title and windows as notes, the viewer's clipboard pasted by its own paste, a polite close, an app that dies before a window with its code and output.
+  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display. Over `--stdio`: an app by its argv, its title and windows as notes, the viewer's clipboard pasted by its own paste, a polite close, an app that dies before a window with its code and output; the desktop's processes listed, one asked to end and one killed, afterglow itself refused, a file trashed and one deleted for good, one outside the home refused.
 - `bench` builds the host and times input to frame: a key echoed and a key that flips the whole screen, at 720p and 1080p, and open to first frame. With `BENCH_LOG=debug BENCH_KEEP=1` the host's log says where each frame's time went and how long from an input to the app's drawing and to its frame.
 
 The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the archive lays it out:
