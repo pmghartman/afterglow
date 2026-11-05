@@ -120,6 +120,10 @@ export const configOf = (msg: Uint8Array) => ({
   h: u16(msg, 6),
   avcc: msg.subarray(8),
 });
+// the WebCodecs codec string an avcC record names: "avc1." and its profile, constraint
+// flags and level in hex. afterglow's own encoder makes Constrained Baseline ("avc1.42c0..")
+export const codecOf = (avcc: Uint8Array): string =>
+  `avc1.${[avcc[1] ?? 0x42, avcc[2] ?? 0xc0, avcc[3] ?? 0x28].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
 // a frame message: key, gen; the message itself is the viewer's, its first 8 bytes room
 export const frameOf = (msg: Uint8Array) => ({ key: msg[1] === 1, gen: u16(msg, 2) });
 

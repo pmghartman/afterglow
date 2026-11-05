@@ -28,7 +28,7 @@ afterglow is how [Phosphorus](https://github.com/pmghartman/phosphorus) streams 
 
 | Path | What it is | Licence |
 | --- | --- | --- |
-| [`host/`](host) | **afterglow**, the host, in Rust. It launches one app at a time, captures and encodes its display as H.264, and injects the viewer's input. On Windows: DXGI capture, Media Foundation H.264 (the GPU's encoder, or Windows' software one), SendInput, a SudoVDA virtual display per app, and the `afterglowsvc.exe` service. On Linux: an Xvfb per app (or the session's display), MIT-SHM capture driven by XDamage, OpenH264, XTest. | GPL-3.0-only |
+| [`host/`](host) | **afterglow**, the host, in Rust. It launches one app at a time, captures and encodes its display as H.264, and injects the viewer's input. Its own H.264 encoder ([`host/src/avc`](host/src/avc)) codes only the macroblocks that changed, so a frame costs what changed in it, not its size. On Windows: DXGI capture reading back only its dirty rectangles (or Media Foundation's encoders, asked for), SendInput, a SudoVDA virtual display per app, and the `afterglowsvc.exe` service. On Linux: an Xvfb per app (or the session's display), its framebuffer read in place where XDamage says it changed (or OpenH264, asked for), XTest. | GPL-3.0-only |
 | [`src/afterglow/`](src/afterglow) | `AfterglowSource`, the client: launch an app, get its frames already shaped as AVCC, send input back. Also the config, link file, service line and systemd unit an installer writes. | Apache-2.0 |
 | [`src/source.ts`](src/source.ts) | The contract a source keeps with whatever drives it. | Apache-2.0 |
 | [`docs/protocol.md`](docs/protocol.md) | The link's wire format. | |
@@ -39,20 +39,23 @@ One TCP connection on `127.0.0.1`: length-prefixed messages, a token said first,
 
 - **To the first frame:** one `launch`, one `video`. No pairing, TLS, RTSP or session setup.
 - **Each frame:** the encoder's output reshaped once into AVCC, the form WebCodecs' `VideoDecoder` takes, behind 8 bytes of room. One socket write on the host, one copy on the client, and the driver overwrites the room with its own header and forwards it as it is. No packetization, FEC or reassembly.
-- **When frames are made:** a frame is captured and encoded when the screen changes (DXGI's frame updates on Windows, XDamage on Linux), within the video's rate, and again once a second when nothing does. On Linux only what changed is read and converted, straight out of the app's X framebuffer. A keyframe is a message, not a restart.
+- **When frames are made:** a frame is captured and encoded when the screen changes (DXGI's frame updates on Windows, XDamage on Linux), within the video's rate, and again once a second when nothing does. Only what changed is read and converted: on Linux straight out of the app's X framebuffer, on Windows the dirty rectangles copied out of GPU memory. A keyframe is a message, not a restart.
+- **Encoding what changed:** afterglow's own encoder codes the macroblocks whose pixels changed and skips every other one in a few bits, so a typed glyph is encoded in about 10 µs at 720p or 1080p alike (OpenH264 took 1.6 and 3.7 ms). Each change is coded at the quality its frame can have and still keep to about two frames' share of the bitrate (a frame's size is latency too), and once the screen has been still for 60 ms what was coded coarsely is coded again, sharper, a frame's share at a time: on screen at once, sharp a moment later. Its reconstruction is FFmpeg's to the bit, so it never drifts.
 - **The pointer:** its shape goes to the viewer as a PNG when it changes, to show as the viewer's own pointer: moving it costs no frame and lags not at all. Or, asked, it's drawn into the frames.
 - **Decoding:** every SPS says nothing is reordered, so a decoder shows each frame as it arrives instead of holding pictures back.
 - **Input:** small binary events on the same socket, injected as they arrive.
 - **Displays:** each app gets a display at the viewer's window size, so a machine with no monitor streams. The display follows the viewer through resizes, and the app keeps running between videos and viewers.
 
-Measured on Linux (Xvfb, xterm, OpenH264, 120 fps at 20 Mb/s as Phosphorus asks; `bun run bench`, p50):
+Measured on Linux (Xvfb, xterm, 120 fps at 20 Mb/s as Phosphorus asks, 4 cores; `bun run bench`, p50; OpenH264, as before, in brackets):
 
 | | 1280x720 | 1920x1080 |
 | --- | --- | --- |
-| a key typed to the frame echoing it, at the driver | 3.6 ms | 5.8 ms |
-| a key that changes every pixel, to its frame | 7.6 ms | 13.0 ms |
-| a key typed to its frame decoded in Chromium, through Phosphorus's session | 7.7 ms | 12.0 ms |
-| open to first frame | 25 to 35 ms | 45 to 55 ms |
+| a key typed to the frame echoing it, at the driver | 0.8 to 1.0 ms (3.6) | 0.8 to 1.0 ms (5.8) |
+| a key that changes every pixel, to its frame | 4.4 to 4.8 ms (7.6) | 7.8 to 9.1 ms (13.0) |
+| open to first frame | 8 to 21 ms (25 to 35) | 12 to 18 ms (45 to 55) |
+| a key typed to its frame decoded in Chromium, through Phosphorus's session (OpenH264's; not yet measured with afterglow's encoder) | 7.7 ms | 12.0 ms |
+
+Of a typed key's 0.9 ms, about 80 µs is afterglow's: the rest is xterm, its shell and Xvfb drawing the glyph. Encoding alone: a glyph 10 µs at 720p and 12 µs at 1080p; a terminal flipped to reverse video 1.0 ms and 1.7 ms.
 
 Windows hasn't been measured on GPU hardware yet.
 
@@ -71,7 +74,7 @@ The client is a [Bun](https://bun.sh) TypeScript package, consumed from this rep
 Drive afterglow on the same machine:
 
 ```ts
-import { AfterglowSource, FrameRoom, pathsOf, readLink } from "@phosphorus/afterglow";
+import { AfterglowSource, codecOf, FrameRoom, pathsOf, readLink } from "@phosphorus/afterglow";
 
 const link = readLink(pathsOf("C:\\ProgramData\\myapp\\afterglow").link);
 if (!link) throw new Error("afterglow isn't set up here");
@@ -82,7 +85,7 @@ await src.open(
   { meta: console.log, say: console.log, exit: (err) => console.log("exited", err) },
 );
 src.video({ w: 1280, h: 720, fps: 60, kbps: 20_000, full: false }, {
-  config: (avcc, w, h) => decoder.configure({ codec: "avc1.640033", description: avcc, codedWidth: w, codedHeight: h }),
+  config: (avcc, w, h) => decoder.configure({ codec: codecOf(avcc), description: avcc, codedWidth: w, codedHeight: h }),
   frame: (key, data) => send(data.subarray(FrameRoom), key), // or write your own 8-byte header into data[0..8)
   ended: () => {},
 });
@@ -178,7 +181,7 @@ bun run bench
 ```
 
 - `bun test` runs the client's tests anywhere: the input packets and key mapping, the link's framing, `AfterglowSource` against `FakeAfterglow`, and the installer's files.
-- `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, and capture's colour conversion.
+- `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, capture's colour conversion, and the encoder: its streams decoded by `ffmpeg` (where it's installed) to exactly the pictures it reconstructed, keyframes, skips, slices, cropping, refinement and every qp.
 - `test:e2e` builds the host and runs it for real (needs `Xvfb`, `xterm` and `ffmpeg`). `AfterglowSource` launches xterm on an Xvfb of the host's own and checks that:
   - it fills the display, and ffmpeg decodes the stream;
   - a typed command runs; the pointer's shape comes as a PNG and is never in the frames;
@@ -186,7 +189,7 @@ bun run bench
   - quit closes it.
 
   Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display. Over `--stdio`: an app by its argv, its title and windows as notes, the viewer's clipboard pasted by its own paste, a polite close, an app that dies before a window with its code and output.
-- `bench` builds the host and times input to frame: a key echoed and a key that flips the whole screen, at 720p and 1080p, and open to first frame.
+- `bench` builds the host and times input to frame: a key echoed and a key that flips the whole screen, at 720p and 1080p, and open to first frame. With `BENCH_LOG=debug BENCH_KEEP=1` the host's log says where each frame's time went and how long from an input to the app's drawing and to its frame.
 
 The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the archive lays it out:
 

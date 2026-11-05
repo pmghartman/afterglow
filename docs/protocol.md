@@ -90,6 +90,8 @@ The avcC's SPS always carries VUI `bitstream_restriction` with `max_num_reorder_
 
 A frame is made when the screen changes, within the video's rate (the first change after a quiet spell at once), and again once a second when nothing does. `idr` and `stop_video` take effect at once, not at the next frame.
 
+The stream afterglow's own encoder makes is Constrained Baseline (`codecOf` gives its codec string from the `config`): one reference, no B-frames, no deblocking, each frame one or more slices of whole macroblock rows. A frame codes what changed and skips the rest, so its size follows the change. A change comes at the quality two frames' share of `kbps` allows, and once the screen has been still for 60 ms further frames, each a frame's share, code what was coarse again until it's sharp: a still screen's video goes on for a moment after the last change, then stops but for the once-a-second frame.
+
 ## Icons
 
 `afterglow --icons` is not part of the link: it is a batch extractor for app icons, run as the viewer's login (over ssh, for Phosphorus). A build that has it lists `icons` in `--features` (Windows; a Linux build lists nothing and `--icons` answers every spec with `null`).
