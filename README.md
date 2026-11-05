@@ -51,7 +51,7 @@ Measured on Linux (Xvfb, xterm, 120 fps at 20 Mb/s as Phosphorus asks, 4 cores; 
 | | 1280x720 | 1920x1080 |
 | --- | --- | --- |
 | a key typed to the frame echoing it, at the driver | 0.8 to 1.0 ms (3.6) | 0.8 to 1.0 ms (5.8) |
-| a key that changes every pixel, to its frame | 4.4 to 4.8 ms (7.6) | 7.8 to 9.1 ms (13.0) |
+| a key that changes every pixel, to its frame | 3.9 to 4.8 ms (7.6) | 6.9 to 9.1 ms (13.0) |
 | open to first frame | 8 to 21 ms (25 to 35) | 12 to 18 ms (45 to 55) |
 | a key typed to its frame decoded in Chromium, through Phosphorus's session (OpenH264's; not yet measured with afterglow's encoder) | 7.7 ms | 12.0 ms |
 
