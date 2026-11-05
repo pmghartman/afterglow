@@ -268,4 +268,4 @@ jobs:
           ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
             -q ".artifacts[] | select((.expired | not) and (.workflow_run.id | tostring) != \"$KEEP_RUN\") | .id")
           for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --silent || echo "::warning::artifact $id not deleted"; done
-          echo "deleted $(echo "$ids" | grep -c . || true) artifacts${KEEP_RUN:+, kept this run's}"
+          echo "deleted $(echo "$ids" | grep -c . || true) artifacts${KEEP_RUN:+, kept the current run}"

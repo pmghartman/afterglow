@@ -2,7 +2,9 @@
 //! the lock screen are captured too, the pointer drawn in: duplication hands it apart.
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::*;
@@ -17,17 +19,39 @@ pub fn device_for(o: &Output) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut ctx = None;
     // SAFETY: out-params written by D3D11CreateDevice
     unsafe {
-        D3D11CreateDevice(
-            &o.adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
-            D3D11_SDK_VERSION,
-            Some(&mut dev),
-            None,
-            Some(&mut ctx),
-        )?;
+        // the full set first; a software adapter (a runner's Basic Render Driver) can refuse
+        // video support or level 11.1, so those are dropped in turn
+        let tries: [(D3D11_CREATE_DEVICE_FLAG, &[D3D_FEATURE_LEVEL]); 3] = [
+            (
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                &[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0],
+            ),
+            (D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &[D3D_FEATURE_LEVEL_11_0]),
+            (D3D11_CREATE_DEVICE_BGRA_SUPPORT, &[D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1]),
+        ];
+        let mut last = None;
+        for (flags, levels) in tries {
+            match D3D11CreateDevice(
+                &o.adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                flags,
+                Some(levels),
+                D3D11_SDK_VERSION,
+                Some(&mut dev),
+                None,
+                Some(&mut ctx),
+            ) {
+                Ok(()) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            return Err(e);
+        }
         let dev: ID3D11Device = dev.unwrap();
         // Media Foundation's threads share this device
         if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
