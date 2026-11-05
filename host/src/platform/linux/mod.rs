@@ -5,7 +5,7 @@
 //! OpenH264; input injected with XTest. The app is a process group of its own.
 
 mod capture;
-mod convert;
+
 mod encode;
 mod wm;
 mod xserver;
@@ -24,6 +24,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::conf::Conf;
+use crate::convert;
 use crate::host::{Ctl, Host, Launch, LaunchError, Notes, Sink, VideoCfg};
 use crate::input::Inject;
 use crate::{debug, info, warn};
@@ -67,6 +68,8 @@ impl App {
 
 pub struct Linux {
     xvfb_bin: String,
+    /// `openh264`: OpenH264 rather than afterglow's own encoder (crate::avc)
+    encoder: String,
     session: Option<Display>,
     app: Mutex<Option<App>>,
     xi: Mutex<Option<Xi>>,
@@ -74,6 +77,14 @@ pub struct Linux {
     notes: Mutex<Option<Notes>>,
     /// how the last app ended
     ended: Mutex<serde_json::Value>,
+    /// when input was last injected (since epoch()): the stats time what it caused
+    input_at: std::sync::atomic::AtomicU64,
+}
+
+/// a fixed instant to time from across threads
+fn epoch() -> Instant {
+    static E: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *E.get_or_init(Instant::now)
 }
 
 /// the most of the app's output kept
@@ -182,12 +193,14 @@ impl Linux {
         }
         Ok(Arc::new(Linux {
             xvfb_bin,
+            encoder: conf.encoder.clone(),
             session,
             app: Mutex::new(None),
             xi: Mutex::new(None),
             spare,
             notes: Mutex::new(None),
             ended: Mutex::new(serde_json::json!({})),
+            input_at: Default::default(),
         }))
     }
 
@@ -202,6 +215,7 @@ impl Linux {
         if let Some(xi) = self.xi.lock().unwrap().as_mut() {
             f(xi);
             let _ = xi.conn.flush();
+            self.input_at.store(epoch().elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 }
@@ -614,8 +628,17 @@ impl Host for Linux {
         grab.geometry()?;
         self.screen_is(grab.w, grab.h);
         let (w, h) = (v.w as usize, v.h as usize);
-        let mut enc = encode::H264::new(w, h, v.fps, v.kbps, threads_for(w, h))?;
-        let mut yuv = convert::Yuv::new(w, h);
+        let mut enc = if self.encoder == "openh264" {
+            Enc::Open(encode::H264::new(w, h, v.fps, v.kbps, threads_for(w, h))?)
+        } else {
+            let cores = thread::available_parallelism().map_or(1, |n| n.get());
+            Enc::Own(Box::new(crate::avc::Encoder::new(w, h, v.fps, cores)), crate::avc::Rate::new(v.kbps, v.fps))
+        };
+        let (pw, ph) = match &enc {
+            Enc::Own(e, _) => e.padded(),
+            Enc::Open(_) => (w, h),
+        };
+        let mut yuv = convert::Yuv::padded(w, h, pw, ph);
         let period = Duration::from_secs_f64(1.0 / v.fps as f64);
         let keepalive = Duration::from_secs(1);
         let t0 = Instant::now();
@@ -636,11 +659,28 @@ impl Host for Linux {
         let (mut sent, mut pending) = (false, true);
         let mut next_slot = Instant::now();
         let mut last = Instant::now();
+        // the last change sent, and whether anything is still coarser than refinement makes it
+        let mut changed_at = Instant::now();
+        let mut coarse = false;
+        // refinement's own pace, a frame a slot: a change never waits behind it
+        let mut next_refine = Instant::now();
         let mut stats = Stats::new();
         let mut scratch = Vec::new();
+        // the first damage after the last frame, and the input last timed
+        let mut woke: Option<Instant> = None;
+        let mut timed_input = 0u64;
         while !ctl.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
-            let mut until = if pending { next_slot } else { last + keepalive }.saturating_duration_since(now);
+            // refinement once the screen has been still a moment, a frame a slot
+            let refine_at = (changed_at + REFINE_AFTER).max(next_slot).max(next_refine);
+            let mut until = if pending {
+                next_slot
+            } else if coarse {
+                refine_at.min(last + keepalive)
+            } else {
+                last + keepalive
+            }
+            .saturating_duration_since(now);
             if v.draw_cursor {
                 // the pointer is looked for each slot: its moves draw nothing on the screen
                 until = until.min(period);
@@ -648,6 +688,9 @@ impl Host for Linux {
             ch.damage.clear();
             (ch.resized, ch.cursor, ch.woken) = (false, false, false);
             grab.wait(Some(until), &mut ch)?;
+            if !ch.damage.is_empty() && woke.is_none() {
+                woke = Some(Instant::now());
+            }
             if ch.resized {
                 self.screen_is(grab.w, grab.h);
                 yuv.black();
@@ -676,65 +719,163 @@ impl Host for Linux {
             pending |= !dirty.is_empty();
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
             let now = Instant::now();
-            // a change in its slot, a keyframe asked, or once a second the last frame again
-            if !((pending && now >= next_slot) || idr || now >= last + keepalive) {
+            // a change in its slot, a keyframe asked, once a second the last frame again,
+            // or, still, a refinement
+            let change = (pending && now >= next_slot) || idr;
+            let alive = now >= last + keepalive;
+            let refine = !change && !pending && coarse && now >= refine_at;
+            if !(change || alive || refine) {
                 continue;
             }
             let t1 = Instant::now();
             let (gw, gh) = (grab.w, grab.h);
             let mut px_done = 0u64;
-            if (gw as usize, gh as usize) == (w, h) {
-                capture::coalesce(&mut dirty, gw, gh);
-                grab.read(&dirty, |r, px, pitch| {
-                    yuv.put(px, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
-                    px_done += r.w as u64 * r.h as u64;
-                })?;
-                if let (true, Some(c), Some(p)) = (v.draw_cursor, &img, at) {
-                    if let Some(r) = capture::cursor_rect(c, p, gw, gh) {
-                        grab.read(&[r], |r, px, pitch| {
-                            scratch.clear();
-                            scratch.extend_from_slice(px);
+            if change {
+                let mut marks = Vec::new();
+                if (gw as usize, gh as usize) == (w, h) {
+                    capture::coalesce(&mut dirty, gw, gh);
+                    grab.read(&dirty, |r, px, pitch| {
+                        yuv.put(px, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+                        px_done += r.w as u64 * r.h as u64;
+                        marks.push(*r);
+                    })?;
+                    if let (true, Some(c), Some(p)) = (v.draw_cursor, &img, at) {
+                        if let Some(r) = capture::cursor_rect(c, p, gw, gh) {
+                            grab.read(&[r], |r, px, pitch| {
+                                scratch.clear();
+                                scratch.extend_from_slice(px);
+                                capture::draw_cursor(&mut scratch, pitch, r, c, p);
+                                yuv.put(&scratch, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+                                marks.push(*r);
+                            })?;
+                            drawn = Some(r);
+                        }
+                    }
+                } else {
+                    // a display that isn't the video's size: all of it, scaled in
+                    let r = full(&grab);
+                    grab.read(&[r], |r, px, pitch| {
+                        scratch.clear();
+                        scratch.extend_from_slice(px);
+                        if let (true, Some(c), Some(p)) = (v.draw_cursor, &img, at) {
                             capture::draw_cursor(&mut scratch, pitch, r, c, p);
-                            yuv.put(&scratch, pitch, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
-                        })?;
-                        drawn = Some(r);
+                        }
+                        convert::scaled(&scratch, pitch, r.w as usize, r.h as usize, &mut yuv);
+                    })?;
+                    marks.push(capture::Rect { x: 0, y: 0, w: w as u16, h: h as u16 });
+                    px_done = gw as u64 * gh as u64;
+                }
+                if let Enc::Own(e, _) = &mut enc {
+                    for r in &marks {
+                        e.mark(r.x as usize, r.y as usize, r.w as usize, r.h as usize);
                     }
                 }
-            } else {
-                // a display that isn't the video's size: all of it, scaled in
-                let r = full(&grab);
-                grab.read(&[r], |r, px, pitch| {
-                    scratch.clear();
-                    scratch.extend_from_slice(px);
-                    if let (true, Some(c), Some(p)) = (v.draw_cursor, &img, at) {
-                        capture::draw_cursor(&mut scratch, pitch, r, c, p);
-                    }
-                    convert::scaled(&scratch, pitch, r.w as usize, r.h as usize, &mut yuv);
-                })?;
-                px_done = gw as u64 * gh as u64;
+                dirty.clear();
+                pending = false;
+                next_slot = (next_slot + period).max(now);
             }
-            dirty.clear();
-            pending = false;
             last = now;
-            next_slot = (next_slot + period).max(now);
             let t2 = Instant::now();
-            let mut nals = Vec::new();
-            let key = enc.encode(yuv.planes(), yuv.strides(), t0.elapsed().as_millis() as i64, idr, &mut nals)?;
+            let t_enc;
+            let bytes = match &mut enc {
+                Enc::Open(h264) => {
+                    let mut nals = Vec::new();
+                    let key =
+                        h264.encode(yuv.planes(), yuv.strides(), t0.elapsed().as_millis() as i64, idr, &mut nals)?;
+                    if nals.is_empty() {
+                        continue;
+                    }
+                    let bytes: usize = nals.iter().map(|n| n.len()).sum();
+                    t_enc = Instant::now();
+                    if !out.frame(&nals, key) {
+                        break;
+                    }
+                    bytes
+                }
+                Enc::Own(e, rate) => {
+                    let [y, u, v] = yuv.planes();
+                    let frame = crate::avc::Frame { y, u, v };
+                    let (opts, act) = if refine {
+                        // what can't be read yet first, then everything sharp
+                        let fine = if e.coarse(crate::avc::QP_LEGIBLE) > 0 {
+                            crate::avc::QP_READ
+                        } else {
+                            crate::avc::QP_FINE
+                        };
+                        let o = crate::avc::Opts {
+                            idr: false,
+                            qp: fine,
+                            refine: Some((fine, rate.refine_bytes())),
+                            always: false,
+                        };
+                        (o, 0.0)
+                    } else {
+                        // what the change has to say, looked at before choosing its qp
+                        let (mbs, act) = e.activity(&frame, idr);
+                        let o = crate::avc::Opts { idr, qp: rate.qp(mbs, act), refine: None, always: alive && !change };
+                        (o, act)
+                    };
+                    let d = e.encode(&frame, &opts);
+                    rate.seen(&d, opts.qp, act);
+                    if d.coded + d.refined > 64 {
+                        debug!(
+                            "a frame of {} macroblocks ({} refined, {} intra) at qp {}, activity {act:.0}: {} bytes",
+                            d.coded + d.refined,
+                            d.refined,
+                            d.intra,
+                            opts.qp,
+                            d.bytes
+                        );
+                    }
+                    if !d.frame {
+                        continue;
+                    }
+                    t_enc = Instant::now();
+                    if !out.frame(&e.nals(), d.key) {
+                        break;
+                    }
+                    if change {
+                        changed_at = now;
+                    }
+                    if refine {
+                        next_refine = now + period;
+                    }
+                    // whether refinement has more to do: looked at once the frame's gone
+                    coarse = e.coarse(crate::avc::QP_FINE) > 0;
+                    d.bytes
+                }
+            };
             let t3 = Instant::now();
-            if nals.is_empty() {
-                continue;
-            }
             sent = true;
-            let bytes: usize = nals.iter().map(|n| n.len()).sum();
-            if !out.frame(&nals, key) {
-                break;
+            stats.frame(px_done, bytes, t2 - t1, t_enc - t2, t3 - t_enc);
+            // the first frame after an input: how long from it to the app's drawing seen,
+            // and to the frame sent
+            if change {
+                let input = self.input_at.load(Ordering::Relaxed);
+                let at = epoch() + Duration::from_nanos(input);
+                if input != timed_input && input > 0 && t3.duration_since(at) < Duration::from_millis(500) {
+                    timed_input = input;
+                    if let Some(w) = woke {
+                        stats.input(w.saturating_duration_since(at), t3.duration_since(at));
+                    }
+                }
+                woke = None;
             }
-            stats.frame(px_done, bytes, t2 - t1, t3 - t2, t3.elapsed());
         }
         stats.log();
         Ok(())
     }
 }
+
+/// what encodes: afterglow's own encoder (its cost follows what changed), or OpenH264
+enum Enc {
+    Own(Box<crate::avc::Encoder>, crate::avc::Rate),
+    Open(encode::H264),
+}
+
+/// how long the screen is still before what was coded coarsely is refined: long enough
+/// that typing doesn't share its frames with refinement
+const REFINE_AFTER: Duration = Duration::from_millis(60);
 
 /// encoder threads (one slice each) for a size: one for small pictures, where a
 /// thread's hand-off costs more than it saves; two at 720p, three at 1080p and up (four
@@ -754,6 +895,10 @@ fn threads_for(w: usize, h: usize) -> usize {
 /// where a video's time goes, logged every few seconds at debug
 struct Stats {
     since: Instant,
+    /// inputs timed: to the app's drawing seen, to its frame sent
+    inputs: u32,
+    to_damage: Duration,
+    to_sent: Duration,
     frames: u32,
     px: u64,
     bytes: u64,
@@ -767,6 +912,9 @@ impl Stats {
     fn new() -> Stats {
         Stats {
             since: Instant::now(),
+            inputs: 0,
+            to_damage: Duration::ZERO,
+            to_sent: Duration::ZERO,
             frames: 0,
             px: 0,
             bytes: 0,
@@ -775,6 +923,12 @@ impl Stats {
             send: Duration::ZERO,
             worst: Duration::ZERO,
         }
+    }
+
+    fn input(&mut self, to_damage: Duration, to_sent: Duration) {
+        self.inputs += 1;
+        self.to_damage += to_damage;
+        self.to_sent += to_sent;
     }
 
     fn frame(&mut self, px: u64, bytes: usize, grab: Duration, enc: Duration, send: Duration) {
@@ -803,6 +957,15 @@ impl Stats {
                 us(self.send),
                 self.worst.as_micros(),
                 self.bytes as f64 / n / 1024.0
+            );
+        }
+        if self.inputs > 0 {
+            let n = self.inputs as f64;
+            debug!(
+                "input: {} timed, injected to the app's drawing seen {:.0} us, to its frame sent {:.0} us",
+                self.inputs,
+                self.to_damage.as_secs_f64() * 1e6 / n,
+                self.to_sent.as_secs_f64() * 1e6 / n
             );
         }
         *self = Stats::new();

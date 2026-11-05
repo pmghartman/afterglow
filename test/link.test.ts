@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   AfterglowSource,
+  codecOf,
   FrameRoom,
   In,
   LinkReader,
@@ -19,6 +20,11 @@ import {
 import { configMessage, cursorMessage, FakeAfterglow, frameMessage, jsonMessage } from "../src/testing.ts";
 
 describe("link framing", () => {
+  test("an avcC record's codec string", () => {
+    expect(codecOf(new Uint8Array([1, 0x42, 0xc0, 0x33, 0xff]))).toBe("avc1.42c033");
+    expect(codecOf(new Uint8Array([1, 0x64, 0x00, 0x1f]))).toBe("avc1.64001f");
+  });
+
   test("messages out of a stream cut anywhere, each its own array", () => {
     const a = jsonMessage(Out.ready, { version: "1" });
     const b = frameMessage(3, true, [0, 0, 0, 1, 0x65]);

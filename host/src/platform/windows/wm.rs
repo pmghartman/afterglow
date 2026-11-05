@@ -2,38 +2,60 @@
 //! keeps them to its Xvfb: a main window fills the display, over the taskbar, and a
 //! dialog or a fixed-size window is centred on it, so the video shows the app and not
 //! the desktop around it. Windows are looked for every 100ms; nothing is hooked.
+//!
+//! The app's windows are those of its job's processes. An app can show its window from
+//! outside the job, though: one already running takes the launch and opens it, a broker
+//! starts the real process. So until a window of the job's own has shown, for the first
+//! seconds after the launch, a window of a process started since then is taken as the
+//! app's too; and what was seen (or wasn't) is logged, so a launch that shows nothing
+//! on its display says why.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::JobObjects::IsProcessInJob;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindowAsync, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW,
-    WS_THICKFRAME,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindowAsync, WM_CLOSE, WS_CAPTION, WS_CHILD,
+    WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, PWSTR};
 
 use super::display;
 use super::input::sync_desktop;
-use crate::debug;
+use crate::{info, warn};
+
+/// what the follower knows of the app's windows, for the host to ask
+#[derive(Default)]
+struct Seen {
+    /// the app's windows up now, and whether it ever had one
+    windows: AtomicUsize,
+    ever: AtomicBool,
+    /// windows of processes outside the job taken as the app's
+    adopted: Mutex<Vec<isize>>,
+}
 
 /// the app's windows followed on their own thread until dropped
 pub struct Follower {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    seen: Arc<Seen>,
+    started: Instant,
 }
 
 impl Follower {
@@ -42,11 +64,55 @@ impl Follower {
         let stop = Arc::new(AtomicBool::new(false));
         // a handle isn't Send: its value crosses, the job outlives the follower
         let (s, job) = (stop.clone(), job.0 as usize);
+        // SAFETY: fills the struct it's given
+        let launched = unsafe { GetSystemTimeAsFileTime() };
+        let seen = Arc::new(Seen::default());
+        let out = seen.clone();
         let thread = thread::Builder::new()
             .name("windows".into())
-            .spawn(move || follow(HANDLE(job as *mut c_void), &display, &s))
+            .spawn(move || follow(HANDLE(job as *mut c_void), &display, &s, ticks(launched), &out))
             .ok();
-        Follower { stop, thread }
+        Follower { stop, thread, seen, started: Instant::now() }
+    }
+
+    /// the app's windows up now
+    pub fn windows(&self) -> usize {
+        self.seen.windows.load(Ordering::Relaxed)
+    }
+
+    /// whether a window of the app's has ever shown
+    pub fn ever(&self) -> bool {
+        self.seen.ever.load(Ordering::Relaxed)
+    }
+
+    /// since the launch
+    pub fn age(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// the windows taken from outside the job asked to close, as their close button
+    /// would: their processes weren't started by afterglow, so they're never ended. How
+    /// many were asked
+    pub fn close_adopted(&self) -> usize {
+        let hs = self.seen.adopted.lock().unwrap().clone();
+        let mut n = 0;
+        for h in hs {
+            let h = HWND(h as *mut c_void);
+            // SAFETY: a message posted to a window that may have gone, which only fails
+            unsafe {
+                if IsWindow(Some(h)).as_bool() && PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// adopted windows still up
+    pub fn adopted_left(&self) -> usize {
+        let hs = self.seen.adopted.lock().unwrap();
+        // SAFETY: IsWindow takes any value
+        hs.iter().filter(|&&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool()).count()
     }
 }
 
@@ -68,7 +134,48 @@ enum Kind {
     Centre,
 }
 
-fn follow(job: HANDLE, display: &str, stop: &AtomicBool) {
+/// how long after the launch a window from outside the job can be taken as the app's,
+/// while none of the job's own has shown; and when to say that none has
+const ADOPT_FOR: Duration = Duration::from_secs(15);
+const NONE_YET: Duration = Duration::from_secs(3);
+
+/// processes of the shell, never taken for the app
+const SHELL: [&str; 10] = [
+    "explorer.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "searchhost.exe",
+    "searchapp.exe",
+    "textinputhost.exe",
+    "lockapp.exe",
+    "applicationframehost.exe",
+    "afterglow.exe",
+    "conhost.exe",
+];
+
+fn ticks(f: FILETIME) -> u64 {
+    ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
+}
+
+/// a process's executable's file name, lower case, and when it started (FILETIME ticks)
+fn process_of(pid: u32) -> Option<(String, u64)> {
+    // SAFETY: a process opened for queries and closed; buffers sized as passed
+    unsafe {
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut c, mut e, mut k, mut u) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let times = GetProcessTimes(p, &mut c, &mut e, &mut k, &mut u).is_ok();
+        let mut buf = [0u16; 512];
+        let mut n = buf.len() as u32;
+        let named = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+        let _ = CloseHandle(p);
+        let path = if named { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() };
+        let file = path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+        times.then_some((file, ticks(c)))
+    }
+}
+
+fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Seen) {
     // onto the app's desktop before COM: a thread with a window of its own can't change desktops
     sync_desktop();
     // SAFETY: balanced below; the taskbar's object lives in an apartment
@@ -77,17 +184,85 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool) {
     let taskbar: Option<ITaskbarList2> = unsafe {
         CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER).ok().filter(|t: &ITaskbarList2| t.HrInit().is_ok())
     };
+    let t0 = Instant::now();
     // windows already placed once, so the app has the keyboard as each comes
     let mut seen: HashSet<isize> = HashSet::new();
+    // processes outside the job taken as the app's, and those looked at and not
+    let mut adopted: HashSet<u32> = HashSet::new();
+    let mut looked: HashMap<u32, bool> = HashMap::new();
+    let (mut own_shown, mut said_none, mut said_lost) = (false, false, false);
     while !stop.load(Ordering::Relaxed) {
-        if let Some(mon) = display::rect_of(display) {
-            for (h, kind) in app_windows(job) {
-                let first = seen.insert(h.0 as isize);
-                place(h, kind, mon, first, taskbar.as_ref());
+        match display::rect_of(display) {
+            Some(mon) => {
+                said_lost = false;
+                let early = t0.elapsed() < ADOPT_FOR && !own_shown;
+                let mut strangers = Vec::new();
+                for (h, kind, pid) in top_windows() {
+                    let ours = if in_job(h, job) {
+                        own_shown = true;
+                        true
+                    } else if adopted.contains(&pid) {
+                        true
+                    } else {
+                        if early {
+                            // started since the launch, and not the shell's: the app's
+                            let take = *looked.entry(pid).or_insert_with(|| {
+                                process_of(pid).is_some_and(|(exe, started)| {
+                                    let take = started + 20_000_000 >= launched && !SHELL.contains(&exe.as_str());
+                                    if take {
+                                        info!(
+                                            "windows of {exe} (pid {pid}), started since the launch, taken as the app's"
+                                        );
+                                    }
+                                    take
+                                })
+                            });
+                            if take {
+                                adopted.insert(pid);
+                            }
+                        }
+                        if !adopted.contains(&pid) && !said_none {
+                            strangers.push(pid);
+                        }
+                        adopted.contains(&pid)
+                    };
+                    if ours {
+                        let first = seen.insert(h.0 as isize);
+                        if first && adopted.contains(&pid) {
+                            out.adopted.lock().unwrap().push(h.0 as isize);
+                        }
+                        place(h, kind, mon, first, taskbar.as_ref());
+                    }
+                }
+                if seen.is_empty() && !said_none && t0.elapsed() >= NONE_YET {
+                    said_none = true;
+                    let mut others: Vec<String> = strangers
+                        .iter()
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .filter_map(|&p| process_of(p).map(|(exe, _)| format!("{exe} ({p})")))
+                        .collect();
+                    others.sort();
+                    others.truncate(12);
+                    warn!(
+                        "no window of the app's after {}s; windows on the desktop not its: {}",
+                        NONE_YET.as_secs(),
+                        if others.is_empty() { "none".into() } else { others.join(", ") }
+                    );
+                }
             }
+            None if !said_lost => {
+                said_lost = true;
+                warn!("{display} isn't found among the displays: the app's windows are left where they are");
+            }
+            None => {}
         }
         // SAFETY: IsWindow takes any value
         seen.retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
+        out.windows.store(seen.len(), Ordering::Relaxed);
+        if !seen.is_empty() {
+            out.ever.store(true, Ordering::Relaxed);
+        }
         thread::sleep(Duration::from_millis(100));
     }
     drop(taskbar);
@@ -104,8 +279,9 @@ unsafe extern "system" fn collect(h: HWND, l: LPARAM) -> BOOL {
     true.into()
 }
 
-/// the app's visible top-level windows, and what's done with each
-fn app_windows(job: HANDLE) -> Vec<(HWND, Kind)> {
+/// the desktop's visible top-level windows that are someone's main window or dialog,
+/// what would be done with each, and its process
+fn top_windows() -> Vec<(HWND, Kind, u32)> {
     let mut all: Vec<HWND> = Vec::new();
     // SAFETY: collect only pushes to the Vec whose address it's given
     unsafe {
@@ -130,9 +306,8 @@ fn app_windows(job: HANDLE) -> Vec<(HWND, Kind)> {
             {
                 continue;
             }
-            if !in_job(h, job) {
-                continue;
-            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut pid));
             let owned = GetWindow(h, GW_OWNER).is_ok_and(|o| !o.is_invalid());
             let captioned = style & WS_CAPTION.0 == WS_CAPTION.0;
             let kind = if !owned && style & WS_THICKFRAME.0 != 0 {
@@ -143,7 +318,7 @@ fn app_windows(job: HANDLE) -> Vec<(HWND, Kind)> {
                 // an owned popup without a caption (a dropdown, a flyout): placed by the app
                 continue;
             };
-            out.push((h, kind));
+            out.push((h, kind, pid));
         }
     }
     out
@@ -196,7 +371,7 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
                     let (w, ht) = (mon.right - mon.left + l + r, mon.bottom - mon.top + t + b);
                     let _ = SetWindowPos(h, None, mon.left - l, mon.top - t, w, ht, flags);
                     if first {
-                        debug!("window {:#x} fills the display", h.0 as usize);
+                        info!("window {:#x} fills the display", h.0 as usize);
                     }
                 }
                 if first {
@@ -213,7 +388,7 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
                     let y = mon.top + ((mon.bottom - mon.top) - (wr.bottom - wr.top)) / 2;
                     let _ = SetWindowPos(h, None, x.max(mon.left), y.max(mon.top), 0, 0, flags | SWP_NOSIZE);
                     if first {
-                        debug!("window {:#x} centred on the display", h.0 as usize);
+                        info!("window {:#x} centred on the display", h.0 as usize);
                     }
                 }
             }

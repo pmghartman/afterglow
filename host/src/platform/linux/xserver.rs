@@ -92,8 +92,9 @@ impl Xvfb {
         // the server reads the cookie at start, any display; the app's copy names its display after
         write_auth("")?;
         let mut fds = [0i32; 2];
-        // SAFETY: a pipe whose write end Xvfb inherits to say its display number
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        // SAFETY: a pipe whose write end Xvfb alone inherits to say its display number:
+        // close-on-exec, so no other child started meanwhile (the app, another Xvfb) holds it
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err("no pipe".into());
         }
         // SAFETY: fds[0] is ours alone from here
@@ -108,6 +109,18 @@ impl Xvfb {
             .arg(&auth);
         if let Some(d) = &fbdir {
             cmd.arg("-fbdir").arg(d);
+        }
+        let wfd = fds[1];
+        // SAFETY: in the child between fork and exec, one fcntl on a descriptor it has: the
+        // write end kept across the exec for Xvfb
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(move || {
+                if libc::fcntl(wfd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         let child = cmd
             .stdin(Stdio::null())

@@ -18,6 +18,7 @@ export {
 } from "./afterglow/config.ts";
 export { asText, InputPacker, modOf, pack, vkOf } from "./afterglow/input.ts";
 export {
+  codecOf,
   configOf,
   cursorOf,
   frameOf,
