@@ -4,8 +4,8 @@
 # Windows and built for Linux, then a GitHub release with
 # afterglow-VERSION-windows-x86_64.zip, afterglow-VERSION-linux-x86_64.tar.gz, their
 # SHA256SUMS, build provenance attestations and afterglow.json, the manifest hosts
-# update from (every archive's sha256 and the link's proto), signed with minisign as
-# afterglow.json.minisig by the secret UPDATE_SIGNING_KEY. The Windows exes are
+# update from (every archive's sha256 and the link's proto), signed in minisign's format
+# by scripts/sign.ts as afterglow.json.minisig with the secret UPDATE_SIGNING_KEY. The Windows exes are
 # Authenticode-signed when the signing secrets are set. "Build only" stops before publishing:
 # a way to try the Windows build. The SudoVDA driver isn't built here: its signed
 # package and nefconc.exe come out of Apollo's release installer at APOLLO_TAG, checked
@@ -289,10 +289,7 @@ jobs:
           } > out/afterglow.json
           jq . out/afterglow.json
           jq -e '.proto > 0 and (.assets | length) > 0' out/afterglow.json >/dev/null
-          umask 077
-          printf '%s\n' "$KEY" > "$RUNNER_TEMP/minisign.key"
-          minisign -S -s "$RUNNER_TEMP/minisign.key" -W -m out/afterglow.json -x out/afterglow.json.minisig -t "afterglow $VER"
-          rm -f "$RUNNER_TEMP/minisign.key"
+          UPDATE_SIGNING_KEY="$KEY" bun scripts/sign.ts out/afterglow.json "afterglow $VER"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
