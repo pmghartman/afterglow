@@ -9,8 +9,9 @@
 # Authenticode-signed when the signing secrets are set. "Build only" stops before publishing:
 # a way to try the Windows build. The SudoVDA driver isn't built here: its signed
 # package and nefconc.exe come out of Apollo's release installer at APOLLO_TAG, checked
-# against the driver's catalog. Every run ends by purging the repo's Actions caches
-# and artifacts (the purge job). After a release only the two newest releases and
+# against the driver's catalog. Clippy's build is cached between runs; the tests and
+# release builds never are. Every run ends by purging the repo's Actions caches (all
+# but the newest clippy one on each OS) and artifacts (the purge job). After a release only the two newest releases and
 # their tags are kept (the prune job)
 name: release
 
@@ -97,7 +98,19 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm ffmpeg nasm
       - run: rustup toolchain install stable --profile minimal -c clippy,rustfmt && rustup default stable
       - run: cargo fmt --manifest-path host/Cargo.toml --check
+      # clippy in a target dir of its own, cached across runs; the tests and release
+      # builds use host/target, which is never cached
+      - id: rustc
+        run: echo "v=$(rustc -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: host/target-clippy
+          key: clippy-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('host/Cargo.lock') }}
+          restore-keys: clippy-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
       - run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets -- -D warnings
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/host/target-clippy
+          CARGO_INCREMENTAL: 0
       - run: bun run test:host
       - run: bun run test:e2e
 
@@ -122,7 +135,18 @@ jobs:
           # nothing kept in the Actions cache: the purge job clears it after each run
           no-cache: true
       - run: rustup toolchain install stable --profile minimal -c clippy && rustup default stable
+      # clippy's cached target dir, as in check; the build below uses host/target, uncached
+      - id: rustc
+        run: echo "v=$(rustc -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: host/target-clippy
+          key: clippy-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('host/Cargo.lock') }}
+          restore-keys: clippy-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
       - run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets -- -D warnings
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/host/target-clippy
+          CARGO_INCREMENTAL: 0
       - name: build
         env:
           VER: ${{ needs.version.outputs.ver }}
@@ -339,9 +363,10 @@ jobs:
           done
 
   # the repo's Actions storage cleared after every run, whatever its outcome: every
-  # cache (setup actions' and those older runs left), and every artifact but this run's
-  # own when nothing was published, so a build-only or failed run's zip can still be
-  # downloaded for the day it's kept. Runs are serialized, so no other run's are in use
+  # cache but the newest clippy one on each OS (key clippy-OS-...), and every artifact
+  # but this run's own when nothing was published, so a build-only or failed run's zip
+  # can still be downloaded for the day it's kept. Runs are serialized, so no other
+  # run's are in use
   purge:
     needs: [check, windows, linux, publish]
     if: ${{ always() }}
@@ -355,9 +380,11 @@ jobs:
     steps:
       - name: caches
         run: |
-          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[].id')
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[]' | jq -rs '
+            ([.[] | select(.key | startswith("clippy-"))] | group_by(.key | split("-")[1]) | map(max_by(.last_accessed_at).id)) as $keep
+            | .[] | select(.id as $i | $keep | index($i) | not) | .id')
           for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent || echo "::warning::cache $id not deleted"; done
-          echo "deleted $(echo "$ids" | grep -c . || true) caches"
+          echo "deleted $(echo "$ids" | grep -c . || true) caches, kept the newest clippy cache on each OS"
       - name: artifacts
         run: |
           ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
