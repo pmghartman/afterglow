@@ -248,7 +248,10 @@ pub struct Encoder {
     provides: bool,
     out_size: u32,
     seq: Vec<u8>,
+    /// frames given to the encoder
     n: i64,
+    /// access units it gave back
+    made: i64,
     period: i64,
     w: u32,
     h: u32,
@@ -340,6 +343,7 @@ impl Encoder {
                     out_size: 0,
                     seq: Vec::new(),
                     n: 0,
+                    made: 0,
                     period: 10_000_000 / v.fps as i64,
                     w: v.w,
                     h: v.h,
@@ -552,6 +556,7 @@ impl Encoder {
                 au.splice(0..0, self.seq.iter().copied());
             }
             out.push((au, key));
+            self.made += 1;
             Ok(true)
         }
     }
@@ -581,6 +586,12 @@ impl Encoder {
     /// asynchronous encoder's later output comes from poll
     pub fn encode(&mut self, idr: bool) -> std::result::Result<Vec<(Vec<u8>, bool)>, String> {
         self.encode_inner(idr).map_err(|e| format!("the encoder failed: {e}"))
+    }
+
+    /// frames given to the encoder and not yet given back: a hardware encoder can
+    /// hold a few until more come, so a still screen's last change waits on them
+    pub fn held(&self) -> i64 {
+        (self.n - self.made).max(0)
     }
 
     /// what an asynchronous encoder has made since, without waiting

@@ -189,20 +189,34 @@ impl Windows {
         let mut pending = false;
         let mut next_slot = Instant::now();
         let mut last = Instant::now();
+        // after a change, the same frame given again (in its slots) while the encoder
+        // holds frames back, so the change comes out now rather than with the next one
+        let mut tail = 0u32;
+        let mut stats = Stats::new();
         while !ctl.stop.load(Ordering::Relaxed) {
             // what the encoder finished since, sent as soon as it's out
             for (au, key) in enc.poll()? {
+                stats.au(au.len());
                 if !out(&au, key) {
                     return Ok(false);
                 }
             }
+            stats.tick(enc.held());
             let now = Instant::now();
-            let wait = if pending { next_slot.saturating_duration_since(now) } else { period };
+            let flush = tail > 0 && enc.held() > 0;
+            let wait = if pending || flush { next_slot.saturating_duration_since(now) } else { period };
             // short: the wait holds the device the encoder shares
             match dup.next(wait.as_millis().clamp(1, 4) as u32) {
-                Ok(capture::Got::Frame) => pending = true,
+                Ok(capture::Got::Frame) => {
+                    pending = true;
+                    stats.captured += 1;
+                }
                 Ok(capture::Got::Timeout) => {}
-                Err(capture::Lost::Again) => return Ok(true),
+                Err(capture::Lost::Again) => {
+                    // a mode change or a desktop switch: everything set up again, a pause the viewer sees
+                    info!("the capture was lost; set up again");
+                    return Ok(true);
+                }
                 Err(capture::Lost::Wait(why)) => {
                     debug!("{why}");
                     thread::sleep(Duration::from_millis(100));
@@ -217,22 +231,88 @@ impl Windows {
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
             let now = Instant::now();
             // a change in its slot, a keyframe asked, or once a second the last frame again to keep the stream alive
-            let due = (pending && now >= next_slot) || idr || last.elapsed() >= Duration::from_secs(1);
+            let flush = tail > 0 && enc.held() > 0;
+            let due = ((pending || flush) && now >= next_slot) || idr || last.elapsed() >= Duration::from_secs(1);
             if !due {
                 continue;
             }
+            tail = if pending || idr { FLUSH_FRAMES } else { tail.saturating_sub(1) };
             pending = false;
             last = now;
             next_slot = (next_slot + period).max(now);
+            let t0 = Instant::now();
             let made = enc.encode(idr)?;
+            stats.encoded(t0.elapsed());
             sent = true;
             for (au, key) in made {
+                stats.au(au.len());
                 if !out(&au, key) {
                     return Ok(false);
                 }
             }
         }
         Ok(false)
+    }
+}
+
+/// frames given again after a change at most, while the encoder holds some back
+const FLUSH_FRAMES: u32 = 8;
+
+/// what a video did, logged every few seconds: where its time goes when it's slow
+struct Stats {
+    since: Instant,
+    captured: u32,
+    encodes: u32,
+    encode_time: Duration,
+    encode_max: Duration,
+    aus: u32,
+    bytes: u64,
+    held_max: i64,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats {
+            since: Instant::now(),
+            captured: 0,
+            encodes: 0,
+            encode_time: Duration::ZERO,
+            encode_max: Duration::ZERO,
+            aus: 0,
+            bytes: 0,
+            held_max: 0,
+        }
+    }
+
+    fn encoded(&mut self, d: Duration) {
+        self.encodes += 1;
+        self.encode_time += d;
+        self.encode_max = self.encode_max.max(d);
+    }
+
+    fn au(&mut self, n: usize) {
+        self.aus += 1;
+        self.bytes += n as u64;
+    }
+
+    fn tick(&mut self, held: i64) {
+        self.held_max = self.held_max.max(held);
+        let s = self.since.elapsed();
+        if s < Duration::from_secs(5) {
+            return;
+        }
+        let secs = s.as_secs_f64();
+        let avg = if self.encodes > 0 { self.encode_time.as_secs_f64() * 1000.0 / self.encodes as f64 } else { 0.0 };
+        info!(
+            "video: {:.0} changes/s, {:.0} encodes/s ({avg:.1} ms, max {} ms), {:.0} frames/s out at {:.0} kbps, up to {} held",
+            self.captured as f64 / secs,
+            self.encodes as f64 / secs,
+            self.encode_max.as_millis(),
+            self.aus as f64 / secs,
+            self.bytes as f64 * 8.0 / 1000.0 / secs,
+            self.held_max,
+        );
+        *self = Stats::new();
     }
 }
 
