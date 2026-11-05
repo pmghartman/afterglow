@@ -1,12 +1,18 @@
 //! A window manager for one app on its own Xvfb, inside afterglow: the app's main
 //! windows fill the screen and have the keyboard, a dialog keeps its size, centred.
+//! It speaks EWMH so toolkits lay a filled window out as the maximized window it is
+//! (no client-side frame, shadow or resize border, the restore button), not as a
+//! normal one stretched: _NET_WM_STATE maximized, or fullscreen when the app asks;
+//! frame extents of nothing; the active window and the client list on the root. A
+//! window that can't be as big as the screen (its WM_NORMAL_HINTS say so) is centred
+//! at its size like a dialog.
 //! It tells the driver the main window's title and the app's windows as they change,
 //! brings one to the front when asked, closes the app as its own close button would
 //! (WM_DELETE_WINDOW), and carries the clipboard both ways: the viewer's text owned
 //! here as CLIPBOARD and PRIMARY for the app to paste, what the app copies (XFixes
 //! says when) read and sent on. Commands come from the link on a queue and a wake pipe.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,19 +68,28 @@ fn pipe() -> Option<(OwnedFd, OwnedFd)> {
 }
 
 impl Wm {
+    /// the window manager running on d, once it is: it holds the root's redirect before
+    /// this returns, so no window the app maps after slips past it unmanaged
     pub fn start(d: &Display) -> Result<Wm, String> {
         let (rx, tx) = pipe().ok_or("no pipe")?;
         let shared = Arc::new(Shared::default());
         let (d, sh) = (d.clone(), shared.clone());
+        let (up_tx, up_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let thread = thread::Builder::new()
             .name("wm".into())
             .spawn(move || {
-                if let Err(e) = run(&d, &sh, rx) {
+                if let Err(e) = run(&d, &sh, rx, &up_tx) {
+                    let _ = up_tx.send(Err(e.clone()));
                     warn!("the window manager on {} stopped: {e}", d.name);
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Wm { shared, wake: tx, thread: Some(thread) })
+        let wm = Wm { shared, wake: tx, thread: Some(thread) };
+        match up_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => Ok(wm),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("the window manager didn't start".into()),
+        }
     }
 
     fn poke(&self) {
@@ -126,6 +141,19 @@ struct Atoms {
     plain: u32,
     compound: u32,
     ours: u32,
+    supported: u32,
+    check: u32,
+    state: u32,
+    max_v: u32,
+    max_h: u32,
+    fullscreen: u32,
+    frame: u32,
+    req_frame: u32,
+    active: u32,
+    clients: u32,
+    allowed: u32,
+    act_close: u32,
+    act_full: u32,
 }
 
 fn atoms(c: &RustConnection) -> Result<Atoms, String> {
@@ -146,6 +174,19 @@ fn atoms(c: &RustConnection) -> Result<Atoms, String> {
         "text/plain;charset=utf-8",
         "COMPOUND_TEXT",
         "AFTERGLOW_CLIP",
+        "_NET_SUPPORTED",
+        "_NET_SUPPORTING_WM_CHECK",
+        "_NET_WM_STATE",
+        "_NET_WM_STATE_MAXIMIZED_VERT",
+        "_NET_WM_STATE_MAXIMIZED_HORZ",
+        "_NET_WM_STATE_FULLSCREEN",
+        "_NET_FRAME_EXTENTS",
+        "_NET_REQUEST_FRAME_EXTENTS",
+        "_NET_ACTIVE_WINDOW",
+        "_NET_CLIENT_LIST",
+        "_NET_WM_ALLOWED_ACTIONS",
+        "_NET_WM_ACTION_CLOSE",
+        "_NET_WM_ACTION_FULLSCREEN",
     ];
     let cookies: Vec<_> = names.iter().map(|n| c.intern_atom(false, n.as_bytes())).collect();
     let mut a = Vec::with_capacity(names.len());
@@ -166,6 +207,19 @@ fn atoms(c: &RustConnection) -> Result<Atoms, String> {
         plain: a[13],
         compound: a[14],
         ours: a[15],
+        supported: a[16],
+        check: a[17],
+        state: a[18],
+        max_v: a[19],
+        max_h: a[20],
+        fullscreen: a[21],
+        frame: a[22],
+        req_frame: a[23],
+        active: a[24],
+        clients: a[25],
+        allowed: a[26],
+        act_close: a[27],
+        act_full: a[28],
     })
 }
 
@@ -181,6 +235,10 @@ struct State<'a> {
     sh: u16,
     /// managed windows, bottom to top: (window, fills the screen)
     stack: Vec<(u32, bool)>,
+    /// windows centred by their nature (a dialog, a fixed size), and those the app
+    /// asked to be fullscreen
+    centred: HashSet<u32>,
+    fs: HashSet<u32>,
     titles: HashMap<u32, String>,
     told_title: Option<String>,
     told_list: Option<serde_json::Value>,
@@ -257,6 +315,48 @@ impl State<'_> {
         self.synthetic(w, 0, 0, self.sw, self.sh);
     }
 
+    /// at its size, no bigger than the screen, in the middle of it
+    fn centre(&self, w: u32) {
+        let Some(g) = self.c.get_geometry(w).ok().and_then(|c| c.reply().ok()) else { return };
+        let (ww, hh) = (g.width.min(self.sw), g.height.min(self.sh));
+        let x = ((self.sw as i32 - ww as i32) / 2).max(0);
+        let y = ((self.sh as i32 - hh as i32) / 2).max(0);
+        let _ = self.c.configure_window(w, &ConfigureWindowAux::new().x(x).y(y).width(ww as u32).height(hh as u32));
+        self.synthetic(w, x as i16, y as i16, ww, hh);
+    }
+
+    /// what the window is, said as EWMH says it: maximized when it fills the screen
+    /// (fullscreen when the app asked), nothing when centred; no frame around it either
+    /// way, and what it can be asked
+    fn tell_state(&self, w: u32, fills: bool) {
+        let st: &[u32] = if !fills {
+            &[]
+        } else if self.fs.contains(&w) {
+            &[self.a.fullscreen]
+        } else {
+            &[self.a.max_v, self.a.max_h]
+        };
+        let _ = self.c.change_property32(PropMode::REPLACE, w, self.a.state, AtomEnum::ATOM, st);
+        let _ = self.c.change_property32(PropMode::REPLACE, w, self.a.frame, AtomEnum::CARDINAL, &[0, 0, 0, 0]);
+        let _ = self.c.change_property32(
+            PropMode::REPLACE,
+            w,
+            self.a.allowed,
+            AtomEnum::ATOM,
+            &[self.a.act_close, self.a.act_full],
+        );
+    }
+
+    /// WM_NORMAL_HINTS saying the window can't be as big as the screen
+    fn fixed(&self, w: u32) -> bool {
+        let hints: u32 = AtomEnum::WM_NORMAL_HINTS.into();
+        let Some((_, v)) = self.prop(w, hints, AtomEnum::WM_SIZE_HINTS.into(), 72) else { return false };
+        let at = |i: usize| v.get(i * 4..i * 4 + 4).map_or(0, |b| u32::from_ne_bytes(b.try_into().unwrap()));
+        // PMaxSize
+        let (max_w, max_h) = (at(7), at(8));
+        at(0) & (1 << 5) != 0 && max_w > 0 && max_h > 0 && (max_w < self.sw as u32 || max_h < self.sh as u32)
+    }
+
     /// ICCCM 4.1.5: a client told where it is even when its request wasn't the answer
     fn synthetic(&self, w: u32, x: i16, y: i16, ww: u16, hh: u16) {
         let e = ConfigureNotifyEvent {
@@ -278,11 +378,14 @@ impl State<'_> {
     fn focus(&self, w: u32) {
         let _ = self.c.configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
         let _ = self.c.set_input_focus(InputFocus::POINTER_ROOT, w, x11rb::CURRENT_TIME);
+        let _ = self.c.change_property32(PropMode::REPLACE, self.root, self.a.active, AtomEnum::WINDOW, &[w]);
     }
 
     /// the main window (the newest that fills the screen) and the list, told when changed
     fn report(&mut self) {
         self.sh_.windows.store(self.stack.len(), Ordering::Relaxed);
+        let ids: Vec<u32> = self.stack.iter().map(|s| s.0).collect();
+        let _ = self.c.change_property32(PropMode::REPLACE, self.root, self.a.clients, AtomEnum::WINDOW, &ids);
         if !self.stack.is_empty() {
             self.sh_.seen.store(true, Ordering::Relaxed);
         }
@@ -302,32 +405,74 @@ impl State<'_> {
     }
 
     fn map(&mut self, w: u32) {
-        let dialog = self.is_dialog(w);
-        if dialog {
-            if let Some(g) = self.c.get_geometry(w).ok().and_then(|c| c.reply().ok()) {
-                let (ww, hh) = (g.width.min(self.sw), g.height.min(self.sh));
-                let x = (self.sw as i32 - ww as i32) / 2;
-                let y = (self.sh as i32 - hh as i32) / 2;
-                let _ = self.c.configure_window(
-                    w,
-                    &ConfigureWindowAux::new().x(x.max(0)).y(y.max(0)).width(ww as u32).height(hh as u32),
-                );
-            }
-        } else {
-            self.fill(w);
+        let centred = self.is_dialog(w) || self.fixed(w);
+        let fills = !centred || self.fs.contains(&w);
+        if centred {
+            self.centred.insert(w);
         }
+        if fills {
+            self.fill(w);
+        } else {
+            self.centre(w);
+        }
+        self.tell_state(w, fills);
         let _ = self.c.change_window_attributes(
             w,
             &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         );
         let _ = self.c.map_window(w);
+        // said again once it's mapped: GTK 4 only takes a state change on a window that is
+        self.tell_state(w, fills);
         self.focus(w);
         self.stack.retain(|s| s.0 != w);
-        self.stack.push((w, !dialog));
+        self.stack.push((w, fills));
         let t = self.title_of(w);
         self.titles.insert(w, t);
-        debug!("window {w:#x} {}", if dialog { "centred" } else { "fills the screen" });
+        debug!("window {w:#x} {}", if fills { "fills the screen" } else { "centred" });
         self.report();
+    }
+
+    /// a client message asking the window manager something
+    fn client_message(&mut self, e: &ClientMessageEvent) {
+        let d = e.data.as_data32();
+        let w = e.window;
+        if e.type_ == self.a.req_frame {
+            // asked before mapping: no frame will be put around it
+            let _ = self.c.change_property32(PropMode::REPLACE, w, self.a.frame, AtomEnum::CARDINAL, &[0, 0, 0, 0]);
+            return;
+        }
+        let Some(i) = self.stack.iter().position(|s| s.0 == w) else { return };
+        if e.type_ == self.a.active {
+            let s = self.stack.remove(i);
+            self.stack.push(s);
+            self.focus(w);
+            self.report();
+        } else if e.type_ == self.a.state {
+            // [action: 0 remove, 1 add, 2 toggle, first, second, source]
+            if d[1] == self.a.fullscreen || d[2] == self.a.fullscreen {
+                let on = match d[0] {
+                    0 => false,
+                    1 => true,
+                    _ => !self.fs.contains(&w),
+                };
+                if on {
+                    self.fs.insert(w);
+                } else {
+                    self.fs.remove(&w);
+                }
+            }
+            // whatever was asked, a window that isn't centred by its nature fills the
+            // screen, and one fullscreen does; it's told so again
+            let fills = !self.centred.contains(&w) || self.fs.contains(&w);
+            self.stack[i].1 = fills;
+            if fills {
+                self.fill(w);
+            } else {
+                self.centre(w);
+            }
+            self.tell_state(w, fills);
+            self.report();
+        }
     }
 
     fn unmanage(&mut self, w: u32) {
@@ -335,6 +480,8 @@ impl State<'_> {
             return;
         }
         self.stack.retain(|s| s.0 != w);
+        self.centred.remove(&w);
+        self.fs.remove(&w);
         self.titles.remove(&w);
         if let Some(&(top, _)) = self.stack.last() {
             let _ = self.c.set_input_focus(InputFocus::POINTER_ROOT, top, x11rb::CURRENT_TIME);
@@ -419,9 +566,12 @@ impl State<'_> {
                 for &(w, full) in &self.stack {
                     if full {
                         self.fill(w);
+                    } else {
+                        self.centre(w);
                     }
                 }
             }
+            Event::ClientMessage(e) => self.client_message(&e),
             Event::PropertyNotify(e)
                 if (e.atom == self.a.net_name || e.atom == u32::from(AtomEnum::WM_NAME))
                     && self.stack.iter().any(|s| s.0 == e.window) =>
@@ -458,7 +608,12 @@ impl State<'_> {
     }
 }
 
-fn run(d: &Display, sh: &Shared, wake: OwnedFd) -> Result<(), String> {
+fn run(
+    d: &Display,
+    sh: &Shared,
+    wake: OwnedFd,
+    up: &std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
     let (c, screen) = d.connect()?;
     let root = c.setup().roots[screen].root;
     let mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY;
@@ -474,6 +629,29 @@ fn run(d: &Display, sh: &Shared, wake: OwnedFd) -> Result<(), String> {
     if c.xfixes_query_version(4, 0).ok().and_then(|r| r.reply().ok()).is_some() {
         let _ = c.xfixes_select_selection_input(root, a.clipboard, xfixes::SelectionEventMask::SET_SELECTION_OWNER);
     }
+    // EWMH: what's supported, said by a window of ours that names us
+    let net = [
+        a.supported,
+        a.check,
+        a.state,
+        a.max_v,
+        a.max_h,
+        a.fullscreen,
+        a.frame,
+        a.req_frame,
+        a.active,
+        a.clients,
+        a.allowed,
+        a.act_close,
+        a.act_full,
+        a.net_name,
+        a.wtype,
+    ];
+    let _ = c.change_property32(PropMode::REPLACE, root, a.supported, AtomEnum::ATOM, &net);
+    for w in [root, clipwin] {
+        let _ = c.change_property32(PropMode::REPLACE, w, a.check, AtomEnum::WINDOW, &[clipwin]);
+    }
+    let _ = c.change_property8(PropMode::REPLACE, clipwin, a.net_name, a.utf8, b"afterglow");
     let (sw, shh) = c.get_geometry(root).ok().and_then(|g| g.reply().ok()).map_or(MAX, |g| (g.width, g.height));
     let mut st = State {
         c: &c,
@@ -483,13 +661,25 @@ fn run(d: &Display, sh: &Shared, wake: OwnedFd) -> Result<(), String> {
         sw,
         sh: shh,
         stack: Vec::new(),
+        centred: HashSet::new(),
+        fs: HashSet::new(),
         titles: HashMap::new(),
         told_title: None,
         told_list: None,
         clip: Vec::new(),
         sh_: sh,
     };
-    let _ = c.flush();
+    // windows mapped before we held the redirect, managed as if they'd asked
+    if let Some(tree) = c.query_tree(root).ok().and_then(|t| t.reply().ok()) {
+        for w in tree.children.into_iter().filter(|&w| w != clipwin) {
+            let Some(at) = c.get_window_attributes(w).ok().and_then(|a| a.reply().ok()) else { continue };
+            if at.map_state == x11rb::protocol::xproto::MapState::VIEWABLE && !at.override_redirect {
+                st.map(w);
+            }
+        }
+    }
+    c.sync().map_err(|e| e.to_string())?;
+    let _ = up.send(Ok(()));
     let fd = c.stream().as_raw_fd();
     let mut had_notes = false;
     while !sh.stop.load(Ordering::Relaxed) {
@@ -532,13 +722,17 @@ mod tests {
     use std::time::{Duration, Instant};
     use x11rb::protocol::xproto::{Atom, PropMode};
 
+    /// tests with an Xvfb of their own, one at a time: two servers coming up with their
+    /// framebuffers beside the encoder's tests starve each other
+    static ONE_XVFB: Mutex<()> = Mutex::new(());
+
     fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
         let t0 = Instant::now();
         loop {
             if let Some(v) = f() {
                 return v;
             }
-            assert!(t0.elapsed() < Duration::from_secs(5), "timed out: {what}");
+            assert!(t0.elapsed() < Duration::from_secs(15), "timed out: {what}");
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -551,6 +745,7 @@ mod tests {
     /// the clipboard both ways, closed as its close button would
     #[test]
     fn titles_windows_raise_clipboard_close_on_a_real_xvfb() {
+        let _one = ONE_XVFB.lock().unwrap_or_else(|e| e.into_inner());
         if std::process::Command::new("Xvfb").arg("-help").output().is_err() {
             eprintln!("no Xvfb: skipped");
             return;
@@ -670,5 +865,73 @@ mod tests {
         c.flush().unwrap();
         until("no windows", || (wm.windows() == 0).then_some(()));
         assert!(wm.ever_had_a_window());
+    }
+
+    #[test]
+    fn filled_windows_told_maximized_fixed_ones_centred_fullscreen_on_asking() {
+        let _one = ONE_XVFB.lock().unwrap_or_else(|e| e.into_inner());
+        if std::process::Command::new("Xvfb").arg("-help").output().is_err() {
+            eprintln!("no Xvfb: skipped");
+            return;
+        }
+        let x = Xvfb::start("Xvfb", 640, 480, 96).unwrap();
+        let (c, screen) = x.display.connect().unwrap();
+        let root = c.setup().roots[screen].root;
+        let (state, max_v, max_h, full, frame, supported) = (
+            atom(&c, "_NET_WM_STATE"),
+            atom(&c, "_NET_WM_STATE_MAXIMIZED_VERT"),
+            atom(&c, "_NET_WM_STATE_MAXIMIZED_HORZ"),
+            atom(&c, "_NET_WM_STATE_FULLSCREEN"),
+            atom(&c, "_NET_FRAME_EXTENTS"),
+            atom(&c, "_NET_SUPPORTED"),
+        );
+        let atoms_of = |w: u32, p: u32| -> Vec<u32> {
+            c.get_property(false, w, p, AtomEnum::ANY, 0, 64)
+                .ok()
+                .and_then(|r| r.reply().ok())
+                .and_then(|r| r.value32().map(|v| v.collect()))
+                .unwrap_or_default()
+        };
+        // the root says what's supported
+        until("supported", || atoms_of(root, supported).contains(&state).then_some(()));
+        let win = |w0: u16, h0: u16| {
+            let w = c.generate_id().unwrap();
+            c.create_window(0, w, root, 0, 0, w0, h0, 0, WindowClass::INPUT_OUTPUT, 0, &CreateWindowAux::new())
+                .unwrap();
+            w
+        };
+        // a main window: fills the screen, told it's maximized, no frame
+        let main = win(200, 100);
+        c.map_window(main).unwrap();
+        c.flush().unwrap();
+        until("maximized", || {
+            let s = atoms_of(main, state);
+            (s.contains(&max_v) && s.contains(&max_h)).then_some(())
+        });
+        assert_eq!(atoms_of(main, frame), [0, 0, 0, 0]);
+        until("filled", || c.get_geometry(main).ok()?.reply().ok().filter(|g| g.width == 640 && g.height == 480));
+        // a window whose hints cap it at 300x200: centred at its size, not stretched
+        let fixed = win(300, 200);
+        let mut hints = [0u32; 18];
+        hints[0] = (1 << 4) | (1 << 5);
+        (hints[5], hints[6], hints[7], hints[8]) = (300, 200, 300, 200);
+        c.change_property32(PropMode::REPLACE, fixed, AtomEnum::WM_NORMAL_HINTS, AtomEnum::WM_SIZE_HINTS, &hints)
+            .unwrap();
+        c.map_window(fixed).unwrap();
+        c.flush().unwrap();
+        let g = until("centred", || c.get_geometry(fixed).ok()?.reply().ok().filter(|g| g.x == 170));
+        assert_eq!((g.y, g.width, g.height), (140, 300, 200));
+        assert!(atoms_of(fixed, state).is_empty());
+        // it asks to be fullscreen: it fills the screen, told so
+        let ask = ClientMessageEvent::new(32, fixed, state, [1, full, 0, 1, 0]);
+        c.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ask).unwrap();
+        c.flush().unwrap();
+        until("fullscreen", || atoms_of(fixed, state).contains(&full).then_some(()));
+        until("filled", || c.get_geometry(fixed).ok()?.reply().ok().filter(|g| g.width == 640 && g.height == 480));
+        // and back: centred at its size again
+        let back = ClientMessageEvent::new(32, fixed, state, [0, full, 0, 1, 0]);
+        c.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, back).unwrap();
+        c.flush().unwrap();
+        until("not fullscreen", || atoms_of(fixed, state).is_empty().then_some(()));
     }
 }
