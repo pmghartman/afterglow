@@ -19,9 +19,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
 use windows::Win32::System::JobObjects::IsProcessInJob;
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows::Win32::System::Threading::{
@@ -175,15 +173,44 @@ fn process_of(pid: u32) -> Option<(String, u64)> {
     }
 }
 
+/// the shell's taskbar told to go under a filled window, by a thread of its own that
+/// holds its object for the life of afterglow: making it talks to Explorer, which can
+/// keep the caller waiting (from SYSTEM it did, for good), and placing the app's windows
+/// mustn't wait on it
+fn under_taskbar(h: HWND) {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, channel};
+    static TX: OnceLock<Mutex<Sender<isize>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = channel::<isize>();
+        let _ = thread::Builder::new().name("taskbar".into()).spawn(move || {
+            sync_desktop();
+            // SAFETY: COM for this thread alone, for as long as afterglow runs; the shell
+            // object made, initialised and used on it
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let t: Option<ITaskbarList2> = CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER)
+                    .ok()
+                    .filter(|t: &ITaskbarList2| t.HrInit().is_ok());
+                if t.is_none() {
+                    warn!("the taskbar can't be told to go under the app's windows");
+                }
+                for h in rx {
+                    if let Some(t) = &t {
+                        let _ = t.MarkFullscreenWindow(HWND(h as *mut c_void), true);
+                    }
+                }
+            }
+        });
+        Mutex::new(tx)
+    });
+    let _ = tx.lock().unwrap().send(h.0 as isize);
+}
+
 fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Seen) {
-    // onto the app's desktop before COM: a thread with a window of its own can't change desktops
+    // onto the app's desktop: its windows are enumerated there
     sync_desktop();
-    // SAFETY: balanced below; the taskbar's object lives in an apartment
-    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-    // SAFETY: a shell object created and initialised on this thread
-    let taskbar: Option<ITaskbarList2> = unsafe {
-        CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER).ok().filter(|t: &ITaskbarList2| t.HrInit().is_ok())
-    };
+    info!("following the app's windows onto {display}");
     let t0 = Instant::now();
     // windows already placed once, so the app has the keyboard as each comes
     let mut seen: HashSet<isize> = HashSet::new();
@@ -231,7 +258,7 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
                         if first && adopted.contains(&pid) {
                             out.adopted.lock().unwrap().push(h.0 as isize);
                         }
-                        place(h, kind, mon, first, taskbar.as_ref());
+                        place(h, kind, mon, first);
                     }
                 }
                 if seen.is_empty() && !said_none && t0.elapsed() >= NONE_YET {
@@ -264,11 +291,6 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
             out.ever.store(true, Ordering::Relaxed);
         }
         thread::sleep(Duration::from_millis(100));
-    }
-    drop(taskbar);
-    if com {
-        // SAFETY: the CoInitializeEx above
-        unsafe { CoUninitialize() };
     }
 }
 
@@ -346,7 +368,7 @@ fn frame(h: HWND, wr: RECT) -> RECT {
     if ok { fb } else { wr }
 }
 
-fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarList2>) {
+fn place(h: HWND, kind: Kind, mon: RECT, first: bool) {
     let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
     // SAFETY: window calls on a handle that may have gone, which only fail; async ones
     // never wait on a hung app
@@ -376,9 +398,7 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
                 }
                 if first {
                     // the taskbar goes under it while it's in front
-                    if let Some(t) = taskbar {
-                        let _ = t.MarkFullscreenWindow(h, true);
-                    }
+                    under_taskbar(h);
                 }
             }
             Kind::Centre => {
