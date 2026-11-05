@@ -10,7 +10,8 @@
 # a way to try the Windows build. The SudoVDA driver isn't built here: its signed
 # package and nefconc.exe come out of Apollo's release installer at APOLLO_TAG, checked
 # against the driver's catalog. Every run ends by purging the repo's Actions caches
-# and artifacts (the purge job)
+# and artifacts (the purge job). After a release only the two newest releases and
+# their tags are kept (the prune job)
 name: release
 
 on:
@@ -316,6 +317,26 @@ jobs:
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
           files: out/*
+
+  # only the two newest releases and their tags kept, after a release is published
+  prune:
+    needs: [publish]
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: releases
+        run: |
+          gh release list --limit 200 --json tagName,createdAt --jq '[.[] | select(.tagName | test("^v[0-9]"))] | sort_by(.createdAt) | reverse | .[2:] | .[].tagName' |
+          while read -r t; do
+            echo "deleting release $t"
+            gh release delete "$t" --yes --cleanup-tag
+          done
 
   # the repo's Actions storage cleared after every run, whatever its outcome: every
   # cache (setup actions' and those older runs left), and every artifact but this run's
