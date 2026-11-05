@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Graphics::Gdi::{
-    BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW, HGDIOBJ,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW, HGDIOBJ,
     ReleaseDC,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, GetFileAttributesW};
@@ -60,7 +60,13 @@ fn by_path(p: &str) -> Option<Vec<u8>> {
     let g = LIST.lock().unwrap_or_else(|e| e.into_inner());
     let mut fi = SHFILEINFOW::default();
     let r = unsafe {
-        SHGetFileInfoW(PCWSTR(w.as_ptr()), Default::default(), Some(&mut fi), size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX)
+        SHGetFileInfoW(
+            PCWSTR(w.as_ptr()),
+            Default::default(),
+            Some(&mut fi),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        )
     };
     let h = (r != 0).then(|| sys_icon(fi.iIcon)).flatten();
     drop(g);
@@ -123,7 +129,9 @@ fn loc(path: &str, index: i32) -> Option<Vec<u8>> {
     file[..w.len()].copy_from_slice(&w);
     let mut h = [HICON::default()];
     let mut id = [0u32];
-    let n = unsafe { PrivateExtractIconsW(&file, index, SIZE_PX as i32, SIZE_PX as i32, Some(&mut h), Some(id.as_mut_ptr()), 0) };
+    let n = unsafe {
+        PrivateExtractIconsW(&file, index, SIZE_PX as i32, SIZE_PX as i32, Some(&mut h), Some(id.as_mut_ptr()), 0)
+    };
     if n == 0 || n == u32::MAX || h[0].is_invalid() {
         return None;
     }
@@ -156,12 +164,14 @@ unsafe fn rgba(h: HICON) -> Option<(u32, u32, Vec<u8>)> {
 /// a color bitmap (and its mask, when the alpha is empty) as straight RGBA
 unsafe fn pixels(ii: &ICONINFO) -> Option<(u32, u32, Vec<u8>)> {
     unsafe {
-        let out = (|| {
+        (|| {
             if ii.hbmColor.is_invalid() {
                 return None;
             }
             let mut bm = BITMAP::default();
-            if GetObjectW(HGDIOBJ(ii.hbmColor.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void)) == 0 {
+            if GetObjectW(HGDIOBJ(ii.hbmColor.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void))
+                == 0
+            {
                 return None;
             }
             let (w, ht) = (bm.bmWidth, bm.bmHeight);
@@ -169,24 +179,36 @@ unsafe fn pixels(ii: &ICONINFO) -> Option<(u32, u32, Vec<u8>)> {
                 return None;
             }
             let dc = GetDC(None);
-            let mut bi = BITMAPINFO::default();
-            bi.bmiHeader = BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -ht,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
+            let mut bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -ht,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let n = (w * ht) as usize;
             let mut px = vec![0u8; n * 4];
-            let got = GetDIBits(dc, ii.hbmColor, 0, ht as u32, Some(px.as_mut_ptr() as *mut c_void), &mut bi, DIB_RGB_COLORS);
+            let got =
+                GetDIBits(dc, ii.hbmColor, 0, ht as u32, Some(px.as_mut_ptr() as *mut c_void), &mut bi, DIB_RGB_COLORS);
             // an icon with no alpha of its own is cut out by its mask
             if got != 0 && px.chunks_exact(4).all(|p| p[3] == 0) && !ii.hbmMask.is_invalid() {
                 let mut mask = vec![0u8; n * 4];
                 let mut mi = bi;
-                if GetDIBits(dc, ii.hbmMask, 0, ht as u32, Some(mask.as_mut_ptr() as *mut c_void), &mut mi, DIB_RGB_COLORS) != 0 {
+                if GetDIBits(
+                    dc,
+                    ii.hbmMask,
+                    0,
+                    ht as u32,
+                    Some(mask.as_mut_ptr() as *mut c_void),
+                    &mut mi,
+                    DIB_RGB_COLORS,
+                ) != 0
+                {
                     for (p, m) in px.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
                         p[3] = if m[0] == 0 { 255 } else { 0 };
                     }
@@ -203,8 +225,7 @@ unsafe fn pixels(ii: &ICONINFO) -> Option<(u32, u32, Vec<u8>)> {
                 return None;
             }
             Some((w as u32, ht as u32, px))
-        })();
-        out
+        })()
     }
 }
 
@@ -228,9 +249,14 @@ fn package_dir(family: &str) -> Option<PathBuf> {
         }
         let mut names = vec![PWSTR::null(); count as usize];
         let mut buf = vec![0u16; len as usize];
-        if GetPackagesByPackageFamily(PCWSTR(fam.as_ptr()), &mut count, Some(names.as_mut_ptr()), &mut len, Some(PWSTR(buf.as_mut_ptr())))
-            .0
-            != 0
+        if GetPackagesByPackageFamily(
+            PCWSTR(fam.as_ptr()),
+            &mut count,
+            Some(names.as_mut_ptr()),
+            &mut len,
+            Some(PWSTR(buf.as_mut_ptr())),
+        )
+        .0 != 0
         {
             return None;
         }
