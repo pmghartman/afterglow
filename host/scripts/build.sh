@@ -40,12 +40,6 @@ GNU General Public License version 3 (LICENSE.txt). Its complete source, with th
 changes made to it, is host/ in $REPO
 at commit ${GITHUB_SHA:-unknown} (tag v$VER), its submodules at the commits pinned there.
 TXT
-afterglow $VER: phosphorus's streaming host, a fork of Apollo
-(https://github.com/ClassicOldSong/Apollo), itself a fork of LizardByte's Sunshine.
-GNU General Public License version 3 (LICENSE.txt). Its complete source, with the
-changes phosphorus made, is native/afterglow in https://github.com/pmghartman/phosphorus
-at commit ${GITHUB_SHA:-unknown}.
-TXT
 echo "$VER" > "$OUT/VERSION"
 strip "$OUT/afterglow.exe" "$OUT/tools/afterglowsvc.exe" || true
 ls -la "$OUT" "$OUT/tools"
