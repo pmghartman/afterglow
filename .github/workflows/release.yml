@@ -32,7 +32,7 @@ concurrency:
 
 env:
   APOLLO_REPO: ClassicOldSong/Apollo
-  APOLLO_TAG: v0.4.8
+  APOLLO_TAG: v0.4.6
   # the installer's checksum once known; empty, it's printed for pinning
   APOLLO_INSTALLER_SHA256: ""
 
