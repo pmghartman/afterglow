@@ -42,6 +42,8 @@ use crate::{debug, info, warn};
 /// the display afterglow's apps get: one id, so Windows keeps its settings
 const DISPLAY_GUID: GUID = GUID::from_u128(0x5d1b0f7a_3c55_4e8b_9d2e_af7e0c6b1a01);
 const DISPLAY_SERIAL: &str = "5D1B0F7A-3C55";
+/// the virtual display's refresh when the app's windows are captured on their own
+const APP_HZ: u32 = 240;
 
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
@@ -126,6 +128,23 @@ impl Windows {
         !matches!(self.conf.encoder.as_str(), "hardware" | "mf" | "software")
     }
 
+    /// the virtual display's refresh for a video at fps, in millihertz. A window's capture
+    /// gets a frame only when the compositor composes one, which it does at the display's
+    /// refresh: at 60 Hz a key's change waited 13 ms (median, 24 at p90) to be seen, at
+    /// 240 Hz 8 ms (12). The video is still sent at fps; a change after a quiet moment
+    /// goes at once either way
+    fn refresh(&self, fps: u32) -> u32 {
+        if self.app_capture() { fps.max(APP_HZ) * 1000 } else { fps * 1000 }
+    }
+
+    /// the display at w×h, at the refresh above where it takes it, else at fps
+    fn set_mode(&self, name: &str, w: u32, h: u32, fps: u32) {
+        let hz = self.refresh(fps);
+        if !display::set_mode(name, w, h, hz) && hz != fps * 1000 {
+            display::set_mode(name, w, h, fps * 1000);
+        }
+    }
+
     fn vda_ok(&self) -> bool {
         let mut v = self.vda.lock().unwrap();
         if !v.as_ref().is_some_and(|d| d.ok()) {
@@ -147,11 +166,11 @@ impl Windows {
                 _ => warn!("the virtual display can't render on {}", self.conf.adapter),
             }
         }
-        let millihz = l.fps * 1000;
+        let millihz = self.refresh(l.fps);
         match vda.add(DISPLAY_GUID, l.w, l.h, millihz, "Phosphorus", DISPLAY_SERIAL) {
             Ok(name) => {
-                info!("virtual display {name}: {}x{}@{}", l.w, l.h, l.fps);
-                display::set_mode(&name, l.w, l.h, millihz);
+                info!("virtual display {name}: {}x{}@{}", l.w, l.h, millihz / 1000);
+                self.set_mode(&name, l.w, l.h, l.fps);
                 // the app's windows are captured on their own: the user's own monitor and
                 // taskbar stay where they are
                 if self.conf.primary && !self.app_capture() {
@@ -625,7 +644,7 @@ impl Host for Windows {
         let name = self.run.lock().unwrap().vdisplay.clone();
         // the virtual display follows the viewer's window: the app redraws at its size
         if let Some(n) = &name {
-            display::set_mode(n, v.w, v.h, v.fps * 1000);
+            self.set_mode(n, v.w, v.h, v.fps);
         }
         // the app alone: its windows captured as the signed-in user, nothing else
         let seen = self.run.lock().unwrap().follower.as_ref().map(|f| f.watch());
