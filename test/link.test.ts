@@ -16,7 +16,7 @@ import {
   type Sink,
   type VideoSink,
 } from "../src/index.ts";
-import { configMessage, FakeAfterglow, frameMessage, jsonMessage } from "../src/testing.ts";
+import { configMessage, cursorMessage, FakeAfterglow, frameMessage, jsonMessage } from "../src/testing.ts";
 
 describe("link framing", () => {
   test("messages out of a stream cut anywhere, each its own array", () => {
@@ -36,6 +36,19 @@ describe("link framing", () => {
     const r = new LinkReader(() => {});
     r.feed(new Uint8Array([0xff, 0xff, 0xff, 0xff, 1]));
     expect(r.broken).toBe(true);
+  });
+  test("a message cut at every byte, the length prefix too, and several in one chunk", () => {
+    const a = frameMessage(1, false, [0, 0, 0, 3, 0x41, 1, 2]);
+    const b = jsonMessage(Out.pong, 7);
+    const all = new Uint8Array([...a, ...b, ...a]);
+    const got: Uint8Array[] = [];
+    const r = new LinkReader((m) => got.push(m));
+    for (const c of all) r.feed(new Uint8Array([c]));
+    r.feed(all);
+    expect(got.map((m) => m[0])).toEqual([Out.frame, Out.pong, Out.frame, Out.frame, Out.pong, Out.frame]);
+    expect(Array.from(got[3]!)).toEqual(Array.from(got[0]!));
+    // each its own buffer, not a view into what was fed
+    expect(got[3]!.buffer).not.toBe(all.buffer);
   });
   test("a message bigger than the buffer", () => {
     const big = new Uint8Array(3 << 20).fill(7);
@@ -127,6 +140,16 @@ describe("afterglow source", () => {
     await settle();
     expect(fake.sent(In.video).length).toBe(1);
     expect(fake.sent(In.idr).length).toBe(1);
+    // the pointer is the viewer's to draw: asked of the host, not drawn in, no blank one
+    expect(bodyJson(fake.sent(In.video)[0]!.body)).toMatchObject({ draw_cursor: false });
+    expect(d.metas.some((m) => m.t === "cursor")).toBe(false);
+    fake.send(cursorMessage(true, 3, 4, 1, 1, [0x89, 0x50, 0x4e, 0x47]));
+    fake.send(cursorMessage(false, 0, 0, 0, 0, []));
+    await settle();
+    expect(d.metas.filter((m) => m.t === "cursor")).toEqual([
+      { t: "cursor", png: "iVBORw==", x: 3, y: 4 },
+      { t: "cursor", name: "none" },
+    ]);
     expect(d.configs).toEqual([{ avcc: [1, 0x64, 0, 0x1f], w: 1280, h: 720 }]);
     expect(d.frames.length).toBe(1);
     expect(d.frames[0]!.key).toBe(true);
@@ -196,6 +219,7 @@ describe("afterglow source", () => {
       link: { port: fake.port, token: fake.token },
       target: "C:\\x.lnk",
       virtualDisplay: true,
+      drawCursor: true,
     });
     const first = new Driver();
     await src.open(opened(800, 600), first);
@@ -204,7 +228,9 @@ describe("afterglow source", () => {
     const next = new Driver();
     src.video({ w: 1024, h: 768, fps: 60, kbps: 20_000, full: false }, next);
     await settle();
-    expect(bodyJson(fake.sent(In.video).at(-1)!.body)).toMatchObject({ w: 1024, h: 768 });
+    expect(bodyJson(fake.sent(In.video).at(-1)!.body)).toMatchObject({ w: 1024, h: 768, draw_cursor: true });
+    // drawn in by the host: the page's pointer hidden
+    expect(first.metas).toContainEqual({ t: "cursor", name: "blank" });
     expect(next.configs).toEqual([{ avcc: [1, 2, 3], w: 1024, h: 768 }]);
     expect(next.frames.length).toBe(1);
     expect(next.frames[0]!.data[FrameRoom + 4]).toBe(0x65);

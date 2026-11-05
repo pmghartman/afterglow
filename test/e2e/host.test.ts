@@ -54,7 +54,10 @@ class Viewer implements Sink, VideoSink {
   frames: { key: boolean; avcc: Uint8Array; at: number }[] = [];
   ends: boolean[] = [];
   exits: string[] = [];
-  meta() {}
+  metas: Record<string, unknown>[] = [];
+  meta(m: Record<string, unknown>) {
+    this.metas.push(m);
+  }
   say() {}
   exit(e: string) {
     this.exits.push(e);
@@ -186,13 +189,18 @@ test.skipIf(!run)(
     src.keyframe();
     await until(() => v.frames.filter((f) => f.key).length > keysBefore, 2000, "the keyframe");
 
-    // the pointer moved: xterm's I-beam drawn into the frames where it went, nowhere else
-    const moved = v.frames.length;
+    // the pointer is the viewer's: its shape came as a PNG, and a move draws nothing
+    // into the frames (the host's own pointer kept out of what it reads)
+    const shape = v.metas.find((m) => m.t === "cursor" && typeof m.png === "string");
+    expect(shape).toBeDefined();
+    expect(Buffer.from(String(shape!.png), "base64").subarray(1, 4).toString()).toBe("PNG");
     src.input(["m", 900, 500], 1280, 720);
-    await until(() => v.frames.length > moved, 2000, "a frame of the pointer's move");
-    const shot = shotOf(v, 1280, 720);
-    expect(count(shot, 1280, 900, 500, 12, (p) => p < 100)).toBeGreaterThan(5);
-    expect(count(shot, 1280, 640, 360, 12, (p) => p < 100)).toBe(0);
+    // a frame after the move, asked for, to look at
+    await settle(200);
+    const kf = v.frames.filter((f) => f.key).length;
+    src.keyframe();
+    await until(() => v.frames.filter((f) => f.key).length > kf, 2000, "a keyframe after the move");
+    expect(count(shotOf(v, 1280, 720), 1280, 900, 500, 12, (p) => p < 100)).toBe(0);
 
     // everything so far decodes, at the size asked
     const d = decode(
@@ -232,7 +240,11 @@ test.skipIf(!run)(
     expect(d2.err).toBe("");
     expect(d2.size).toBe("960,540");
     // the display followed the video: xterm fills 960x540, not a corner of 1280x720
-    expect(count(shotOf(next, 960, 540), 960, 900, 500, 20, (p) => p > 200)).toBeGreaterThan(1000);
+    const resized = shotOf(next, 960, 540);
+    expect(count(resized, 960, 900, 500, 20, (p) => p > 200)).toBeGreaterThan(1000);
+    // and the whole screen read again after the resize has no pointer in it: the host's
+    // own is hidden, the viewer draws it
+    expect(count(resized, 960, 900, 500, 12, (p) => p < 100)).toBe(0);
 
     // the app asked to quit: the host closes it and says so
     src.close();
@@ -243,10 +255,50 @@ test.skipIf(!run)(
 );
 
 test.skipIf(!run)(
+  "the pointer drawn in where it moved, nowhere else",
+  async () => {
+    const v = new Viewer();
+    const src = new AfterglowSource({
+      link: { port, token },
+      target: Bun.which("xterm")!,
+      virtualDisplay: true,
+      drawCursor: true,
+    });
+    await src.open(opened(1280, 720), v);
+    src.video({ w: 1280, h: 720, fps: 30, kbps: 4000, full: false }, v);
+    await until(() => v.frames.length > 0, 5000, "the first frame");
+    await settle(1500);
+    expect(v.metas).toContainEqual({ t: "cursor", name: "blank" });
+    const moved = v.frames.length;
+    src.input(["m", 900, 500], 1280, 720);
+    await until(() => v.frames.length > moved, 2000, "a frame of the pointer's move");
+    let shot = shotOf(v, 1280, 720);
+    expect(count(shot, 1280, 900, 500, 12, (p) => p < 100)).toBeGreaterThan(5);
+    expect(count(shot, 1280, 640, 360, 12, (p) => p < 100)).toBe(0);
+    // moved again: drawn at the new place, the old one put back
+    const again = v.frames.length;
+    src.input(["m", 300, 200], 1280, 720);
+    await until(() => v.frames.length > again, 2000, "a frame of the second move");
+    await settle(100);
+    shot = shotOf(v, 1280, 720);
+    expect(count(shot, 1280, 300, 200, 12, (p) => p < 100)).toBeGreaterThan(5);
+    expect(count(shot, 1280, 900, 500, 12, (p) => p < 100)).toBe(0);
+    src.quit();
+    await settle(500);
+  },
+  30_000,
+);
+
+test.skipIf(!run)(
   "xterm on the session's own display, then a missing app refused",
   async () => {
     const v = new Viewer();
-    const src = new AfterglowSource({ link: { port, token }, target: Bun.which("xterm")!, virtualDisplay: false });
+    const src = new AfterglowSource({
+      link: { port, token },
+      target: Bun.which("xterm")!,
+      virtualDisplay: false,
+      drawCursor: true,
+    });
     await src.open(opened(1280, 720), v);
     src.video({ w: 640, h: 360, fps: 30, kbps: 2000, full: false }, v);
     await until(() => v.frames.length > 0, 5000, "a frame of the session's display");

@@ -13,6 +13,7 @@ use windows::core::{Interface, Result};
 
 use super::display::Output;
 use super::input::sync_desktop;
+use crate::host::Cursor;
 
 pub fn device_for(o: &Output) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut dev = None;
@@ -56,6 +57,12 @@ pub fn device_for(o: &Output) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
         // Media Foundation's threads share this device
         if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
             let _ = mt.SetMultithreadProtected(true);
+        }
+        // the GPU's highest priority for our copies, conversion and encode, so a game
+        // that fills the GPU doesn't queue the capture behind its own frames (SYSTEM
+        // has the privilege it takes)
+        if let Ok(d) = dev.cast::<IDXGIDevice>() {
+            let _ = d.SetGPUThreadPriority(7);
         }
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         Ok((dev, ctx.unwrap()))
@@ -110,12 +117,17 @@ pub struct Dup {
     dup: IDXGIOutputDuplication,
     pub w: u32,
     pub h: u32,
-    /// the desktop as last captured, without the pointer
-    desk: ID3D11Texture2D,
-    /// the desktop with the pointer drawn: what's encoded
+    /// the desktop as last captured, without the pointer, when it's drawn in
+    desk: Option<ID3D11Texture2D>,
+    /// what's encoded: the desktop, with the pointer drawn when it's drawn in
     pub comp: ID3D11Texture2D,
     ptr: Pointer,
     has_image: bool,
+    /// the pointer drawn into comp. Otherwise its shape is the viewer's, and a pointer
+    /// move costs no copy, no compose and no frame
+    draw: bool,
+    /// the shape or visibility changed since cursor() last said
+    shape_dirty: bool,
 }
 
 /// why a capture must be set up again
@@ -129,7 +141,12 @@ pub enum Lost {
 }
 
 impl Dup {
-    pub fn new(o: &Output, dev: &ID3D11Device, ctx: &ID3D11DeviceContext) -> std::result::Result<Dup, Lost> {
+    pub fn new(
+        o: &Output,
+        dev: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        draw: bool,
+    ) -> std::result::Result<Dup, Lost> {
         sync_desktop();
         // SAFETY: COM calls on owned objects
         unsafe {
@@ -157,7 +174,7 @@ impl Dup {
             let bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             let mk =
                 || texture(dev, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0));
-            let desk = mk().map_err(|e| Lost::Fail(e.to_string()))?;
+            let desk = if draw { Some(mk().map_err(|e| Lost::Fail(e.to_string()))?) } else { None };
             let comp = mk().map_err(|e| Lost::Fail(e.to_string()))?;
             Ok(Dup {
                 dev: dev.clone(),
@@ -169,6 +186,8 @@ impl Dup {
                 comp,
                 ptr: Pointer::default(),
                 has_image: false,
+                draw,
+                shape_dirty: true,
             })
         }
     }
@@ -188,17 +207,19 @@ impl Dup {
             let mut changed = false;
             if info.LastPresentTime != 0 {
                 if let Some(t) = res.as_ref().and_then(|r| r.cast::<ID3D11Texture2D>().ok()) {
-                    self.ctx.CopyResource(&self.desk, &t);
+                    self.ctx.CopyResource(self.desk.as_ref().unwrap_or(&self.comp), &t);
                     self.has_image = true;
                     changed = true;
                 }
             }
             if info.LastMouseUpdateTime != 0 {
                 let p = info.PointerPosition;
-                self.ptr.visible = p.Visible.as_bool();
+                let visible = p.Visible.as_bool();
+                self.shape_dirty |= visible != self.ptr.visible;
+                self.ptr.visible = visible;
                 self.ptr.x = p.Position.x;
                 self.ptr.y = p.Position.y;
-                changed = true;
+                changed |= self.draw;
             }
             if info.PointerShapeBufferSize > 0 {
                 let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
@@ -211,6 +232,8 @@ impl Dup {
                 {
                     self.ptr.shape = buf;
                     self.ptr.info = si;
+                    self.shape_dirty = true;
+                    changed |= self.draw;
                 }
             }
             let _ = self.dup.ReleaseFrame();
@@ -218,14 +241,29 @@ impl Dup {
                 return Ok(Got::Timeout);
             }
         }
-        self.compose().map_err(|e| Lost::Fail(format!("the pointer couldn't be drawn: {e}")))?;
+        if self.draw {
+            self.compose().map_err(|e| Lost::Fail(format!("the pointer couldn't be drawn: {e}")))?;
+        }
         Ok(Got::Frame)
+    }
+
+    /// the pointer's shape, when it or whether it shows changed since last asked
+    pub fn cursor(&mut self) -> Option<Cursor> {
+        if !std::mem::take(&mut self.shape_dirty) {
+            return None;
+        }
+        let p = &self.ptr;
+        if !p.visible || p.shape.is_empty() {
+            return Some(Cursor::default());
+        }
+        Some(cursor_of(&p.shape, &p.info))
     }
 
     /// comp: the desktop and the pointer over it
     fn compose(&mut self) -> Result<()> {
+        let Some(desk) = &self.desk else { return Ok(()) };
         // SAFETY: COM calls on owned textures
-        unsafe { self.ctx.CopyResource(&self.comp, &self.desk) };
+        unsafe { self.ctx.CopyResource(&self.comp, desk) };
         let p = &self.ptr;
         if !p.visible || p.shape.is_empty() {
             return Ok(());
@@ -301,5 +339,55 @@ fn blend(shape: &[u8], pitch: usize, ty: u32, h: usize, x: usize, y: usize, d: &
     let a = s[3] as u32;
     for i in 0..3 {
         d[i] = ((s[i] as u32 * a + d[i] as u32 * (255 - a)) / 255) as u8;
+    }
+}
+
+/// DXGI's pointer shape as straight-alpha RGBA for a browser's cursor. What inverts the
+/// screen under it (a monochrome XOR, a masked colour's XOR pixels) can't be said in
+/// RGBA: it's drawn black, so an I-beam stays visible on the light pages it's mostly over
+pub fn cursor_of(shape: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Cursor {
+    let mono = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32;
+    let masked = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32;
+    let (w, h) = (si.Width as usize, if mono { si.Height as usize / 2 } else { si.Height as usize });
+    let pitch = si.Pitch as usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let d = &mut rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            if mono {
+                let bit = 0x80 >> (x % 8);
+                let (Some(&a), Some(&b)) = (shape.get(y * pitch + x / 8), shape.get((y + h) * pitch + x / 8)) else {
+                    continue;
+                };
+                d.copy_from_slice(match (a & bit != 0, b & bit != 0) {
+                    (false, false) => &[0, 0, 0, 255],
+                    (false, true) => &[255, 255, 255, 255],
+                    (true, false) => &[0, 0, 0, 0],
+                    (true, true) => &[0, 0, 0, 255],
+                });
+                continue;
+            }
+            let Some(s) = shape.get(y * pitch + x * 4..y * pitch + x * 4 + 4) else { continue };
+            if masked {
+                // alpha 0: the colour as it is; 0xff: XORed with the screen, nothing where it's 0
+                let xor = s[3] != 0;
+                let none = s[..3] == [0, 0, 0];
+                d.copy_from_slice(&match (xor, none) {
+                    (false, _) => [s[2], s[1], s[0], 255],
+                    (true, true) => [0, 0, 0, 0],
+                    (true, false) => [0, 0, 0, 255],
+                });
+                continue;
+            }
+            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        }
+    }
+    Cursor {
+        visible: true,
+        w: w as u32,
+        h: h as u32,
+        hot_x: si.HotSpot.x.max(0) as u32,
+        hot_y: si.HotSpot.y.max(0) as u32,
+        rgba,
     }
 }

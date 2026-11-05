@@ -16,6 +16,10 @@ export const frameMessage = (gen: number, key: boolean, avcc: number[]) =>
 export const configMessage = (gen: number, w: number, h: number, avcc: number[]) =>
   message(Out.config, new Uint8Array([0, ...u16(gen), ...u16(w), ...u16(h), ...avcc]));
 
+// a cursor message: [type][visible][hot x][hot y][w][h] then the PNG
+export const cursorMessage = (visible: boolean, x: number, y: number, w: number, h: number, png: number[]) =>
+  message(Out.cursor, new Uint8Array([visible ? 1 : 0, ...u16(x), ...u16(y), ...u16(w), ...u16(h), ...png]));
+
 export class FakeAfterglow {
   readonly server: Bun.TCPSocketListener<undefined>;
   readonly got: { type: number; body: Uint8Array }[] = [];

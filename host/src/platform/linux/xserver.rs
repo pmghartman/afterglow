@@ -33,6 +33,8 @@ pub struct Display {
     pub cookie: Option<Vec<u8>>,
     /// the file holding it, for the app
     pub auth: Option<PathBuf>,
+    /// our Xvfb's framebuffer as a file in memory (XWD, -fbdir): read in place
+    pub fb: Option<PathBuf>,
 }
 
 impl Display {
@@ -102,11 +104,17 @@ impl Xvfb {
         // SAFETY: fds[0] is ours alone from here
         let mut rd = unsafe { File::from_raw_fd(fds[0]) };
         let size = (MAX.0.max(w), MAX.1.max(h));
-        let child = Command::new(bin)
-            .args(["-displayfd", &fds[1].to_string()])
+        // the framebuffer in RAM, in a directory only we can read: capture reads it there
+        let fbdir = fb_dir(&tag);
+        let mut cmd = Command::new(bin);
+        cmd.args(["-displayfd", &fds[1].to_string()])
             .args(["-screen", "0", &format!("{}x{}x24", size.0, size.1)])
             .args(["-nolisten", "tcp", "-noreset", "-auth"])
-            .arg(&auth)
+            .arg(&auth);
+        if let Some(d) = &fbdir {
+            cmd.arg("-fbdir").arg(d);
+        }
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -114,18 +122,30 @@ impl Xvfb {
             .map_err(|e| format!("{bin} didn't start: {e}"));
         // SAFETY: our copy of the write end, closed so the read sees Xvfb's alone
         unsafe { libc::close(fds[1]) };
-        let mut child = child?;
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(d) = &fbdir {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+                return Err(e);
+            }
+        };
         let number = match read_line(&mut rd, Duration::from_secs(10)) {
             Some(n) if n.parse::<u32>().is_ok() => n,
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = std::fs::remove_file(&auth);
+                if let Some(d) = &fbdir {
+                    let _ = std::fs::remove_dir_all(d);
+                }
                 return Err(format!("{bin} didn't say which display it serves"));
             }
         };
         write_auth(&number)?;
-        let display = Display { name: format!(":{number}"), cookie: Some(cookie), auth: Some(auth) };
+        let fb = fbdir.map(|d| d.join("Xvfb_screen0")).filter(|f| f.is_file());
+        let display = Display { name: format!(":{number}"), cookie: Some(cookie), auth: Some(auth), fb };
         let mut x = Xvfb { child, display, stop: Arc::new(AtomicBool::new(false)), wm: None };
         let (conn, screen) = x.display.connect()?;
         resize(&conn, conn.setup().roots[screen].root, w, h);
@@ -133,6 +153,18 @@ impl Xvfb {
         x.wm = Some(thread::Builder::new().name("wm".into()).spawn(move || wm(&d, &stop)).map_err(|e| e.to_string())?);
         info!("Xvfb on {} at {w}x{h}", x.display.name);
         Ok(x)
+    }
+
+    /// its screen set to w×h, for an app taking up a spare one
+    pub fn fit(&self, w: u16, h: u16) -> Result<(), String> {
+        let (conn, screen) = self.display.connect()?;
+        resize(&conn, conn.setup().roots[screen].root, w, h);
+        Ok(())
+    }
+
+    /// whether it's still serving
+    pub fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 }
 
@@ -147,7 +179,23 @@ impl Drop for Xvfb {
         if let Some(a) = &self.display.auth {
             let _ = std::fs::remove_file(a);
         }
+        if let Some(d) = self.display.fb.as_ref().and_then(|f| f.parent()) {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
+}
+
+/// a fresh private directory on a RAM filesystem for an Xvfb's framebuffer; none where
+/// there's no /dev/shm (then capture reads the screen over MIT-SHM)
+fn fb_dir(tag: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let base = PathBuf::from("/dev/shm");
+    if !base.is_dir() {
+        return None;
+    }
+    let d = base.join(format!("afterglow-{tag}"));
+    std::fs::DirBuilder::new().mode(0o700).create(&d).ok()?;
+    Some(d)
 }
 
 fn read_line(f: &mut File, timeout: Duration) -> Option<String> {

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use afterglow::host::{Ctl, Host, Launch, LaunchError, Out, VideoCfg};
+use afterglow::host::{Ctl, Cursor, Host, Launch, LaunchError, Sink, VideoCfg};
 use afterglow::input::Inject;
 use afterglow::link::Link;
 use afterglow::wire::{self, input as i, output as o};
@@ -24,6 +24,7 @@ struct Fake {
     launches: Mutex<Vec<Launch>>,
     events: Mutex<Vec<String>>,
     idrs: Mutex<u32>,
+    videos: Mutex<Vec<VideoCfg>>,
 }
 
 impl Inject for Fake {
@@ -66,7 +67,15 @@ impl Host for Fake {
     fn terminate(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
-    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: Out) -> Result<(), String> {
+    fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
+        self.videos.lock().unwrap().push(*v);
+        // the pointer's shape first, unless it's drawn in
+        if !v.draw_cursor {
+            let c = Cursor { visible: true, w: 1, h: 1, hot_x: 0, hot_y: 0, rgba: vec![0, 0, 0, 255] };
+            if !out.cursor(&c) {
+                return Ok(());
+            }
+        }
         // a keyframe with its parameter sets, then P-frames until stopped
         let mut idr = true;
         let mut n = 0u8;
@@ -77,7 +86,7 @@ impl Host for Fake {
             }
             let au =
                 if idr { [&SPS[..], &PPS, &[0, 0, 1, 0x65, n | 0x80]].concat() } else { vec![0, 0, 1, 0x41, n | 0x80] };
-            if !out(&au, idr) {
+            if !out.frame(&afterglow::h264::split(&au), idr) {
                 return Ok(());
             }
             idr = false;
@@ -199,6 +208,10 @@ fn launch_video_keyframe_input_quit() {
     assert_eq!(d.wait_json(o::LAUNCHED)["resumed"], true);
 
     d.json(i::VIDEO, json!({"gen": 7, "w": 1280, "h": 720, "fps": 60, "kbps": 8000}));
+    // the pointer's shape, a PNG behind its hotspot and size
+    let c = d.wait(o::CURSOR);
+    assert_eq!(&c[..9], &[1, 0, 0, 0, 0, 1, 0, 1, 0]);
+    assert_eq!(&c[9..13], b"\x89PNG");
     let cfg = d.wait(o::CONFIG);
     // [pad][u16 gen][u16 w][u16 h] avcC
     assert_eq!(&cfg[..7], &[0, 7, 0, 0x00, 0x05, 0xd0, 0x02]);
@@ -234,6 +247,18 @@ fn launch_video_keyframe_input_quit() {
         *fake.events.lock().unwrap(),
         ["abs 0.50 0.50", "button 1 true", "key 0x41 true", "key 0x41 false", "button 1 false"]
     );
+
+    // the pointer drawn in, asked: no shape sent
+    d.json(i::VIDEO, json!({"gen": 8, "draw_cursor": true}));
+    loop {
+        let (t, b) = d.next().unwrap();
+        assert_ne!(t, o::CURSOR);
+        if t == o::FRAME && b[1..3] == [8, 0] {
+            break;
+        }
+    }
+    let vs = fake.videos.lock().unwrap().clone();
+    assert_eq!((vs[0].draw_cursor, vs[1].draw_cursor), (false, true));
 
     d.send(i::QUIT, &[]);
     assert_eq!(d.wait_json(o::EXITED), json!({}));

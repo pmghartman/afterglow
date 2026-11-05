@@ -29,6 +29,8 @@ pub mod output {
     pub const CONFIG: u8 = 0x90;
     /// `[type][key][u16 vgen][pad 4]` then AVCC
     pub const FRAME: u8 = 0x91;
+    /// `[type][visible][u16 hot x][u16 hot y][u16 w][u16 h]` then a PNG
+    pub const CURSOR: u8 = 0x92;
 }
 
 /// room in front of a frame's AVCC: the viewer's own header length
@@ -94,130 +96,86 @@ impl Reader {
     }
 }
 
-/// one NAL unit in an Annex B stream: where its bytes start (after the start code)
-/// and end, its type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Nal {
-    pub start: usize,
-    pub end: usize,
-    pub ty: u8,
-}
-
-fn start_code(b: &[u8], from: usize) -> usize {
-    let mut i = from;
-    while i + 3 <= b.len() {
-        // most bytes aren't zero: skip by the third byte's value
-        if b[i + 2] > 1 {
-            i += 3;
-        } else if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 {
-            return i;
-        } else {
-            i += 1;
-        }
-    }
-    b.len()
-}
-
-pub fn nals_of(b: &[u8]) -> Vec<Nal> {
-    let n = b.len();
-    let mut out = Vec::new();
-    let mut i = start_code(b, 0);
-    while i < n {
-        let start = i + 3;
-        let next = start_code(b, start);
-        let mut end = next;
-        // a 4-byte start code's leading zero belongs to it, not the NAL before
-        if next < n && end > start && b[end - 1] == 0 {
-            end -= 1;
-        }
-        // trailing zero padding isn't the NAL's
-        if next >= n {
-            while end > start && b[end - 1] == 0 {
-                end -= 1;
-            }
-        }
-        if end > start {
-            out.push(Nal { start, end, ty: b[start] & 0x1f });
-        }
-        i = next;
-    }
-    out
-}
-
-/// an avcC record from one SPS and one PPS: what VideoDecoder takes as description
-pub fn avcc_of(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(11 + sps.len() + pps.len());
-    let at = |i: usize| sps.get(i).copied().unwrap_or(0);
-    out.extend_from_slice(&[1, at(1), at(2), at(3), 0xff, 0xe1]);
-    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    out.extend_from_slice(sps);
-    out.push(1);
-    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    out.extend_from_slice(pps);
-    out
-}
-
-/// what one access unit becomes
-#[derive(Default)]
-pub struct Shaped {
+/// what one access unit became
+pub struct Shaped<'a> {
     /// a config message to send first, empty when the parameter sets are as before
-    pub config: Vec<u8>,
+    pub config: &'a [u8],
     /// the frame message, empty when the access unit held no picture
-    pub frame: Vec<u8>,
+    pub frame: &'a [u8],
 }
 
 /// H.264 access units in, the link's messages out: parameter sets as a config message
-/// whenever they change, every other NAL unit of the frame in AVCC behind the viewer's
-/// header room. Access unit delimiters are dropped, nothing else
+/// whenever they change (the SPS rewritten so nothing is held for reordering,
+/// h264.rs), every other NAL unit of the frame in AVCC behind the viewer's header
+/// room. Access unit delimiters and SEI are dropped. Its buffers are kept from frame to
+/// frame: nothing allocated per frame once the first big one has been made
 #[derive(Default)]
 pub struct Shaper {
+    /// the SPS as the encoder made it, and as it went out
+    sps_in: Vec<u8>,
     sps: Vec<u8>,
     pps: Vec<u8>,
+    config: Vec<u8>,
+    frame: Vec<u8>,
 }
 
 impl Shaper {
-    pub fn shape(&mut self, b: &[u8], key: bool, vgen: u16, w: u16, h: u16) -> Shaped {
-        let mut r = Shaped::default();
-        let list = nals_of(b);
-        let mut body = 0;
+    pub fn shape(&mut self, nals: &[&[u8]], key: bool, vgen: u16, w: u16, h: u16) -> Shaped<'_> {
         let (mut sps, mut pps): (&[u8], &[u8]) = (&[], &[]);
-        for u in &list {
-            let v = &b[u.start..u.end];
-            match u.ty {
-                7 => sps = v,
-                8 => pps = v,
-                9 => {}
-                _ => body += 4 + v.len(),
+        let mut body = 0;
+        for n in nals {
+            match crate::h264::nal_type(n) {
+                7 => sps = n,
+                8 => pps = n,
+                6 | 9 => {}
+                _ => body += 4 + n.len(),
             }
         }
-        if !sps.is_empty() && !pps.is_empty() && (sps != self.sps || pps != self.pps) {
-            self.sps = sps.to_vec();
+        self.config.clear();
+        if !sps.is_empty() && !pps.is_empty() && (sps != self.sps_in || pps != self.pps) {
+            self.sps_in = sps.to_vec();
+            self.sps = crate::h264::low_delay_sps(sps).unwrap_or_else(|| sps.to_vec());
             self.pps = pps.to_vec();
-            let rec = avcc_of(sps, pps);
-            let mut cfg = vec![0u8; HEAD_LEN - 1];
-            cfg[1..3].copy_from_slice(&vgen.to_le_bytes());
-            cfg[3..5].copy_from_slice(&w.to_le_bytes());
-            cfg[5..7].copy_from_slice(&h.to_le_bytes());
-            cfg.extend_from_slice(&rec);
-            r.config = message(output::CONFIG, &cfg);
+            let rec = crate::h264::avcc(&self.sps, &self.pps);
+            let c = &mut self.config;
+            c.extend_from_slice(&((HEAD_LEN + rec.len()) as u32).to_le_bytes());
+            c.push(output::CONFIG);
+            c.push(0);
+            c.extend_from_slice(&vgen.to_le_bytes());
+            c.extend_from_slice(&w.to_le_bytes());
+            c.extend_from_slice(&h.to_le_bytes());
+            c.extend_from_slice(&rec);
         }
-        if body == 0 {
-            return r;
+        self.frame.clear();
+        if body > 0 {
+            // [u32 len][type][key][u16 vgen][pad 4][AVCC]: the type byte starts the 8 bytes of room
+            let f = &mut self.frame;
+            f.reserve(4 + HEAD_LEN + body);
+            f.extend_from_slice(&((HEAD_LEN + body) as u32).to_le_bytes());
+            f.push(output::FRAME);
+            f.push(key as u8);
+            f.extend_from_slice(&vgen.to_le_bytes());
+            f.extend_from_slice(&[0; 4]);
+            for n in nals.iter().filter(|n| !matches!(crate::h264::nal_type(n), 6..=9)) {
+                f.extend_from_slice(&(n.len() as u32).to_be_bytes());
+                f.extend_from_slice(n);
+            }
         }
-        // [u32 len][type][key][u16 vgen][pad 4][AVCC]: the type byte starts the 8 bytes of room
-        let mut f = Vec::with_capacity(4 + HEAD_LEN + body);
-        f.extend_from_slice(&((HEAD_LEN + body) as u32).to_le_bytes());
-        f.push(output::FRAME);
-        f.push(key as u8);
-        f.extend_from_slice(&vgen.to_le_bytes());
-        f.extend_from_slice(&[0; 4]);
-        for u in list.iter().filter(|u| !matches!(u.ty, 7..=9)) {
-            f.extend_from_slice(&((u.end - u.start) as u32).to_be_bytes());
-            f.extend_from_slice(&b[u.start..u.end]);
-        }
-        r.frame = f;
-        r
+        Shaped { config: &self.config, frame: &self.frame }
     }
+}
+
+/// the pointer's shape: `[type][u8 visible][u16 hot x][u16 hot y][u16 w][u16 h]` then a
+/// PNG of it, none when hidden
+pub fn cursor_message(c: &crate::host::Cursor) -> Vec<u8> {
+    let png = if c.visible && c.w > 0 && c.h > 0 { crate::png::rgba(c.w, c.h, &c.rgba) } else { Vec::new() };
+    let mut b = Vec::with_capacity(9 + png.len());
+    b.push(c.visible as u8);
+    for v in [c.hot_x, c.hot_y, c.w, c.h] {
+        b.extend_from_slice(&(v.min(0xffff) as u16).to_le_bytes());
+    }
+    b.extend_from_slice(&png);
+    message(output::CURSOR, &b)
 }
 
 /// the token compared in constant time: a wrong guess learns nothing from timing
@@ -273,50 +231,52 @@ mod tests {
     }
 
     #[test]
-    fn nal_units_three_and_four_byte_start_codes_trailing_padding() {
-        let s = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9, 0, 0];
-        let l = nals_of(&s);
-        assert_eq!(
-            l,
-            vec![Nal { start: 4, end: 7, ty: 7 }, Nal { start: 10, end: 12, ty: 8 }, Nal { start: 16, end: 19, ty: 5 },]
-        );
-        assert!(nals_of(&[1, 2, 3]).is_empty());
-        assert!(nals_of(&[]).is_empty());
-    }
-
-    #[test]
     fn an_idr_parameter_sets_once_aud_dropped_slice_behind_the_room() {
         let s = [
             0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80, 0, 0,
             1, 0x65, 0x88, 0x84,
         ];
+        let nals = crate::h264::split(&s);
         let mut sh = Shaper::default();
-        let r = sh.shape(&s, true, 7, 1280, 720);
-        let c = &r.config;
-        assert_eq!(u32_at(c), c.len() - 4);
+        let r = sh.shape(&nals, true, 7, 1280, 720);
+        let c = r.config.to_vec();
+        assert_eq!(u32_at(&c), c.len() - 4);
         assert_eq!(c[4], output::CONFIG);
         assert_eq!(&c[6..12], &[7, 0, 0x00, 0x05, 0xd0, 0x02]);
         // avcC: version, profile, compat, level from the SPS
         assert_eq!(&c[12..16], &[1, 0x64, 0x00, 0x1f]);
-        let f = &r.frame;
+        let f = r.frame;
         assert_eq!(f.len(), 4 + HEAD_LEN + 4 + 3);
         assert_eq!(u32_at(f), HEAD_LEN + 7);
         assert_eq!(&f[4..8], &[output::FRAME, 1, 7, 0]);
         assert_eq!(&f[12..19], &[0, 0, 0, 3, 0x65, 0x88, 0x84]);
         // the same parameter sets again: no config
-        assert!(sh.shape(&s, true, 7, 1280, 720).config.is_empty());
+        assert!(sh.shape(&nals, true, 7, 1280, 720).config.is_empty());
         // a fresh shaper sends them again
-        assert!(!Shaper::default().shape(&s, true, 7, 1280, 720).config.is_empty());
+        assert!(!Shaper::default().shape(&nals, true, 7, 1280, 720).config.is_empty());
         // a P-frame: two slices, no key
-        let p = [0, 0, 1, 0x41, 1, 0, 0, 1, 0x41, 2, 3];
+        let p = crate::h264::split(&[0, 0, 1, 0x41, 1, 0, 0, 1, 0x41, 2, 3]);
         let rp = sh.shape(&p, false, 7, 1280, 720);
         assert!(rp.config.is_empty());
         assert_eq!(rp.frame[5], 0);
         assert_eq!(rp.frame.len(), 4 + HEAD_LEN + (4 + 2) + (4 + 3));
         // parameter sets alone: a config, no frame
-        let ps = &s[6..23];
-        let only = Shaper::default().shape(ps, true, 1, 2, 2);
+        let ps = crate::h264::split(&s[6..23]);
+        let mut fresh = Shaper::default();
+        let only = fresh.shape(&ps, true, 1, 2, 2);
         assert!(!only.config.is_empty() && only.frame.is_empty());
+    }
+
+    #[test]
+    fn a_cursor_with_its_shape_or_hidden() {
+        let c = crate::host::Cursor { visible: true, w: 1, h: 1, hot_x: 3, hot_y: 4, rgba: vec![1, 2, 3, 4] };
+        let m = cursor_message(&c);
+        assert_eq!(m[4], output::CURSOR);
+        assert_eq!(&m[5..14], &[1, 3, 0, 4, 0, 1, 0, 1, 0]);
+        assert_eq!(&m[14..18], b"\x89PNG");
+        let m = cursor_message(&crate::host::Cursor::default());
+        assert_eq!(m.len(), 14);
+        assert_eq!(m[5], 0);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! one is closed. One app at a time, kept running between connections and videos so a
 //! viewer that comes back (or a resize) resumes it.
 
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::host::{Ctl, Host, Launch, VideoCfg};
+use crate::host::{Ctl, Cursor, Host, Launch, Sink, VideoCfg};
 use crate::input::Input;
 use crate::wire::{self, input as msg_in, output as msg_out};
 use crate::{error, info, warn};
@@ -33,14 +33,19 @@ struct Conn {
 
 impl Conn {
     fn send(&self, m: &[u8]) -> bool {
-        if m.is_empty() {
+        self.send2(m, &[])
+    }
+
+    /// two messages in one write: a config and the frame after it go out together
+    fn send2(&self, a: &[u8], b: &[u8]) -> bool {
+        if a.is_empty() && b.is_empty() {
             return true;
         }
         let mut s = self.sock.lock().unwrap();
         if self.dead.load(Ordering::Relaxed) {
             return false;
         }
-        if s.write_all(m).is_err() {
+        if write_both(&mut s, a, b).is_err() {
             self.dead.store(true, Ordering::Relaxed);
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -55,6 +60,39 @@ impl Conn {
         let s = self.sock.lock().unwrap();
         self.dead.store(true, Ordering::Relaxed);
         let _ = s.shutdown(Shutdown::Both);
+    }
+}
+
+fn write_both(s: &mut TcpStream, mut a: &[u8], mut b: &[u8]) -> std::io::Result<()> {
+    while !a.is_empty() || !b.is_empty() {
+        let n = s.write_vectored(&[IoSlice::new(a), IoSlice::new(b)])?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let k = n.min(a.len());
+        a = &a[k..];
+        b = &b[n - k..];
+    }
+    Ok(())
+}
+
+/// a video's frames and pointer shapes, shaped and written as they come
+struct Out {
+    conn: Arc<Conn>,
+    shaper: wire::Shaper,
+    vgen: u16,
+    w: u16,
+    h: u16,
+}
+
+impl Sink for Out {
+    fn frame(&mut self, nals: &[&[u8]], key: bool) -> bool {
+        let s = self.shaper.shape(nals, key, self.vgen, self.w, self.h);
+        self.conn.send2(s.config, s.frame)
+    }
+
+    fn cursor(&mut self, c: &Cursor) -> bool {
+        self.conn.send(&wire::cursor_message(c))
     }
 }
 
@@ -234,7 +272,7 @@ impl<H: Host> Link<H> {
             }
             msg_in::IDR => {
                 if let Some(r) = &self.lock().video {
-                    r.ctl.idr.store(true, Ordering::Relaxed);
+                    r.ctl.ask_idr();
                 }
             }
             msg_in::PING => {
@@ -321,20 +359,24 @@ impl<H: Host> Link<H> {
             fps: num(&j, "fps", 60, 10, 240) as u32,
             kbps: num(&j, "kbps", 20000, 500, 500_000) as u32,
             yuv444: j.get("yuv444").and_then(Value::as_bool).unwrap_or(false),
+            draw_cursor: j.get("draw_cursor").and_then(Value::as_bool).unwrap_or(false),
         };
         let ctl = Arc::new(Ctl::default());
         let ended: Arc<Mutex<Option<String>>> = Arc::default();
         let (host, ctl2, ended2, conn) = (self.host.clone(), ctl.clone(), ended.clone(), c.clone());
-        info!("video {vgen}: {}x{} at {} fps, {} kbps", v.w, v.h, v.fps, v.kbps);
+        info!(
+            "video {vgen}: {}x{} at {} fps, {} kbps{}",
+            v.w,
+            v.h,
+            v.fps,
+            v.kbps,
+            if v.draw_cursor { ", the pointer drawn in" } else { "" }
+        );
         let thread = thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                let mut shaper = wire::Shaper::default();
-                let (w, h) = (v.w as u16, v.h as u16);
-                let mut out = |b: &[u8], key: bool| {
-                    let s = shaper.shape(b, key, vgen, w, h);
-                    conn.send(&s.config) && conn.send(&s.frame)
-                };
+                let mut out =
+                    Out { conn: conn.clone(), shaper: wire::Shaper::default(), vgen, w: v.w as u16, h: v.h as u16 };
                 let r = host.video(&v, &ctl2, &mut out);
                 if ctl2.stop.load(Ordering::Relaxed) || conn.dead.load(Ordering::Relaxed) {
                     return;
@@ -355,7 +397,7 @@ impl<H: Host> Link<H> {
     /// the running video stopped and joined; the app left running
     fn stop_video(&self, st: &mut State) {
         let Some(mut r) = st.video.take() else { return };
-        r.ctl.stop.store(true, Ordering::Relaxed);
+        r.ctl.ask_stop();
         if let Some(t) = r.thread.take() {
             let _ = t.join();
         }

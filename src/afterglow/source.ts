@@ -6,7 +6,7 @@
 
 import type { Opened, Sink, Source, Video, VideoSink } from "../source.ts";
 import { InputPacker } from "./input.ts";
-import { configOf, frameOf, In, jsonOf, Link, type LinkAddr, Out } from "./link.ts";
+import { configOf, cursorOf, frameOf, In, jsonOf, Link, type LinkAddr, Out } from "./link.ts";
 
 export type AfterglowTarget = {
   link: LinkAddr;
@@ -17,6 +17,10 @@ export type AfterglowTarget = {
   virtualDisplay: boolean;
   // the capture rate when the viewer names none
   fps?: number;
+  // the pointer drawn into the frames by the host. Otherwise (the default) its shape
+  // comes as cursor metadata for the viewer to show as its own pointer: a move costs
+  // no frame and shows with no latency at all
+  drawCursor?: boolean;
   // called once the app has quit, the host free again
   done?: () => void;
   // a link opened for us, for tests
@@ -72,8 +76,9 @@ export class AfterglowSource implements Source {
     // the video started now, kept for the viewer about to attach
     this.startVideo({ w: s.w, h: s.h, fps, kbps: 20_000, full: s.full });
     sink.meta({ t: "title", s: s.name });
-    // the host draws the pointer into its frames: the page's own hidden, so there's one
-    sink.meta({ t: "cursor", name: "blank" });
+    // drawn in by the host: the page's own hidden, so there's one. Otherwise the
+    // host's shapes come as it changes them
+    if (this.t.drawCursor) sink.meta({ t: "cursor", name: "blank" });
   }
 
   private fpsOf(fps?: number) {
@@ -84,7 +89,15 @@ export class AfterglowSource implements Source {
     this.gen = (this.gen + 1) & 0xffff;
     const r: Running = { gen: this.gen, v, sink, got: false };
     this.cur = r;
-    this.link?.json(In.video, { gen: r.gen, w: v.w, h: v.h, fps: v.fps, kbps: v.kbps, yuv444: v.full });
+    this.link?.json(In.video, {
+      gen: r.gen,
+      w: v.w,
+      h: v.h,
+      fps: v.fps,
+      kbps: v.kbps,
+      yuv444: v.full,
+      draw_cursor: !!this.t.drawCursor,
+    });
     return r;
   }
 
@@ -110,6 +123,13 @@ export class AfterglowSource implements Source {
         this.cur = undefined;
         c.sink?.ended(c.got);
         return;
+      }
+      case Out.cursor: {
+        if (this.t.drawCursor) return;
+        const c = cursorOf(m);
+        // an empty shape is a hidden pointer
+        if (!c.visible || !c.png.length) return this.sink?.meta({ t: "cursor", name: "none" });
+        return this.sink?.meta({ t: "cursor", png: Buffer.from(c.png).toString("base64"), x: c.x, y: c.y });
       }
       case Out.exited:
         return this.gone("");
