@@ -22,6 +22,9 @@ use crate::input::Input;
 use crate::wire::{self, input as msg_in, output as msg_out};
 use crate::{error, info, warn};
 
+/// the link protocol's number (docs/protocol.md): bumped on any incompatible change
+pub const PROTO: u32 = 1;
+
 pub const VERSION: &str = match option_env!("AFTERGLOW_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
@@ -332,6 +335,7 @@ impl<H: Host> Link<H> {
             msg_out::READY,
             json!({
                 "version": VERSION,
+                "proto": PROTO,
                 "virtual_display": self.host.virtual_display(),
                 "hostname": self.host.hostname(),
                 "running": running,

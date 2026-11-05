@@ -133,7 +133,7 @@ export const cursorOf = (msg: Uint8Array) => ({
   png: msg.subarray(10),
 });
 
-export type Ready = { version: string; virtual_display: boolean; hostname: string; running: boolean };
+export type Ready = { version: string; proto?: number; virtual_display: boolean; hostname: string; running: boolean };
 
 export type LinkEvents = {
   message(msg: Uint8Array): void;

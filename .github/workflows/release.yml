@@ -3,7 +3,10 @@
 # Rust host's tests and its end-to-end run on Linux, the host built and smoke-run on
 # Windows and built for Linux, then a GitHub release with
 # afterglow-VERSION-windows-x86_64.zip, afterglow-VERSION-linux-x86_64.tar.gz, their
-# SHA256SUMS and build provenance attestations. "Build only" stops before publishing:
+# SHA256SUMS, build provenance attestations and afterglow.json, the manifest hosts
+# update from (every archive's sha256 and the link's proto), signed with minisign as
+# afterglow.json.minisig by the secret UPDATE_SIGNING_KEY. The Windows exes are
+# Authenticode-signed when the signing secrets are set. "Build only" stops before publishing:
 # a way to try the Windows build. The SudoVDA driver isn't built here: its signed
 # package and nefconc.exe come out of Apollo's release installer at APOLLO_TAG, checked
 # against the driver's catalog. Every run ends by purging the repo's Actions caches
@@ -44,6 +47,12 @@ jobs:
       ver: ${{ steps.v.outputs.ver }}
       ref: ${{ steps.v.outputs.ref }}
     steps:
+      # no release without the key that signs the manifest
+      - name: signing key
+        if: ${{ !inputs.build_only }}
+        env:
+          KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: '[ -n "$KEY" ] || { echo "::error::secret UPDATE_SIGNING_KEY is not set"; exit 1; }'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # a tag pushed by hand with no release yet is released as it is, from its commit;
       # otherwise the next version, from this run's commit
@@ -206,6 +215,10 @@ jobs:
     env:
       VER: ${{ needs.version.outputs.ver }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+          fetch-depth: 1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: afterglow-windows-x86_64
@@ -218,6 +231,25 @@ jobs:
         with:
           name: afterglow-linux-aarch64
           path: stage/linux-aarch64
+      # Authenticode on the Windows exes before they're zipped; unsigned with a warning
+      # when no signing secrets are set
+      - name: sign
+        env:
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$AZURE_CLIENT_SECRET$WINDOWS_CERT_PFX" ]; then
+            echo "::warning::no Windows signing secrets set, the exes are released unsigned"
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq osslsigncode default-jre-headless
+          WINDOWS_SIGNING_REQUIRED=1 bash host/scripts/winsign.sh stage/windows/afterglow.exe stage/windows/tools/afterglowsvc.exe
       - name: package
         run: |
           mkdir -p out
@@ -228,6 +260,35 @@ jobs:
             tar -C stage/linux-$a -czf "out/afterglow-$VER-linux-$a.tar.gz" .
           done
           (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      # the manifest of the archives above, signed (prehashed Ed25519, as minisign -S)
+      - name: manifest
+        env:
+          KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo "::error::secret UPDATE_SIGNING_KEY is not set"; exit 1; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          for f in out/afterglow-*.zip out/afterglow-*.tar.gz; do
+            # each archive carries the version it is
+            n=$(basename "$f")
+            case $n in *.zip) unzip -p "$f" VERSION ;; *) tar -xzOf "$f" ./VERSION ;; esac | grep -qx "$VER" || { echo "::error::$n has no VERSION $VER"; exit 1; }
+          done
+          {
+            printf '{"version":"%s","proto":%s,"assets":{' "$VER" "$(sed -n 's/^pub const PROTO: u32 = \([0-9]*\);.*/\1/p' host/src/link.rs)"
+            sep=
+            for p in windows-x86_64:zip linux-x86_64:tar.gz linux-aarch64:tar.gz; do
+              k=${p%%:*} n=afterglow-$VER-$k.${p#*:}
+              [ -f "out/$n" ] || continue
+              printf '%s"%s":{"name":"%s","sha256":"%s"}' "$sep" "$k" "$n" "$(sha256sum "out/$n" | cut -d' ' -f1)"
+              sep=,
+            done
+            printf '}}\n'
+          } > out/afterglow.json
+          jq . out/afterglow.json
+          jq -e '.proto > 0 and (.assets | length) > 0' out/afterglow.json >/dev/null
+          umask 077
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -W -m out/afterglow.json -x out/afterglow.json.minisig -t "afterglow $VER"
+          rm -f "$RUNNER_TEMP/minisign.key"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |

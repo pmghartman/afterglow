@@ -4,7 +4,11 @@ One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to 
 
 afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token. It serves nothing else and captures no audio.
 
-Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version>` and what it serves (`stdio argv notes clipboard raise close cursor`), for a driver probing a host.
+Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version> proto=<n>` and what it serves (`stdio argv notes clipboard raise close cursor`), for a driver probing a host.
+
+## Protocol number
+
+`proto` is the link's version, an integer: 1 now. `ready` carries it (`proto`) and `--features` prints it (`proto=1`). It bumps on any incompatible change to the messages: framing, a message's type or body, or the meaning of a field. Adding a message, a field or a feature word is compatible and leaves it. A driver treats a missing `proto` as 1 and refuses a number outside the range it speaks. Releases state it too, as `proto` in the signed `afterglow.json`.
 
 ## Framing
 
@@ -34,7 +38,7 @@ A length outside that range breaks the link. One driver at a time: a new connect
 
 | Type | Name | Body |
 | --- | --- | --- |
-| `0x81` | `ready` | JSON `{version, virtual_display, hostname, running}`, after a good `hello` |
+| `0x81` | `ready` | JSON `{version, proto, virtual_display, hostname, running}`, after a good `hello` |
 | `0x82` | `launched` | JSON `{ok, resumed, ms, features}` or `{ok: false, error, code}`. `features`: what this app can be asked besides input, some of `notes`, `clipboard`, `raise`, `close` |
 | `0x83` | `exited` | JSON `{code, log, error}`, any of them: the app is gone, its exit code, the last of what it wrote, why when it never showed a window |
 | `0x84` | `video_ended` | JSON `{gen, why}`: the capture stopped by itself |
