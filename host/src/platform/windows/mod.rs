@@ -5,11 +5,18 @@
 mod capture;
 mod display;
 mod encode;
+mod grab;
 mod input;
 mod process;
 pub mod svc;
 mod vdisplay;
+mod wgc;
 mod wm;
+
+/// `afterglow --grab`: the app's windows captured as the signed-in user (grab.rs)
+pub fn grab_main() -> i32 {
+    grab::run()
+}
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +120,12 @@ impl Windows {
         }))
     }
 
+    /// the app's own windows captured (grab.rs) rather than its display, unless Media
+    /// Foundation's encoder is asked for
+    fn app_capture(&self) -> bool {
+        !matches!(self.conf.encoder.as_str(), "hardware" | "mf" | "software")
+    }
+
     fn vda_ok(&self) -> bool {
         let mut v = self.vda.lock().unwrap();
         if !v.as_ref().is_some_and(|d| d.ok()) {
@@ -139,7 +152,9 @@ impl Windows {
             Ok(name) => {
                 info!("virtual display {name}: {}x{}@{}", l.w, l.h, l.fps);
                 display::set_mode(&name, l.w, l.h, millihz);
-                if self.conf.primary {
+                // the app's windows are captured on their own: the user's own monitor and
+                // taskbar stay where they are
+                if self.conf.primary && !self.app_capture() {
                     display::make_primary(&name);
                 }
                 Some(name)
@@ -611,6 +626,19 @@ impl Host for Windows {
         // the virtual display follows the viewer's window: the app redraws at its size
         if let Some(n) = &name {
             display::set_mode(n, v.w, v.h, v.fps * 1000);
+        }
+        // the app alone: its windows captured as the signed-in user, nothing else
+        let seen = self.run.lock().unwrap().follower.as_ref().map(|f| f.watch());
+        if let (true, false, Some(seen), Some(rect)) =
+            (self.app_capture(), v.draw_cursor, seen, name.as_deref().and_then(display::rect_of))
+        {
+            match grab::Helper::start() {
+                Ok(h) => match h.video(v, ctl, &mut *out, rect, || seen.pids()) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => warn!("the app's windows couldn't be captured ({e}): its display is, instead"),
+                },
+                Err(e) => warn!("no capture process ({e}): the app's display is captured instead"),
+            }
         }
         let mut fails = 0u32;
         // set up again after each loss (a mode change, a desktop switch) until stopped

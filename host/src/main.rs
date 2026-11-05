@@ -29,6 +29,7 @@ fn main() {
         "--features" => return println!("afterglow {VERSION} proto={PROTO} {FEATURES}"),
         "--stdio" => return stdio(),
         "--icons" => std::process::exit(icons::run()),
+        "--grab" => std::process::exit(platform::grab()),
         _ => {}
     }
     let conf = match std::fs::read_to_string(&path)

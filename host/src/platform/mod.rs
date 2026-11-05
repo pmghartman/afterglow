@@ -20,6 +20,17 @@ pub fn open(conf: &crate::conf::Conf) -> Result<Arc<Native>, String> {
     Native::open(conf)
 }
 
+/// `afterglow --grab`: the capture process Windows' host starts as the signed-in user
+pub fn grab() -> i32 {
+    #[cfg(windows)]
+    return windows::grab_main();
+    #[cfg(not(windows))]
+    {
+        eprintln!("afterglow: --grab is Windows' alone");
+        2
+    }
+}
+
 /// shutdown raised on Ctrl-C, a console close or SIGTERM
 pub fn on_shutdown(flag: Arc<AtomicBool>) {
     #[cfg(windows)]

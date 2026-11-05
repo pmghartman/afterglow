@@ -27,6 +27,16 @@ windows-service = "0.8"
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
+  # Windows.Graphics.Capture: an app's own windows captured, not a display
+  "Foundation",
+  "Foundation_Collections",
+  "Graphics",
+  "Graphics_Capture",
+  "Graphics_DirectX",
+  "Graphics_DirectX_Direct3D11",
+  "Win32_System_WinRT",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
   "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_Devices_Display",
   "Win32_Foundation",
@@ -41,6 +51,7 @@ features = [
   "Win32_Networking_WinSock",
   "Win32_Security",
   "Win32_Storage_FileSystem",
+  "Win32_System_Pipes",
   "Win32_Storage_Packaging_Appx",
   "Win32_System_Com",
   "Win32_System_Console",

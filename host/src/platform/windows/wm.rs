@@ -40,7 +40,9 @@ use crate::{info, warn};
 
 /// what the follower knows of the app's windows, for the host to ask
 #[derive(Default)]
-struct Seen {
+pub struct Seen {
+    /// the app's processes: its job's, and those whose windows were taken as its
+    pids: Mutex<Vec<u32>>,
     /// the app's windows up now, and whether it ever had one
     windows: AtomicUsize,
     ever: AtomicBool,
@@ -71,6 +73,11 @@ impl Follower {
             .spawn(move || follow(HANDLE(job as *mut c_void), &display, &s, ticks(launched), &out))
             .ok();
         Follower { stop, thread, seen, started: Instant::now() }
+    }
+
+    /// what it knows, for another thread to read
+    pub fn watch(&self) -> Arc<Seen> {
+        self.seen.clone()
     }
 
     /// the app's windows up now
@@ -150,6 +157,13 @@ const SHELL: [&str; 10] = [
     "afterglow.exe",
     "conhost.exe",
 ];
+
+impl Seen {
+    /// the app's processes as last looked at
+    pub fn pids(&self) -> Vec<u32> {
+        self.pids.lock().unwrap().clone()
+    }
+}
 
 fn ticks(f: FILETIME) -> u64 {
     ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
@@ -287,6 +301,9 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
         // SAFETY: IsWindow takes any value
         seen.retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
         out.windows.store(seen.len(), Ordering::Relaxed);
+        let mut pids = super::process::pids_of(job);
+        pids.extend(adopted.iter().copied());
+        *out.pids.lock().unwrap() = pids;
         if !seen.is_empty() {
             out.ever.store(true, Ordering::Relaxed);
         }
