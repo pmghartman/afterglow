@@ -651,12 +651,14 @@ impl Host for Linux {
         // the last change sent, and whether anything is still coarser than refinement makes it
         let mut changed_at = Instant::now();
         let mut coarse = false;
+        // refinement's own pace, a frame a slot: a change never waits behind it
+        let mut next_refine = Instant::now();
         let mut stats = Stats::new();
         let mut scratch = Vec::new();
         while !ctl.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
             // refinement once the screen has been still a moment, a frame a slot
-            let refine_at = (changed_at + REFINE_AFTER).max(next_slot);
+            let refine_at = (changed_at + REFINE_AFTER).max(next_slot).max(next_refine);
             let mut until = if pending {
                 next_slot
             } else if coarse {
@@ -774,20 +776,38 @@ impl Host for Linux {
                 Enc::Own(e, rate) => {
                     let [y, u, v] = yuv.planes();
                     let frame = crate::avc::Frame { y, u, v };
-                    let opts = if refine {
-                        let fine = crate::avc::QP_FINE;
-                        crate::avc::Opts {
+                    let (opts, act) = if refine {
+                        // what can't be read yet first, then everything sharp
+                        let fine = if e.coarse(crate::avc::QP_LEGIBLE) > 0 {
+                            crate::avc::QP_READ
+                        } else {
+                            crate::avc::QP_FINE
+                        };
+                        let o = crate::avc::Opts {
                             idr: false,
                             qp: fine,
-                            refine: Some((fine, rate.refine_mbs())),
+                            refine: Some((fine, rate.refine_bytes())),
                             always: false,
-                        }
+                        };
+                        (o, 0.0)
                     } else {
-                        let mbs = if idr { e.mbw * e.mbh } else { e.marked() };
-                        crate::avc::Opts { idr, qp: rate.qp(mbs), refine: None, always: alive && !change }
+                        // what the change has to say, looked at before choosing its qp
+                        let (mbs, act) = e.activity(&frame, idr);
+                        let o = crate::avc::Opts { idr, qp: rate.qp(mbs, act), refine: None, always: alive && !change };
+                        (o, act)
                     };
                     let d = e.encode(&frame, &opts);
-                    rate.seen(&d, opts.qp);
+                    rate.seen(&d, opts.qp, act);
+                    if d.coded + d.refined > 64 {
+                        debug!(
+                            "a frame of {} macroblocks ({} refined, {} intra) at qp {}, activity {act:.0}: {} bytes",
+                            d.coded + d.refined,
+                            d.refined,
+                            d.intra,
+                            opts.qp,
+                            d.bytes
+                        );
+                    }
                     if !d.frame {
                         continue;
                     }
@@ -796,6 +816,9 @@ impl Host for Linux {
                     }
                     if change {
                         changed_at = now;
+                    }
+                    if refine {
+                        next_refine = now + period;
                     }
                     // whether refinement has more to do: looked at once the frame's gone
                     coarse = e.coarse(crate::avc::QP_FINE) > 0;
@@ -819,7 +842,7 @@ enum Enc {
 
 /// how long the screen is still before what was coded coarsely is refined: long enough
 /// that typing doesn't share its frames with refinement
-const REFINE_AFTER: Duration = Duration::from_millis(100);
+const REFINE_AFTER: Duration = Duration::from_millis(60);
 
 /// encoder threads (one slice each) for a size: one for small pictures, where a
 /// thread's hand-off costs more than it saves; two at 720p, three at 1080p and up (four

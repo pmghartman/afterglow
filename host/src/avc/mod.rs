@@ -58,7 +58,8 @@ pub struct Done {
 pub struct Opts {
     pub idr: bool,
     pub qp: u8,
-    /// what's coded coarser than this is coded again at it, this many macroblocks at most
+    /// what's coded coarser than this is coded again at it, in this many bytes at most:
+    /// whatever doesn't fit stays coarse for the next refinement
     pub refine: Option<(u8, usize)>,
     /// a frame even when nothing changed (a keepalive)
     pub always: bool,
@@ -81,8 +82,6 @@ pub struct Encoder {
     frame_num: u16,
     idr_id: u32,
     threads: usize,
-    /// where the next refinement starts looking, so all of the screen gets its turn
-    refine_at: usize,
     sps: Vec<u8>,
     pps: Vec<u8>,
     rbsp: Vec<Bits>,
@@ -133,7 +132,6 @@ impl Encoder {
             frame_num: 0,
             idr_id: 0,
             threads: threads.max(1),
-            refine_at: 0,
             sps: Vec::new(),
             pps: Vec::new(),
             rbsp: Vec::new(),
@@ -234,9 +232,33 @@ impl Encoder {
         self.q.iter().filter(|&&q| q > qp).count()
     }
 
-    /// macroblocks marked since the last frame
-    pub fn marked(&self) -> usize {
-        self.dirty.iter().filter(|&&d| d).count()
+    /// what the next frame has to say, as a cheap look tells it before coding: the
+    /// macroblocks marked (all of them for a keyframe), and their activity, the sum
+    /// over them of their luma's SAD to the reference or to its own mean, whichever is
+    /// less (what inter or intra DC would leave to code). A big frame is sampled
+    pub fn activity(&self, src: &Frame, idr: bool) -> (usize, f64) {
+        let n = self.mbw * self.mbh;
+        let ys = self.mbw * 16;
+        let marked: Vec<usize> = if idr { (0..n).collect() } else { (0..n).filter(|&i| self.dirty[i]).collect() };
+        let step = (marked.len() / 1024).max(1);
+        let mut e = 0u64;
+        for &i in marked.iter().step_by(step) {
+            let (mx, my) = (i % self.mbw, i / self.mbw);
+            let at = my * 16 * ys + mx * 16;
+            let mut s = [0u8; 256];
+            for y in 0..16 {
+                s[y * 16..y * 16 + 16].copy_from_slice(&src.y[at + y * ys..at + y * ys + 16]);
+            }
+            let mean = (s.iter().map(|&v| v as u32).sum::<u32>() / 256) as u8;
+            let flat = mb::sad(&s, &[mean; 256]);
+            let ref_sad = if idr {
+                u32::MAX
+            } else {
+                (0..16).map(|y| mb::sad(&s[y * 16..y * 16 + 16], &self.rec[at + y * ys..at + y * ys + 16])).sum()
+            };
+            e += flat.min(ref_sad) as u64;
+        }
+        (marked.len(), e as f64 * step as f64)
     }
 
     /// a frame: an IDR when asked (or the first), otherwise the marked macroblocks that
@@ -251,17 +273,8 @@ impl Encoder {
             self.todo.extend((0..n as u32).map(|i| (i, Act::Dirty)));
         } else {
             let mut refine = Vec::new();
-            if let Some((rq, most)) = o.refine {
-                let mut k = 0;
-                while k < n && refine.len() < most {
-                    let i = (self.refine_at + k) % n;
-                    if !self.dirty[i] && self.q[i] > rq {
-                        refine.push(i as u32);
-                    }
-                    k += 1;
-                }
-                self.refine_at = (self.refine_at + k) % n;
-                refine.sort_unstable();
+            if let Some((rq, _)) = o.refine {
+                refine.extend((0..n).filter(|&i| !self.dirty[i] && self.q[i] > rq).map(|i| i as u32));
             }
             let mut r = refine.into_iter().peekable();
             for (i, _) in self.dirty.iter().enumerate().filter(|(_, d)| **d) {
@@ -273,6 +286,7 @@ impl Encoder {
             self.todo.extend(r.map(|j| (j, Act::Refine)));
         }
         let total = self.todo.len();
+        let refines = self.todo.iter().filter(|t| t.1 == Act::Refine).count();
         if total == 0 && !o.always {
             return Done::default();
         }
@@ -344,6 +358,10 @@ impl Encoder {
                 for t in mine.iter_mut() {
                     t.0 -= (r0 * mbw) as u32;
                 }
+                let refining = mine.iter().filter(|t| t.1 == Act::Refine).count();
+                let refine_bytes = o.refine.map_or(usize::MAX, |(_, most)| {
+                    if refines == 0 { most } else { (most as u128 * refining as u128 / refines as u128) as usize }
+                });
                 let band = Band {
                     mbw,
                     rows,
@@ -358,6 +376,7 @@ impl Encoder {
                     su: &src.u[r0 * 8 * cs..r1 * 8 * cs],
                     sv: &src.v[r0 * 8 * cs..r1 * 8 * cs],
                     todo: mine,
+                    refine_bytes,
                     q: qq,
                     nnz: nn,
                     stamp: st,
@@ -439,49 +458,59 @@ impl Encoder {
     }
 }
 
-/// the finest a change is coded at first, and what refinement brings everything to
+/// the finest a change is coded at first, and what refinement brings everything to:
+/// what's coarser than QP_LEGIBLE first to QP_READ (cheap, and text reads), then all of
+/// it to QP_FINE
 pub const QP_FIRST: u8 = 22;
 pub const QP_FINE: u8 = 14;
+pub const QP_LEGIBLE: u8 = 32;
+pub const QP_READ: u8 = 26;
 
-/// the qp a frame is coded at, from how many macroblocks it codes and how big
-/// macroblocks have been coming out: a frame that would take much more than its share
-/// of the bitrate on the wire is coarser, since its size is latency too (the viewer
-/// sees nothing until all of it arrived). Refinement then sharpens it in frames that
-/// each keep to a frame's share
+/// the qp a frame is coded at, from what it has to say: a frame that would take much
+/// more than its share of the bitrate on the wire is coarser, since its size is latency
+/// too (the viewer sees nothing until all of it has arrived). Refinement then sharpens
+/// it in frames that each keep to a frame's share
 pub struct Rate {
     /// a frame's share of the bitrate, in bytes
     share: f64,
-    /// bytes a macroblock takes at qp 26, and a refined one at QP_FINE, as seen lately
+    /// bytes a unit of activity costs at qp 26, as seen lately
     k: f64,
-    kr: f64,
 }
+
+/// what a coded macroblock costs whatever its content: its type, its pattern, its qp
+const MB_BYTES: f64 = 1.5;
 
 impl Rate {
     pub fn new(kbps: u32, fps: u32) -> Rate {
-        Rate { share: kbps as f64 * 125.0 / fps.max(1) as f64, k: 24.0, kr: 24.0 }
+        Rate { share: kbps as f64 * 125.0 / fps.max(1) as f64, k: 0.02 }
     }
 
-    /// a change over `mbs` macroblocks: the finest qp whose frame fits in two shares
-    pub fn qp(&self, mbs: usize) -> u8 {
-        let want = self.share * 2.0;
-        let at26 = mbs.max(1) as f64 * self.k;
-        let qp = 26.0 + 6.0 * (at26 / want).log2();
+    /// a change over `mbs` macroblocks of this activity: the finest qp whose frame
+    /// comes to two shares at most
+    pub fn qp(&self, mbs: usize, activity: f64) -> u8 {
+        let room = (self.share * 2.0 - MB_BYTES * mbs as f64).max(self.share * 0.25);
+        let at26 = (activity * self.k).max(1.0);
+        let qp = 26.0 + 6.0 * (at26 / room).log2();
         qp.ceil().clamp(QP_FIRST as f64, 51.0) as u8
     }
 
-    /// how many macroblocks one refinement frame may take: a share's worth
-    pub fn refine_mbs(&self) -> usize {
-        ((self.share / self.kr) as usize).clamp(16, 1 << 16)
+    /// the bytes one refinement frame may take: a share
+    pub fn refine_bytes(&self) -> usize {
+        self.share as usize
     }
 
     /// what a frame came to, for the next ones
-    pub fn seen(&mut self, d: &Done, qp: u8) {
-        if d.coded >= 8 && d.refined == 0 {
-            let k = d.bytes as f64 / d.coded as f64 * 2f64.powf((qp as f64 - 26.0) / 6.0);
-            self.k = (0.6 * self.k + 0.4 * k).clamp(0.5, 400.0);
-        } else if d.refined >= 8 && d.coded == 0 {
-            let k = d.bytes as f64 / d.refined as f64;
-            self.kr = (0.6 * self.kr + 0.4 * k).clamp(0.5, 400.0);
+    pub fn seen(&mut self, d: &Done, qp: u8, activity: f64) {
+        // learnt only from frames whose size is mostly their content, not each
+        // macroblock's fixed cost; quicker to think frames bigger than smaller, since
+        // one too big is late and one too small is only refined sooner
+        let mix = |old: f64, new: f64| if new > old { 0.4 * old + 0.6 * new } else { 0.8 * old + 0.2 * new };
+        if d.coded >= 4 && d.refined == 0 && activity > 256.0 {
+            let content = d.bytes as f64 - MB_BYTES * d.coded as f64;
+            if content > 0.25 * d.bytes as f64 {
+                let k = content / activity * 2f64.powf((qp as f64 - 26.0) / 6.0);
+                self.k = mix(self.k, k).clamp(1e-3, 1.0);
+            }
         }
     }
 }

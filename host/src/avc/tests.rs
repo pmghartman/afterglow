@@ -129,7 +129,7 @@ fn run(w: usize, h: usize, threads: usize, seed: u64) {
             }
             // refinement passes while still
             9..=12 => {
-                o.refine = Some((16, (pw / 16) * (ph / 16) / 3 + 1));
+                o.refine = Some((16, 12_000));
             }
             // a keepalive with nothing changed
             13 => o.always = true,

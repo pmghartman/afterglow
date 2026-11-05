@@ -43,6 +43,9 @@ pub struct Band<'a> {
     /// the macroblocks to code, by their index in the band, in order; every other one
     /// is skipped without being looked at
     pub todo: &'a [(u32, Act)],
+    /// the bytes this slice may grow to refining: past them what's left to refine is
+    /// skipped and stays coarse
+    pub refine_bytes: usize,
     /// the qp each macroblock was last coded at
     pub q: &'a mut [u8],
     /// total_coeff of each 4x4 block (16 luma, raster, then 4 Cb, 4 Cr), good for the
@@ -333,7 +336,7 @@ fn clip(v: i32) -> u8 {
 
 /// the sum of absolute differences of two blocks of rows `w` wide (8 or 16)
 #[inline(always)]
-fn sad(a: &[u8], b: &[u8]) -> u32 {
+pub fn sad(a: &[u8], b: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     if a.len() % 16 == 0 {
         use std::arch::x86_64::*;
@@ -635,6 +638,7 @@ impl Band<'_> {
             self.load(&mut mb, mx, my);
             let coded = match act {
                 Act::Skip => false,
+                Act::Refine if b.buf.len() >= self.refine_bytes => false,
                 Act::Dirty if !h.idr && !self.changed(&mb, mx, my) => false,
                 Act::Dirty => {
                     let r = self.code(&mut mb, b, mx, my, h.idr, h.qp, h.tick, &mut last_qp, &mut skip);
