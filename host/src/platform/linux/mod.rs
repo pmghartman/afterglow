@@ -76,6 +76,14 @@ pub struct Linux {
     notes: Mutex<Option<Notes>>,
     /// how the last app ended
     ended: Mutex<serde_json::Value>,
+    /// when input was last injected (since epoch()): the stats time what it caused
+    input_at: std::sync::atomic::AtomicU64,
+}
+
+/// a fixed instant to time from across threads
+fn epoch() -> Instant {
+    static E: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *E.get_or_init(Instant::now)
 }
 
 /// the most of the app's output kept
@@ -191,6 +199,7 @@ impl Linux {
             spare,
             notes: Mutex::new(None),
             ended: Mutex::new(serde_json::json!({})),
+            input_at: Default::default(),
         }))
     }
 
@@ -205,6 +214,7 @@ impl Linux {
         if let Some(xi) = self.xi.lock().unwrap().as_mut() {
             f(xi);
             let _ = xi.conn.flush();
+            self.input_at.store(epoch().elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 }
@@ -655,6 +665,9 @@ impl Host for Linux {
         let mut next_refine = Instant::now();
         let mut stats = Stats::new();
         let mut scratch = Vec::new();
+        // the first damage after the last frame, and the input last timed
+        let mut woke: Option<Instant> = None;
+        let mut timed_input = 0u64;
         while !ctl.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
             // refinement once the screen has been still a moment, a frame a slot
@@ -674,6 +687,9 @@ impl Host for Linux {
             ch.damage.clear();
             (ch.resized, ch.cursor, ch.woken) = (false, false, false);
             grab.wait(Some(until), &mut ch)?;
+            if !ch.damage.is_empty() && woke.is_none() {
+                woke = Some(Instant::now());
+            }
             if ch.resized {
                 self.screen_is(grab.w, grab.h);
                 yuv.black();
@@ -759,6 +775,7 @@ impl Host for Linux {
             }
             last = now;
             let t2 = Instant::now();
+            let t_enc;
             let bytes = match &mut enc {
                 Enc::Open(h264) => {
                     let mut nals = Vec::new();
@@ -768,6 +785,7 @@ impl Host for Linux {
                         continue;
                     }
                     let bytes: usize = nals.iter().map(|n| n.len()).sum();
+                    t_enc = Instant::now();
                     if !out.frame(&nals, key) {
                         break;
                     }
@@ -811,6 +829,7 @@ impl Host for Linux {
                     if !d.frame {
                         continue;
                     }
+                    t_enc = Instant::now();
                     if !out.frame(&e.nals(), d.key) {
                         break;
                     }
@@ -827,7 +846,20 @@ impl Host for Linux {
             };
             let t3 = Instant::now();
             sent = true;
-            stats.frame(px_done, bytes, t2 - t1, t3 - t2, t3.elapsed());
+            stats.frame(px_done, bytes, t2 - t1, t_enc - t2, t3 - t_enc);
+            // the first frame after an input: how long from it to the app's drawing seen,
+            // and to the frame sent
+            if change {
+                let input = self.input_at.load(Ordering::Relaxed);
+                let at = epoch() + Duration::from_nanos(input);
+                if input != timed_input && input > 0 && t3.duration_since(at) < Duration::from_millis(500) {
+                    timed_input = input;
+                    if let Some(w) = woke {
+                        stats.input(w.saturating_duration_since(at), t3.duration_since(at));
+                    }
+                }
+                woke = None;
+            }
         }
         stats.log();
         Ok(())
@@ -862,6 +894,10 @@ fn threads_for(w: usize, h: usize) -> usize {
 /// where a video's time goes, logged every few seconds at debug
 struct Stats {
     since: Instant,
+    /// inputs timed: to the app's drawing seen, to its frame sent
+    inputs: u32,
+    to_damage: Duration,
+    to_sent: Duration,
     frames: u32,
     px: u64,
     bytes: u64,
@@ -875,6 +911,9 @@ impl Stats {
     fn new() -> Stats {
         Stats {
             since: Instant::now(),
+            inputs: 0,
+            to_damage: Duration::ZERO,
+            to_sent: Duration::ZERO,
             frames: 0,
             px: 0,
             bytes: 0,
@@ -883,6 +922,12 @@ impl Stats {
             send: Duration::ZERO,
             worst: Duration::ZERO,
         }
+    }
+
+    fn input(&mut self, to_damage: Duration, to_sent: Duration) {
+        self.inputs += 1;
+        self.to_damage += to_damage;
+        self.to_sent += to_sent;
     }
 
     fn frame(&mut self, px: u64, bytes: usize, grab: Duration, enc: Duration, send: Duration) {
@@ -911,6 +956,15 @@ impl Stats {
                 us(self.send),
                 self.worst.as_micros(),
                 self.bytes as f64 / n / 1024.0
+            );
+        }
+        if self.inputs > 0 {
+            let n = self.inputs as f64;
+            debug!(
+                "input: {} timed, injected to the app's drawing seen {:.0} us, to its frame sent {:.0} us",
+                self.inputs,
+                self.to_damage.as_secs_f64() * 1e6 / n,
+                self.to_sent.as_secs_f64() * 1e6 / n
             );
         }
         *self = Stats::new();

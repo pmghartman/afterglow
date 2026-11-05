@@ -257,6 +257,28 @@ fn the_sps_says_nothing_is_reordered() {
     assert_eq!(&rec[1..3], &[66, 0xc0]);
 }
 
+/// one encoder over a flipping terminal, for a profiler to look at
+#[test]
+#[ignore]
+fn flat_flips() {
+    let (w, h) = (1920, 1080);
+    let mut enc = Encoder::new(w, h, 120, 1);
+    let (pw, ph) = enc.padded();
+    let mut pic = Pic::new(pw, ph);
+    let mut rng = Rng(5);
+    for line in 0..6 {
+        for col in 0..60 {
+            pic.glyphs(&mut rng, col * 9, line * 16, 7, 12);
+        }
+    }
+    let o = Opts { idr: false, qp: 26, refine: None, always: false };
+    for _ in 0..20 {
+        pic.invert();
+        enc.mark_all();
+        enc.encode(&pic.frame(), &o);
+    }
+}
+
 #[test]
 #[ignore]
 fn speed() {
@@ -297,5 +319,27 @@ fn speed() {
             took += t.elapsed();
         }
         eprintln!("{w}x{h} a glyph: {:.1} us a frame", took.as_secs_f64() * 1e6 / n as f64);
+        // a terminal flipped to reverse video: a few lines of text, the rest flat
+        let mut enc = Encoder::new(w, h, 120, threads);
+        let mut pic = Pic::new(pw, ph);
+        for line in 0..6 {
+            for col in 0..60 {
+                pic.glyphs(&mut rng, col * 9, line * 16, 7, 12);
+            }
+        }
+        enc.encode(&pic.frame(), &o);
+        let (mut bytes, mut took) = (0, std::time::Duration::ZERO);
+        for _ in 0..n {
+            pic.invert();
+            enc.mark_all();
+            let t = std::time::Instant::now();
+            bytes += enc.encode(&pic.frame(), &o).bytes;
+            took += t.elapsed();
+        }
+        eprintln!(
+            "{w}x{h} a terminal flipped: {:.2} ms a frame, {} KiB",
+            took.as_secs_f64() * 1000.0 / n as f64,
+            bytes / n / 1024
+        );
     }
 }

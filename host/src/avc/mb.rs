@@ -334,6 +334,187 @@ fn clip(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+/// a macroblock's 16 luma blocks' residual laid side by side: r[y * 4 + x][by * 4 + bx].
+/// A 4x4 transpose of each row's four blocks, with SSE2 (every x86-64 has it)
+#[inline(always)]
+fn gather_luma(src: &[u8; 256], pred: &[u8; 256], r: &mut [[i32; 16]; 16]) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is x86-64's baseline; every load is a row of the 256-byte blocks and
+    // every store 4 lanes of a row of 16
+    unsafe {
+        use std::arch::x86_64::*;
+        let z = _mm_setzero_si128();
+        let wide = |v: __m128i, hi: bool| {
+            let u = if hi { _mm_unpackhi_epi16(v, v) } else { _mm_unpacklo_epi16(v, v) };
+            _mm_srai_epi32(u, 16)
+        };
+        for by in 0..4 {
+            for y in 0..4 {
+                let row = (by * 4 + y) * 16;
+                let s = _mm_loadu_si128(src.as_ptr().add(row) as *const __m128i);
+                let p = _mm_loadu_si128(pred.as_ptr().add(row) as *const __m128i);
+                // blocks 0 and 1, 2 and 3 of the row, as i16
+                let lo = _mm_sub_epi16(_mm_unpacklo_epi8(s, z), _mm_unpacklo_epi8(p, z));
+                let hi = _mm_sub_epi16(_mm_unpackhi_epi8(s, z), _mm_unpackhi_epi8(p, z));
+                let t0 = _mm_unpacklo_epi16(lo, hi);
+                let t1 = _mm_unpackhi_epi16(lo, hi);
+                // by column: x 0 and 1, then 2 and 3, each the four blocks
+                let u0 = _mm_unpacklo_epi16(t0, t1);
+                let u1 = _mm_unpackhi_epi16(t0, t1);
+                for (x, v) in [wide(u0, false), wide(u0, true), wide(u1, false), wide(u1, true)].into_iter().enumerate()
+                {
+                    _mm_storeu_si128(r[y * 4 + x].as_mut_ptr().add(by * 4) as *mut __m128i, v);
+                }
+            }
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for by in 0..4 {
+        for y in 0..4 {
+            let row = (by * 4 + y) * 16;
+            for bx in 0..4 {
+                for x in 0..4 {
+                    r[y * 4 + x][by * 4 + bx] = src[row + bx * 4 + x] as i32 - pred[row + bx * 4 + x] as i32;
+                }
+            }
+        }
+    }
+}
+
+/// the luma reconstruction: prediction plus the side-by-side residual, clipped, into a
+/// plane's 16 rows at `at`, `stride` apart
+#[inline(always)]
+fn scatter_luma(res: &[[i32; 16]; 16], pred: &[u8; 256], plane: &mut [u8], at: usize, stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is x86-64's baseline; each store is 16 bytes of a row the caller
+    // owns (checked by the slice index first)
+    unsafe {
+        use std::arch::x86_64::*;
+        let z = _mm_setzero_si128();
+        for by in 0..4 {
+            for y in 0..4 {
+                let q = |x: usize| _mm_loadu_si128(res[y * 4 + x].as_ptr().add(by * 4) as *const __m128i);
+                let a = _mm_packs_epi32(q(0), q(1));
+                let b = _mm_packs_epi32(q(2), q(3));
+                let t0 = _mm_unpacklo_epi16(a, b);
+                let t1 = _mm_unpackhi_epi16(a, b);
+                // by block: 0 and 1, then 2 and 3, each its four columns
+                let u0 = _mm_unpacklo_epi16(t0, t1);
+                let u1 = _mm_unpackhi_epi16(t0, t1);
+                let row = (by * 4 + y) * 16;
+                let p = _mm_loadu_si128(pred.as_ptr().add(row) as *const __m128i);
+                let v = _mm_packus_epi16(
+                    _mm_add_epi16(_mm_unpacklo_epi8(p, z), u0),
+                    _mm_add_epi16(_mm_unpackhi_epi8(p, z), u1),
+                );
+                let out = &mut plane[at + (by * 4 + y) * stride..][..16];
+                _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, v);
+            }
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for by in 0..4 {
+        for y in 0..4 {
+            let row = (by * 4 + y) * 16;
+            let out = &mut plane[at + (by * 4 + y) * stride..][..16];
+            for bx in 0..4 {
+                for x in 0..4 {
+                    out[bx * 4 + x] = clip(pred[row + bx * 4 + x] as i32 + res[y * 4 + x][by * 4 + bx]);
+                }
+            }
+        }
+    }
+}
+
+/// one chroma plane's four blocks' residual into lanes p*4.. of the side-by-side form
+#[inline(always)]
+fn gather_chroma(src: &[u8; 64], pred: &[u8; 64], p: usize, r: &mut [[i32; 8]; 16]) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2; 8-byte loads within the 64-byte blocks, 8-byte stores of 2 lanes
+    unsafe {
+        use std::arch::x86_64::*;
+        let z = _mm_setzero_si128();
+        for by in 0..2 {
+            for y in 0..4 {
+                let row = (by * 4 + y) * 8;
+                let s = _mm_loadl_epi64(src.as_ptr().add(row) as *const __m128i);
+                let q = _mm_loadl_epi64(pred.as_ptr().add(row) as *const __m128i);
+                let d = _mm_sub_epi16(_mm_unpacklo_epi8(s, z), _mm_unpacklo_epi8(q, z));
+                // (block 0, block 1) for each column
+                let t = _mm_unpacklo_epi16(d, _mm_srli_si128(d, 8));
+                let w0 = _mm_srai_epi32(_mm_unpacklo_epi16(t, t), 16);
+                let w1 = _mm_srai_epi32(_mm_unpackhi_epi16(t, t), 16);
+                let lane = p * 4 + by * 2;
+                for (x, v) in [w0, _mm_srli_si128(w0, 8), w1, _mm_srli_si128(w1, 8)].into_iter().enumerate() {
+                    _mm_storel_epi64(r[y * 4 + x].as_mut_ptr().add(lane) as *mut __m128i, v);
+                }
+            }
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for by in 0..2 {
+        for y in 0..4 {
+            let row = (by * 4 + y) * 8;
+            for bx in 0..2 {
+                for x in 0..4 {
+                    let at = row + bx * 4 + x;
+                    r[y * 4 + x][p * 4 + by * 2 + bx] = src[at] as i32 - pred[at] as i32;
+                }
+            }
+        }
+    }
+}
+
+/// one chroma plane's reconstruction from lanes p*4.. into its 8 rows at `at`
+#[inline(always)]
+fn scatter_chroma(res: &[[i32; 8]; 16], pred: &[u8; 64], p: usize, plane: &mut [u8], at: usize, stride: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2; 8-byte loads of 2 lanes, 8-byte stores into a row the caller owns
+    unsafe {
+        use std::arch::x86_64::*;
+        let z = _mm_setzero_si128();
+        for by in 0..2 {
+            for y in 0..4 {
+                let lane = p * 4 + by * 2;
+                let q = |x: usize| _mm_loadl_epi64(res[y * 4 + x].as_ptr().add(lane) as *const __m128i);
+                // (block 0, block 1) by column, then each block's columns together
+                let a = _mm_packs_epi32(_mm_unpacklo_epi64(q(0), q(1)), _mm_unpacklo_epi64(q(2), q(3)));
+                let a = _mm_shufflehi_epi16(_mm_shufflelo_epi16(a, 0xd8), 0xd8);
+                let a = _mm_shuffle_epi32(a, 0xd8);
+                let row = (by * 4 + y) * 8;
+                let pr = _mm_loadl_epi64(pred.as_ptr().add(row) as *const __m128i);
+                let v = _mm_packus_epi16(_mm_add_epi16(_mm_unpacklo_epi8(pr, z), a), z);
+                let out = &mut plane[at + (by * 4 + y) * stride..][..8];
+                _mm_storel_epi64(out.as_mut_ptr() as *mut __m128i, v);
+            }
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for by in 0..2 {
+        for y in 0..4 {
+            let row = (by * 4 + y) * 8;
+            let out = &mut plane[at + (by * 4 + y) * stride..][..8];
+            for bx in 0..2 {
+                for x in 0..4 {
+                    out[bx * 4 + x] = clip(pred[row + bx * 4 + x] as i32 + res[y * 4 + x][p * 4 + by * 2 + bx]);
+                }
+            }
+        }
+    }
+}
+
+/// a block of rows copied into a plane's rows at `at`
+#[inline(always)]
+fn put_rows(src: &[u8], w: usize, plane: &mut [u8], at: usize, stride: usize) {
+    for (y, row) in src.chunks_exact(w).enumerate() {
+        plane[at + y * stride..at + y * stride + w].copy_from_slice(row);
+    }
+}
+
 /// the sum of absolute differences of two blocks of rows `w` wide (8 or 16)
 #[inline(always)]
 pub fn sad(a: &[u8], b: &[u8]) -> u32 {
@@ -810,16 +991,7 @@ impl Band<'_> {
         let f = if intra { (1 << qbits) / 3 } else { (1 << qbits) / 6 };
         // luma: the residual of all 16 blocks side by side, transformed, quantised
         let mut r = [[0i32; 16]; 16];
-        for by in 0..4 {
-            for y in 0..4 {
-                let row = (by * 4 + y) * 16;
-                for bx in 0..4 {
-                    for x in 0..4 {
-                        r[y * 4 + x][by * 4 + bx] = mb.sy[row + bx * 4 + x] as i32 - mb.py[row + bx * 4 + x] as i32;
-                    }
-                }
-            }
-        }
+        gather_luma(&mb.sy, &mb.py, &mut r);
         let c = fdct_n(&r);
         let ln = quant_n(&c, &mut mb.lv, intra as usize, q, f, qbits);
         let mut cbp_l = 0u32;
@@ -846,20 +1018,8 @@ impl Band<'_> {
         let cbits = 15 + qc6;
         let cf = if intra { (1 << cbits) / 3 } else { (1 << cbits) / 6 };
         let mut rc = [[0i32; 8]; 16];
-        for p in 0..2 {
-            let (src, pred) = if p == 0 { (&mb.su, &mb.pu) } else { (&mb.sv, &mb.pv) };
-            for by in 0..2 {
-                for y in 0..4 {
-                    let row = (by * 4 + y) * 8;
-                    for bx in 0..2 {
-                        for x in 0..4 {
-                            let at = row + bx * 4 + x;
-                            rc[y * 4 + x][p * 4 + by * 2 + bx] = src[at] as i32 - pred[at] as i32;
-                        }
-                    }
-                }
-            }
-        }
+        gather_chroma(&mb.su, &mb.pu, 0, &mut rc);
+        gather_chroma(&mb.sv, &mb.pv, 1, &mut rc);
         let cc = fdct_n(&rc);
         let cn = quant_n(&cc, &mut mb.cl, 1, qcr, cf, cbits);
         let mut any_dc = false;
@@ -965,46 +1125,32 @@ impl Band<'_> {
                 }
             }
         }
-        // the reconstruction, as the decoder makes it
-        let mut d = dequant_n(&mb.lv, q, q6);
-        if intra {
-            d[0] = luma_dc_dequant(&mb.ldc, qp);
-        }
-        let res = idct_n(&d);
+        // the reconstruction, as the decoder makes it; where nothing was coded, the
+        // prediction itself
         let ys = self.mbw * 16;
-        for by in 0..4 {
-            for y in 0..4 {
-                let row = (by * 4 + y) * 16;
-                let out = &mut self.ry[(my * 16 + by * 4 + y) * ys + mx * 16..][..16];
-                for bx in 0..4 {
-                    for x in 0..4 {
-                        let at = bx * 4 + x;
-                        out[at] = clip(mb.py[row + at] as i32 + res[y * 4 + x][by * 4 + bx]);
-                    }
-                }
+        let at = my * 16 * ys + mx * 16;
+        if ln.iter().all(|&n| n == 0) && (!intra || mb.ldc.iter().all(|&v| v == 0)) {
+            put_rows(&mb.py, 16, self.ry, at, ys);
+        } else {
+            let mut d = dequant_n(&mb.lv, q, q6);
+            if intra {
+                d[0] = luma_dc_dequant(&mb.ldc, qp);
             }
+            scatter_luma(&idct_n(&d), &mb.py, self.ry, at, ys);
         }
-        let mut dc = dequant_n(&mb.cl, qcr, qc6);
-        for p in 0..2 {
-            let dcc = if cbp_c > 0 { chroma_dc_dequant(&mb.cdc[p], qc) } else { [0; 4] };
-            dc[0][p * 4..p * 4 + 4].copy_from_slice(&dcc);
-        }
-        let resc = idct_n(&dc);
         let cs = self.mbw * 8;
-        for p in 0..2 {
-            let (pred, plane) = if p == 0 { (&mb.pu, &mut *self.ru) } else { (&mb.pv, &mut *self.rv) };
-            for by in 0..2 {
-                for y in 0..4 {
-                    let row = (by * 4 + y) * 8;
-                    let out = &mut plane[(my * 8 + by * 4 + y) * cs + mx * 8..][..8];
-                    for bx in 0..2 {
-                        for x in 0..4 {
-                            let at = bx * 4 + x;
-                            out[at] = clip(pred[row + at] as i32 + resc[y * 4 + x][p * 4 + by * 2 + bx]);
-                        }
-                    }
-                }
+        let at = my * 8 * cs + mx * 8;
+        if cbp_c == 0 {
+            put_rows(&mb.pu, 8, self.ru, at, cs);
+            put_rows(&mb.pv, 8, self.rv, at, cs);
+        } else {
+            let mut dc = dequant_n(&mb.cl, qcr, qc6);
+            for p in 0..2 {
+                dc[0][p * 4..p * 4 + 4].copy_from_slice(&chroma_dc_dequant(&mb.cdc[p], qc));
             }
+            let resc = idct_n(&dc);
+            scatter_chroma(&resc, &mb.pu, 0, self.ru, at, cs);
+            scatter_chroma(&resc, &mb.pv, 1, self.rv, at, cs);
         }
         self.keep(mb, mx, my, qp);
         Some(intra)
@@ -1096,6 +1242,55 @@ fn chroma_dc_dequant(c: &[i32; 4], qc: u8) -> [i32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gathers_and_scatters_put_every_pixel_where_it_belongs() {
+        let src: [u8; 256] = std::array::from_fn(|i| (i * 7 % 251) as u8);
+        let pred: [u8; 256] = std::array::from_fn(|i| (i * 13 % 241) as u8);
+        let mut r = [[0i32; 16]; 16];
+        gather_luma(&src, &pred, &mut r);
+        for by in 0..4 {
+            for y in 0..4 {
+                for bx in 0..4 {
+                    for x in 0..4 {
+                        let at = (by * 4 + y) * 16 + bx * 4 + x;
+                        assert_eq!(r[y * 4 + x][by * 4 + bx], src[at] as i32 - pred[at] as i32);
+                    }
+                }
+            }
+        }
+        // the residual put back over the prediction is the source, clipped
+        let mut plane = vec![0u8; 3 * 16 * 20];
+        scatter_luma(&r, &pred, &mut plane, 20 + 2, 20);
+        for y in 0..16 {
+            assert_eq!(&plane[22 + y * 20..22 + y * 20 + 16], &src[y * 16..y * 16 + 16]);
+        }
+        let mut big = r;
+        big[0][0] = 900;
+        big[5][3] = -900;
+        scatter_luma(&big, &pred, &mut plane, 0, 20);
+        assert_eq!(plane[0], 255);
+        assert_eq!(plane[16 + 1], 0);
+        let su: [u8; 64] = std::array::from_fn(|i| (i * 29 % 253) as u8);
+        let pu: [u8; 64] = std::array::from_fn(|i| (i * 3 % 199) as u8);
+        let mut rc = [[0i32; 8]; 16];
+        gather_chroma(&su, &pu, 1, &mut rc);
+        for by in 0..2 {
+            for y in 0..4 {
+                for bx in 0..2 {
+                    for x in 0..4 {
+                        let at = (by * 4 + y) * 8 + bx * 4 + x;
+                        assert_eq!(rc[y * 4 + x][4 + by * 2 + bx], su[at] as i32 - pu[at] as i32);
+                    }
+                }
+            }
+        }
+        let mut cplane = vec![0u8; 8 * 12];
+        scatter_chroma(&rc, &pu, 1, &mut cplane, 3, 12);
+        for y in 0..8 {
+            assert_eq!(&cplane[3 + y * 12..3 + y * 12 + 8], &su[y * 8..y * 8 + 8]);
+        }
+    }
 
     #[test]
     fn a_transform_and_back_is_near_the_residual() {
