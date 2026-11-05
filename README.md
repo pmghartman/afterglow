@@ -162,6 +162,8 @@ Manual, as Phosphorus's: run **release** from the Actions tab (optionally **Bump
 
 A `vX.Y` tag pushed by hand is released instead, built from its own commit, when it has no release yet.
 
+Every run ends by purging the repo's Actions storage: all caches (nothing in the workflow writes one; older runs' are removed) and all artifacts but a build-only or failed run's own zip, which stays downloadable for the day it's kept.
+
 Consumers pin the client by that tag. Phosphorus installs the host zip of the version its pin names, so bumping the pin moves both.
 
 ## Licence

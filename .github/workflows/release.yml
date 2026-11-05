@@ -5,7 +5,8 @@
 # SHA256SUMS and a build provenance attestation. "Build only" stops before publishing:
 # a way to try the Windows build. The SudoVDA driver isn't built here: its signed
 # package and nefconc.exe come out of Apollo's release installer at APOLLO_TAG, checked
-# against the driver's catalog
+# against the driver's catalog. Every run ends by purging the repo's Actions caches
+# and artifacts (the purge job)
 name: release
 
 on:
@@ -74,6 +75,9 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.ref }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # nothing kept in the Actions cache: the purge job clears it after each run
+          no-cache: true
       - run: bun install --frozen-lockfile
       - run: bun run check
       - run: bun run lint
@@ -103,6 +107,9 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
           fetch-depth: 1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # nothing kept in the Actions cache: the purge job clears it after each run
+          no-cache: true
       - run: rustup toolchain install stable --profile minimal -c clippy && rustup default stable
       - run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets -- -D warnings
       - name: build
@@ -202,3 +209,30 @@ jobs:
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
           files: out/*
+
+  # the repo's Actions storage cleared after every run, whatever its outcome: every
+  # cache (setup actions' and those older runs left), and every artifact but this run's
+  # own when nothing was published, so a build-only or failed run's zip can still be
+  # downloaded for the day it's kept. Runs are serialized, so no other run's are in use
+  purge:
+    needs: [check, windows, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP_RUN: ${{ needs.publish.result != 'success' && github.run_id || '' }}
+    steps:
+      - name: caches
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[].id')
+          for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent || echo "::warning::cache $id not deleted"; done
+          echo "deleted $(echo "$ids" | grep -c . || true) caches"
+      - name: artifacts
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            -q ".artifacts[] | select((.expired | not) and (.workflow_run.id | tostring) != \"$KEEP_RUN\") | .id")
+          for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --silent || echo "::warning::artifact $id not deleted"; done
+          echo "deleted $(echo "$ids" | grep -c . || true) artifacts${KEEP_RUN:+, kept this run's}"
