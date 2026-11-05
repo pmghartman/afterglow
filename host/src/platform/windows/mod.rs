@@ -9,6 +9,7 @@ mod input;
 mod process;
 pub mod svc;
 mod vdisplay;
+mod wm;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,6 +77,8 @@ struct Running {
     app: Option<process::App>,
     /// the virtual display's GDI name, while the app has one
     vdisplay: Option<String>,
+    /// the app's windows kept to that display
+    follower: Option<wm::Follower>,
 }
 
 pub struct Windows {
@@ -105,7 +108,7 @@ impl Windows {
         Ok(Arc::new(Windows {
             conf: conf.clone(),
             vda: Mutex::new(vda),
-            run: Mutex::new(Running { app: None, vdisplay: None }),
+            run: Mutex::new(Running { app: None, vdisplay: None, follower: None }),
             input: input::WinInput::default(),
         }))
     }
@@ -371,7 +374,9 @@ impl Host for Windows {
         let cwd = Path::new(&l.cmd).parent().filter(|p| p.is_dir()).and_then(|p| p.to_str()).map(str::to_string);
         match process::App::start(&cmd, cwd.as_deref()) {
             Ok(app) => {
-                *self.run.lock().unwrap() = Running { app: Some(app), vdisplay: vname };
+                // on a display of its own, the app alone: its windows fill it, the desktop unseen
+                let follower = vname.clone().map(|n| wm::Follower::start(app.job(), n));
+                *self.run.lock().unwrap() = Running { app: Some(app), vdisplay: vname, follower };
                 Ok(())
             }
             Err(e) => {
@@ -390,6 +395,8 @@ impl Host for Windows {
     fn terminate(&self) {
         let (app, vd) = {
             let mut r = self.run.lock().unwrap();
+            // stopped before the job it reads is closed
+            drop(r.follower.take());
             (r.app.take(), r.vdisplay.take())
         };
         if let Some(a) = app {

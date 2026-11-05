@@ -55,7 +55,7 @@ Keys are US-layout Windows virtual-key codes for the physical key: Windows sends
 
 ## Displays
 
-With `virtual_display` the app gets a display of its own at `w` by `h`: on Windows from SudoVDA (made the primary display with `dd_configuration_option = ensure_primary`), on Linux an Xvfb that only afterglow and the app hold the cookie for, run by a window manager inside afterglow that keeps the app's windows filling it and gives it the keyboard. Each `video` sets that display to its own size first, so the app redraws at the viewer's. Without one, the app runs on the console's primary display (Windows) or the session's `$DISPLAY` (Linux), scaled into the video. `ready`'s `virtual_display` says whether this host can give one.
+With `virtual_display` the app gets a display of its own at `w` by `h`: on Windows from SudoVDA (made the primary display with `dd_configuration_option = ensure_primary`), its main windows kept filling it and over the taskbar, its dialogs centred on it, on Linux an Xvfb that only afterglow and the app hold the cookie for, run by a window manager inside afterglow that keeps the app's windows filling it and gives it the keyboard. Each `video` sets that display to its own size first, so the app redraws at the viewer's. Without one, the app runs on the console's primary display (Windows) or the session's `$DISPLAY` (Linux), scaled into the video. `ready`'s `virtual_display` says whether this host can give one.
 
 ## Generations
 

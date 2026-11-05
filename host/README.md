@@ -11,7 +11,7 @@ The streaming host, in Rust, for Windows and Linux: one app at a time launched, 
 | `src/input.rs` | input packets into events; held keys repeated, everything let go when a video stops |
 | `src/conf.rs` | `afterglow.conf` (`key = value`); unknown keys ignored, so a config written for the C++ host works |
 | `src/host.rs` | what the link asks of a platform |
-| `src/platform/windows/` | DXGI desktop duplication with the pointer drawn in (`capture.rs`), the D3D11 video processor and Media Foundation's H.264 encoder (`encode.rs`), SendInput (`input.rs`), the app in a job in the console user's session (`process.rs`), SudoVDA (`vdisplay.rs`), display modes and the primary display (`display.rs`), and the service (`svc.rs`) |
+| `src/platform/windows/` | DXGI desktop duplication with the pointer drawn in (`capture.rs`), the D3D11 video processor and Media Foundation's H.264 encoder (`encode.rs`), SendInput (`input.rs`), the app in a job in the console user's session (`process.rs`), SudoVDA (`vdisplay.rs`), the app's windows kept to its display (`wm.rs`), display modes and the primary display (`display.rs`), and the service (`svc.rs`) |
 | `src/platform/linux/` | an Xvfb per app with its cookie, RandR resizing and a window manager that keeps the app's windows filling it (`xserver.rs`); MIT-SHM capture driven by XDamage, the pointer from XFixes, BGRX to I420 (`capture.rs`); OpenH264, XTest and the app as a process group (`mod.rs`) |
 | `tests/link.rs` | the link on a real socket against a stand-in platform |
 
@@ -19,7 +19,7 @@ The streaming host, in Rust, for Windows and Linux: one app at a time launched, 
 
 `afterglow.exe <afterglow.conf>` serves the link on `127.0.0.1:<phos_link_port>`. As a service, `tools\afterglowsvc.exe "<afterglow.conf>"` runs as SYSTEM and keeps `afterglow.exe` running as SYSTEM in the session at the console, restarting it when it exits or the console moves; stopping the service asks it to stop (Ctrl-C), so the app is closed and its display removed.
 
-An app is started as the console's signed-in user (a limited token for an admin under UAC), in a job so everything it starts is followed. With SudoVDA installed and `virtual_display` asked for, it gets a display of its own at the viewer's size, made primary with `dd_configuration_option = ensure_primary`; a machine with no monitor streams. The display follows each video's size and is removed with the app.
+An app is started as the console's signed-in user (a limited token for an admin under UAC), in a job so everything it starts is followed. With SudoVDA installed and `virtual_display` asked for, it gets a display of its own at the viewer's size, made primary with `dd_configuration_option = ensure_primary`; a machine with no monitor streams. Its main windows are kept filling that display, over the taskbar, and its dialogs centred on it (`wm.rs`), so the video shows the app and not the desktop. The display follows each video's size and is removed with the app.
 
 Capture runs on whichever desktop has the input, so UAC prompts and the lock screen are streamed. Frames go through the GPU's video processor (BGRA to NV12, scaled and letterboxed, BT.709 limited range) into the encoder Media Foundation lists for that GPU (NVENC, AMF or Quick Sync register one) in low latency mode, CBR at the asked bitrate; with no hardware encoder, or `encoder = software`, Windows' own. H.264 4:4:4 isn't offered, so `yuv444` gets 4:2:0.
 

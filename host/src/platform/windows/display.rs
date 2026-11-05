@@ -128,6 +128,14 @@ fn current_mode(name: &[u16]) -> Option<DEVMODEW> {
     unsafe { EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool().then_some(dm) }
 }
 
+/// where a display sits on the desktop, by its GDI name
+pub fn rect_of(name: &str) -> Option<RECT> {
+    let dm = current_mode(&wide(name))?;
+    // SAFETY: the union's position fields are the ones display modes use
+    let p = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
+    Some(RECT { left: p.x, top: p.y, right: p.x + dm.dmPelsWidth as i32, bottom: p.y + dm.dmPelsHeight as i32 })
+}
+
 /// the display set to w×h at the nearest whole rate to millihz
 pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32) -> bool {
     let n = wide(name);

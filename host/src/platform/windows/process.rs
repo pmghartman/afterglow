@@ -190,6 +190,11 @@ impl App {
         }
     }
 
+    /// the job everything the app starts is in: open until terminate
+    pub fn job(&self) -> HANDLE {
+        self.job
+    }
+
     /// whether anything in the app's job still runs
     pub fn running(&self) -> bool {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
