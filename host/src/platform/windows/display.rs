@@ -3,9 +3,10 @@
 use std::mem::size_of;
 
 use windows::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
-    QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
 };
 use windows::Win32::Foundation::{LUID, RECT};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput};
@@ -128,8 +129,62 @@ fn current_mode(name: &[u16]) -> Option<DEVMODEW> {
     unsafe { EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool().then_some(dm) }
 }
 
-/// where a display sits on the desktop, by its GDI name
+/// the active display configuration, as CCD has it: its paths and their modes
+fn config() -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
+    // SAFETY: buffers sized as GetDisplayConfigBufferSizes says, cut to what was filled
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).ok().ok()?;
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None)
+            .ok()
+            .ok()?;
+        paths.truncate(np as usize);
+        modes.truncate(nm as usize);
+        Some((paths, modes))
+    }
+}
+
+/// the index in modes of the source mode of the display by this GDI name
+fn source_mode(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO], name: &str) -> Option<usize> {
+    for p in paths {
+        let mut sn = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        sn.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        sn.header.adapterId = p.sourceInfo.adapterId;
+        sn.header.id = p.sourceInfo.id;
+        // SAFETY: the header is the struct's own, sized; the union's index is what a
+        // path without virtual mode awareness holds
+        unsafe {
+            if DisplayConfigGetDeviceInfo(&mut sn.header) != 0
+                || !from_wide(&sn.viewGdiDeviceName).eq_ignore_ascii_case(name)
+            {
+                continue;
+            }
+            let i = p.sourceInfo.Anonymous.modeInfoIdx as usize;
+            if modes.get(i).is_some_and(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// where a display sits on the desktop, by its GDI name: as CCD has it, else DXGI, else
+/// GDI (whose view of a display just added can lag, and then said nothing)
 pub fn rect_of(name: &str) -> Option<RECT> {
+    if let Some((paths, modes)) = config() {
+        if let Some(i) = source_mode(&paths, &modes, name) {
+            // SAFETY: a source mode, as its type says
+            let m = unsafe { modes[i].Anonymous.sourceMode };
+            let (x, y) = (m.position.x, m.position.y);
+            return Some(RECT { left: x, top: y, right: x + m.width as i32, bottom: y + m.height as i32 });
+        }
+    }
+    if let Some(o) = find(Some(name)) {
+        return Some(o.rect);
+    }
     let dm = current_mode(&wide(name))?;
     // SAFETY: the union's position fields are the ones display modes use
     let p = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
@@ -139,7 +194,10 @@ pub fn rect_of(name: &str) -> Option<RECT> {
 /// the display set to w×h at the nearest whole rate to millihz
 pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32) -> bool {
     let n = wide(name);
-    let Some(mut dm) = current_mode(&n) else { return false };
+    let Some(mut dm) = current_mode(&n) else {
+        warn!("{name}'s mode can't be read: left as it is");
+        return false;
+    };
     if dm.dmPelsWidth == w && dm.dmPelsHeight == h && dm.dmDisplayFrequency == (millihz + 500) / 1000 {
         return true;
     }
@@ -168,8 +226,19 @@ pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32) -> bool {
 
 /// the display made the primary one: moved to 0,0 and every other moved by as much
 pub fn make_primary(name: &str) -> bool {
+    match primary_ccd(name) {
+        Ok(true) => {
+            info!("{name} made the primary display");
+            return true;
+        }
+        Ok(false) => {}
+        Err(e) => warn!("{name} couldn't be made the primary display through CCD ({e}); trying GDI"),
+    }
     let n = wide(name);
-    let Some(target) = current_mode(&n) else { return false };
+    let Some(target) = current_mode(&n) else {
+        warn!("{name} couldn't be made the primary display: GDI can't read its mode");
+        return false;
+    };
     // SAFETY: the union's position fields are the ones display modes use
     let (dx, dy) = unsafe {
         let p = target.Anonymous1.Anonymous2.dmPosition;
@@ -218,4 +287,28 @@ pub fn make_primary(name: &str) -> bool {
         warn!("{name} couldn't be made the primary display");
     }
     ok
+}
+
+/// the display made primary through CCD, as Windows' own display settings do: every
+/// source moved by as much as puts this one at 0,0. Ok(false): CCD doesn't know it
+fn primary_ccd(name: &str) -> Result<bool, String> {
+    let Some((paths, mut modes)) = config() else { return Ok(false) };
+    let Some(i) = source_mode(&paths, &modes, name) else { return Ok(false) };
+    // SAFETY: source modes, as their type says
+    unsafe {
+        let p = modes[i].Anonymous.sourceMode.position;
+        if p.x == 0 && p.y == 0 {
+            return Ok(true);
+        }
+        for m in modes.iter_mut().filter(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            m.Anonymous.sourceMode.position.x -= p.x;
+            m.Anonymous.sourceMode.position.y -= p.y;
+        }
+        let r = SetDisplayConfig(
+            Some(&paths),
+            Some(&modes),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        );
+        if r == 0 { Ok(true) } else { Err(format!("error {r}")) }
+    }
 }
