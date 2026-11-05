@@ -154,7 +154,7 @@ The Windows host builds on Windows with `cargo build --release`, or from Linux w
 host/scripts/stage.sh "$PWD/afterglow-out" 0.0.0
 ```
 
-Format with `bun run fmt`. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Format with `bun run fmt` and `cargo fmt --manifest-path host/Cargo.toml`. A change to the link's wire format touches both ends (`host/src/wire.rs`, `host/src/link.rs` and `src/afterglow/link.ts`) and `docs/protocol.md`.
 
 ## Releases
 
