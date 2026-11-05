@@ -31,7 +31,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
+use super::input::{WinInput, sync_desktop};
 use super::wide;
+use crate::host::Login;
+use crate::input::Inject;
 use crate::{info, warn};
 
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x2000d;
@@ -72,6 +75,50 @@ fn user_token() -> Result<HANDLE, String> {
         WTSQueryUserToken(session, &mut token).map_err(|e| format!("no one is signed in at the console: {e}"))?;
         Ok(token)
     }
+}
+
+/// no one signed in at the console: the logon screen woken, the password typed for the
+/// account it offers and entered, then waited for. Once only, so a wrong one can't lock the account
+pub fn sign_in(login: &Login) -> Result<(), String> {
+    if !running_as_system() {
+        return Ok(());
+    }
+    if let Ok(t) = user_token() {
+        // SAFETY: a handle this function owns
+        unsafe {
+            let _ = CloseHandle(t);
+        }
+        return Ok(());
+    }
+    info!("no one is signed in: signing in at the logon screen");
+    let input = WinInput::default();
+    let tap = |vk: u8| {
+        sync_desktop();
+        input.key(vk, true);
+        input.key(vk, false);
+    };
+    // the lock screen takes any key to show the password box
+    tap(0x20);
+    thread::sleep(Duration::from_millis(2000));
+    sync_desktop();
+    input.text(&login.password);
+    thread::sleep(Duration::from_millis(300));
+    tap(0x0d);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(60) {
+        thread::sleep(Duration::from_millis(500));
+        if let Ok(t) = user_token() {
+            // SAFETY: a handle this function owns
+            unsafe {
+                let _ = CloseHandle(t);
+            }
+            // the shell and its desktop settle before the app starts on it
+            thread::sleep(Duration::from_secs(3));
+            info!("signed in after {} ms", t0.elapsed().as_millis());
+            return Ok(());
+        }
+    }
+    Err("the saved sign-in didn't get past the logon screen".into())
 }
 
 impl App {

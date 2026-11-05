@@ -17,10 +17,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::host::{Ctl, Cursor, Host, Launch, Sink, VideoCfg};
+use crate::host::{Ctl, Cursor, Host, Launch, Login, Sink, VideoCfg};
 use crate::input::Input;
 use crate::wire::{self, input as msg_in, output as msg_out};
 use crate::{error, info, warn};
+
+/// the link protocol's number (docs/protocol.md): bumped on any incompatible change
+pub const PROTO: u32 = 1;
 
 pub const VERSION: &str = match option_env!("AFTERGLOW_VERSION") {
     Some(v) => v,
@@ -332,6 +335,7 @@ impl<H: Host> Link<H> {
             msg_out::READY,
             json!({
                 "version": VERSION,
+                "proto": PROTO,
                 "virtual_display": self.host.virtual_display(),
                 "hostname": self.host.hostname(),
                 "running": running,
@@ -417,6 +421,11 @@ impl<H: Host> Link<H> {
             dpi: num(&j, "dpi", 96, 48, 480) as u32,
             scale: j.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(1.0, 4.0) as f32,
             dbus: j.get("dbus").and_then(Value::as_bool).unwrap_or(false),
+            login: j.get("login").and_then(|l| {
+                let pass = l.get("password").and_then(Value::as_str).filter(|p| !p.is_empty())?;
+                let user = l.get("user").and_then(Value::as_str).unwrap_or("");
+                Some(Login { user: user.to_string(), password: pass.to_string() })
+            }),
         };
         self.stop_video(&mut st);
         if st.launched {

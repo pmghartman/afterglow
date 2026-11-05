@@ -20,6 +20,8 @@ export type AfterglowTarget = {
   // Linux: a session bus of the app's own, so a single-instance app starts on the
   // stream rather than handing its window to a copy on the host's own screen
   dbus?: boolean;
+  // Windows: signed in at the logon screen before the app starts, when no one is
+  login?: { user: string; password: string };
   // the app gets a display of its own at the viewer's size (SudoVDA on Windows, an
   // Xvfb on Linux): no monitor needed, the console's own left alone
   virtualDisplay: boolean;
@@ -82,6 +84,7 @@ export class AfterglowSource implements Source {
       dpi: s.dpi,
       scale: s.scale,
       dbus: !!this.t.dbus,
+      ...(this.t.login ? { login: this.t.login } : {}),
       virtual_display: this.t.virtualDisplay,
       fresh: true,
     });

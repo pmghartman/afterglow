@@ -452,13 +452,10 @@ impl Host for Linux {
             .env("ELECTRON_OZONE_PLATFORM_HINT", "x11")
             .env("NO_AT_BRIDGE", "1")
             .env("_JAVA_AWT_WM_NONREPARENTING", "1");
-        match &display.auth {
-            Some(a) => {
-                cmd.env("XAUTHORITY", a);
-            }
-            None => {
-                cmd.env_remove("XAUTHORITY");
-            }
+        // the session's own display keeps the XAUTHORITY we inherited: without it the
+        // app can't connect to an X server that wants a cookie and exits at once
+        if let Some(a) = &display.auth {
+            cmd.env("XAUTHORITY", a);
         }
         if l.scale >= 1.5 {
             cmd.env("GDK_SCALE", format!("{}", l.scale.round() as u32))

@@ -90,9 +90,10 @@ pub fn serve(specs: &[String], out: &mut impl Write) {
 fn serve_with(specs: &[String], out: &mut impl Write, init: fn(), get: impl Fn(&str) -> Option<Vec<u8>> + Sync) {
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel::<String>();
-    let workers = std::env::var("AFTERGLOW_ICON_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-        std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8)
-    });
+    let workers = std::env::var("AFTERGLOW_ICON_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8));
     let workers = workers.clamp(1, 32).min(specs.len().max(1));
     std::thread::scope(|sc| {
         for _ in 0..workers {
@@ -180,11 +181,16 @@ mod tests {
     fn a_miss_is_null_and_every_spec_answers() {
         let specs: Vec<String> = ["f:nope", "x:bad", "a:ok", "boom"].iter().map(|s| s.to_string()).collect();
         let mut out = Vec::new();
-        serve_with(&specs, &mut out, || {}, |k| match k {
-            "a:ok" => Some(vec![1, 2, 3]),
-            "boom" => panic!("a probe that fails"),
-            _ => None,
-        });
+        serve_with(
+            &specs,
+            &mut out,
+            || {},
+            |k| match k {
+                "a:ok" => Some(vec![1, 2, 3]),
+                "boom" => panic!("a probe that fails"),
+                _ => None,
+            },
+        );
         let mut got: Vec<serde_json::Value> =
             String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         got.sort_by_key(|v| v["k"].as_str().unwrap().to_string());

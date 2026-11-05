@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use afterglow::link::{Link, VERSION};
+use afterglow::link::{Link, PROTO, VERSION};
 use afterglow::{conf, error, icons, info, log, platform};
 
 /// what a driver can count on from this build; icons is Windows only
@@ -26,7 +26,7 @@ fn main() {
     };
     match path.as_str() {
         "--version" => return println!("afterglow {VERSION}"),
-        "--features" => return println!("afterglow {VERSION} {FEATURES}"),
+        "--features" => return println!("afterglow {VERSION} proto={PROTO} {FEATURES}"),
         "--stdio" => return stdio(),
         "--icons" => std::process::exit(icons::run()),
         _ => {}
