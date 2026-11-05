@@ -633,7 +633,7 @@ impl Host for Windows {
             (self.app_capture(), v.draw_cursor, seen, name.as_deref().and_then(display::rect_of))
         {
             match grab::Helper::start() {
-                Ok(h) => match h.video(v, ctl, &mut *out, rect, || seen.pids()) {
+                Ok(h) => match h.video(v, ctl, &mut *out, rect, || seen.pids(), || seen.taken()) {
                     Ok(()) => return Ok(()),
                     Err(e) => warn!("the app's windows couldn't be captured ({e}): its display is, instead"),
                 },

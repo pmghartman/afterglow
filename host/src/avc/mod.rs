@@ -90,6 +90,19 @@ pub struct Encoder {
     started: bool,
 }
 
+/// a slice thread run ahead of the app's own: on a machine the app keeps busy (a
+/// build, a game) a slice waiting its turn holds the whole frame; on Windows, where the
+/// video thread is MMCSS work and these threads don't inherit it, they were seen waiting
+/// up to a second
+fn urgent() {
+    #[cfg(windows)]
+    // SAFETY: this thread's own priority
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+}
+
 /// the least H.264 level for this size and rate (A.3.1's MaxFS and MaxMBPS), up to 5.2
 fn level(mbs: usize, fps: u32) -> u8 {
     let rate = mbs as u64 * fps as u64;
@@ -131,7 +144,8 @@ impl Encoder {
             dirty: vec![true; n],
             frame_num: 0,
             idr_id: 0,
-            threads: threads.max(1),
+            // more than 8 slices' threads buy nothing at these sizes and only crowd the app
+            threads: threads.clamp(1, 8),
             sps: Vec::new(),
             pps: Vec::new(),
             rbsp: Vec::new(),
@@ -399,7 +413,10 @@ impl Encoder {
             } else {
                 std::thread::scope(|s| {
                     for _ in 1..threads {
-                        s.spawn(work);
+                        s.spawn(|| {
+                            urgent();
+                            work()
+                        });
                     }
                     work();
                 });

@@ -8,7 +8,9 @@
 //! and stdout in the link's own framing (wire.rs):
 //!
 //! to it: START `{w, h, fps, kbps, display: [left, top, right, bottom]}`, PIDS
-//! `[pid, ...]` (the app's processes), IDR, STOP (or its stdin closing);
+//! `[pid, ...]` (the app's processes), HWNDS `[hwnd, ...]` (windows of the app's whose
+//! processes aren't: what an older copy opened for the launch), IDR, STOP (or its stdin
+//! closing);
 //! from it: AU `[key]` then AVCC, CURSOR `[visible][u16 hot x][u16 hot y][u16 w][u16 h]`
 //! then straight RGBA, LOG text, ENDED why.
 //!
@@ -36,13 +38,14 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, ReleaseDC,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+use windows::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState};
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, SetEvent, SetThreadPriority, THREAD_PRIORITY_HIGHEST, WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, EnumWindows, GetCursorInfo, GetIconInfo, GetWindowRect, GetWindowThreadProcessId,
-    HICON, ICONINFO, IsIconic, IsWindowVisible,
+    CURSOR_SHOWING, CURSORINFO, EnumWindows, GW_OWNER, GetCursorInfo, GetIconInfo, GetWindow, GetWindowRect,
+    GetWindowThreadProcessId, HICON, ICONINFO, IsIconic, IsWindowVisible,
 };
 use windows::core::BOOL;
 
@@ -54,6 +57,7 @@ pub const START: u8 = 0x01;
 pub const PIDS: u8 = 0x02;
 pub const IDR: u8 = 0x03;
 pub const STOP: u8 = 0x04;
+pub const HWNDS: u8 = 0x05;
 pub const AU: u8 = 0x10;
 pub const CURSOR: u8 = 0x11;
 pub const LOG: u8 = 0x12;
@@ -168,8 +172,8 @@ unsafe extern "system" fn collect(h: HWND, l: LPARAM) -> BOOL {
 }
 
 /// the app's visible top-level windows, bottom to top: main windows, dialogs, menus,
-/// tooltips, whatever its processes show
-fn find(pids: &HashSet<u32>) -> Vec<isize> {
+/// tooltips, whatever its processes show, and the windows taken as its and what they own
+fn find(pids: &HashSet<u32>, taken: &HashSet<isize>) -> Vec<isize> {
     let mut all: Vec<HWND> = Vec::new();
     // SAFETY: collect only pushes to the Vec whose address it's given
     unsafe {
@@ -184,7 +188,8 @@ fn find(pids: &HashSet<u32>) -> Vec<isize> {
             }
             let mut pid = 0u32;
             GetWindowThreadProcessId(h, Some(&mut pid));
-            if !pids.contains(&pid) {
+            let owner = GetWindow(h, GW_OWNER).map_or(0, |o| o.0 as isize);
+            if !pids.contains(&pid) && !taken.contains(&(h.0 as isize)) && !taken.contains(&owner) {
                 continue;
             }
             let mut cloaked = 0u32;
@@ -261,8 +266,14 @@ fn grab(out: &Out, rx: &Receiver<(u8, Vec<u8>)>, wake: HANDLE) -> Result<(), Str
     let (pw, ph) = enc.padded();
     let mut yuv = crate::convert::Yuv::padded(w as usize, h as usize, pw, ph);
     out.log(&format!("capturing the app's windows into {w}x{h} at {fps} fps, {kbps} kbps"));
+    // while the app is streamed the session is in use: no idle display-off, sleep or the
+    // lock that follows them (a remote viewer's input isn't the console's). Lifted when
+    // this process ends
+    // SAFETY: a flag on this thread
+    unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
 
     let mut pids: HashSet<u32> = HashSet::new();
+    let mut taken: HashSet<isize> = HashSet::new();
     let mut placed: Vec<Placed> = Vec::new();
     // windows that couldn't be captured, not asked again
     let mut refused: HashSet<isize> = HashSet::new();
@@ -294,6 +305,11 @@ fn grab(out: &Out, rx: &Receiver<(u8, Vec<u8>)>, wake: HANDLE) -> Result<(), Str
                     pids = list.into_iter().collect();
                     found_at = Instant::now() - FIND_EVERY;
                 }
+                Ok((HWNDS, b)) => {
+                    let list: Vec<isize> = serde_json::from_slice(&b).unwrap_or_default();
+                    taken = list.into_iter().collect();
+                    found_at = Instant::now() - FIND_EVERY;
+                }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -301,7 +317,7 @@ fn grab(out: &Out, rx: &Receiver<(u8, Vec<u8>)>, wake: HANDLE) -> Result<(), Str
         // the app's windows: new ones captured, gone ones dropped, in their order
         if found_at.elapsed() >= FIND_EVERY {
             found_at = Instant::now();
-            let now_list = find(&pids);
+            let now_list = find(&pids, &taken);
             let mut keep: HashMap<isize, Placed> = placed.drain(..).map(|p| (p.win.hwnd, p)).collect();
             for hwnd in &now_list {
                 if let Some(p) = keep.remove(hwnd) {
@@ -621,6 +637,7 @@ impl Helper {
         out: &mut dyn Sink,
         display: RECT,
         pids: impl Fn() -> Vec<u32>,
+        taken: impl Fn() -> Vec<isize>,
     ) -> Result<(), String> {
         let start = json!({
             "w": v.w, "h": v.h, "fps": v.fps, "kbps": v.kbps,
@@ -630,6 +647,7 @@ impl Helper {
             return Err("the capture process didn't take the video".into());
         }
         let mut told: Vec<u32> = Vec::new();
+        let mut told_w: Vec<isize> = Vec::new();
         let mut asked = Instant::now() - Duration::from_secs(1);
         while !ctl.stop.load(std::sync::atomic::Ordering::Relaxed) {
             if asked.elapsed() >= Duration::from_millis(50) {
@@ -639,6 +657,12 @@ impl Helper {
                 if p != told {
                     self.send(PIDS, serde_json::to_string(&p).unwrap_or_default().as_bytes());
                     told = p;
+                }
+                let mut t = taken();
+                t.sort_unstable();
+                if t != told_w {
+                    self.send(HWNDS, serde_json::to_string(&t).unwrap_or_default().as_bytes());
+                    told_w = t;
                 }
             }
             if ctl.idr.swap(false, std::sync::atomic::Ordering::Relaxed) {

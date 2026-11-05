@@ -43,6 +43,8 @@ use crate::{info, warn};
 pub struct Seen {
     /// the app's processes: its job's, and those whose windows were taken as its
     pids: Mutex<Vec<u32>>,
+    /// windows taken as the app's whose processes aren't (an older copy's)
+    taken: Mutex<Vec<isize>>,
     /// the app's windows up now, and whether it ever had one
     windows: AtomicUsize,
     ever: AtomicBool,
@@ -163,6 +165,11 @@ impl Seen {
     pub fn pids(&self) -> Vec<u32> {
         self.pids.lock().unwrap().clone()
     }
+
+    /// windows of the app's whose processes aren't its
+    pub fn taken(&self) -> Vec<isize> {
+        self.taken.lock().unwrap().clone()
+    }
 }
 
 fn ticks(f: FILETIME) -> u64 {
@@ -231,6 +238,10 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
     // processes outside the job taken as the app's, and those looked at and not
     let mut adopted: HashSet<u32> = HashSet::new();
     let mut looked: HashMap<u32, bool> = HashMap::new();
+    // the desktop's windows when the app started, and windows (not their processes)
+    // taken as the app's since: one an app already running opened for the launch
+    let before: HashSet<isize> = top_windows().into_iter().map(|w| w.0.0 as isize).collect();
+    let mut taken: HashSet<isize> = HashSet::new();
     let (mut own_shown, mut said_none, mut said_lost) = (false, false, false);
     while !stop.load(Ordering::Relaxed) {
         match display::rect_of(display) {
@@ -239,10 +250,20 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
                 let early = t0.elapsed() < ADOPT_FOR && !own_shown;
                 let mut strangers = Vec::new();
                 for (h, kind, pid) in top_windows() {
+                    let hv = h.0 as isize;
+                    // a new window of a process one of whose windows was taken: its dialog
+                    let kin = !before.contains(&hv)
+                        && taken.iter().any(|&t| {
+                            let mut p = 0u32;
+                            // SAFETY: a query on a handle that may have gone, which only fails
+                            unsafe { GetWindowThreadProcessId(HWND(t as *mut c_void), Some(&mut p)) };
+                            p == pid
+                        });
                     let ours = if in_job(h, job) {
                         own_shown = true;
                         true
-                    } else if adopted.contains(&pid) {
+                    } else if adopted.contains(&pid) || taken.contains(&hv) || kin {
+                        taken.insert(hv);
                         true
                     } else {
                         if early {
@@ -260,16 +281,24 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
                             });
                             if take {
                                 adopted.insert(pid);
+                            } else if !before.contains(&hv)
+                                && process_of(pid).is_some_and(|(exe, _)| !SHELL.contains(&exe.as_str()))
+                            {
+                                // an older process, but a window new since the launch: the
+                                // launch handed to a copy already running. That window
+                                // alone, never the process's others
+                                info!("window {hv:#x} (pid {pid}), new since the launch, taken as the app's");
+                                taken.insert(hv);
                             }
                         }
-                        if !adopted.contains(&pid) && !said_none {
+                        if !adopted.contains(&pid) && !taken.contains(&hv) && !said_none {
                             strangers.push(pid);
                         }
-                        adopted.contains(&pid)
+                        adopted.contains(&pid) || taken.contains(&hv)
                     };
                     if ours {
                         let first = seen.insert(h.0 as isize);
-                        if first && adopted.contains(&pid) {
+                        if first && (adopted.contains(&pid) || taken.contains(&hv)) {
                             out.adopted.lock().unwrap().push(h.0 as isize);
                         }
                         place(h, kind, mon, first);
@@ -304,6 +333,9 @@ fn follow(job: HANDLE, display: &str, stop: &AtomicBool, launched: u64, out: &Se
         let mut pids = super::process::pids_of(job);
         pids.extend(adopted.iter().copied());
         *out.pids.lock().unwrap() = pids;
+        // SAFETY: IsWindow takes any value
+        taken.retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
+        *out.taken.lock().unwrap() = taken.iter().copied().collect();
         if !seen.is_empty() {
             out.ever.store(true, Ordering::Relaxed);
         }
