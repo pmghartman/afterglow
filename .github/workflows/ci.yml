@@ -1,21 +1,19 @@
-# the TypeScript client (src/) typed, formatted and tested, and the host's link framing
-# (host/src/phos_wire.h) built and tested on its own: on every push to main, every pull
-# request, and before each release (release.yml calls this). The host's full Windows
-# build is host.yml
+# every push to main and every pull request: the TypeScript client typed, formatted
+# and tested, and the host's link framing (host/test/wire_test.cpp) built and run.
+# The release runs it too
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
   workflow_call:
 
 permissions:
   contents: read
 
 jobs:
-  client:
+  test:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -25,10 +23,4 @@ jobs:
       - run: bun run check
       - run: bun run lint
       - run: bun test
-
-  wire:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: mkdir -p build && c++ -std=c++20 -Wall -Wextra -Werror -Ihost/src host/test/wire_test.cpp -o build/wire_test && ./build/wire_test
+      - run: bun run test:wire

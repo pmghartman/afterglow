@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # afterglow built and staged, in an MSYS2 UCRT64 shell (its packages in
-# .github/workflows/host.yml): afterglow.exe and its service, the shaders it
+# .github/workflows/release.yml, its windows job): afterglow.exe and its service, the shaders it
 # compiles at run time, zlib1.dll that OpenSSL loads, the licence and where the
 # source is. The signed SudoVDA driver package is staged by the workflow after it.
 # usage: build.sh OUT_DIR [VERSION]

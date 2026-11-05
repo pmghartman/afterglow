@@ -16,7 +16,7 @@ bun run fmt
 bun run check && bun run lint && bun test && bun run test:wire
 ```
 
-CI runs the same checks on every pull request; changes under `host/` also get the full Windows build.
+CI runs the same checks on every pull request. The Windows host build runs only in the release; to try a host change, run **release** with **Build only**.
 
 ## Where things go
 

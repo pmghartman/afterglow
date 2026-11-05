@@ -31,7 +31,7 @@ Apps launch in the session signed in at the console. With SudoVDA installed, eac
 
 ## Building
 
-Windows only, in MSYS2 UCRT64. [`.github/workflows/host.yml`](../.github/workflows/host.yml) lists the packages, then:
+Windows only, in MSYS2 UCRT64. The `windows` job in [`.github/workflows/release.yml`](../.github/workflows/release.yml) lists the packages, then:
 
 ```bash
 git submodule update --init --recursive
