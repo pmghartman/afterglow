@@ -20,6 +20,25 @@ pub struct Conf {
     pub encoder: String,
     /// Linux: the Xvfb that gives an app a display of its own; `Xvfb` on the PATH when empty
     pub xvfb: String,
+    /// served on stdin and stdout for one app, not on a port for any
+    pub stdio: bool,
+}
+
+impl Conf {
+    /// for `--stdio`: no port, no token (whatever started us let the driver in)
+    pub fn stdio() -> Conf {
+        Conf {
+            port: 0,
+            token: String::new(),
+            log_path: None,
+            log_level: crate::log::Level::Warning,
+            primary: false,
+            adapter: String::new(),
+            encoder: std::env::var("AFTERGLOW_ENCODER").unwrap_or_default(),
+            xvfb: std::env::var("AFTERGLOW_XVFB").unwrap_or_default(),
+            stdio: true,
+        }
+    }
 }
 
 pub fn parse(text: &str) -> Result<Conf, String> {
@@ -32,6 +51,7 @@ pub fn parse(text: &str) -> Result<Conf, String> {
         adapter: String::new(),
         encoder: String::new(),
         xvfb: String::new(),
+        stdio: false,
     };
     for line in text.lines() {
         let line = line.trim();

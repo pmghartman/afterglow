@@ -1,10 +1,12 @@
-//! The link: one loopback TCP connection from a driver (docs/protocol.md). Each
-//! encoded frame is reshaped once into the AVCC the viewer's decoder takes (wire.rs)
-//! and written to the socket; input comes back on it as input packets (input.rs).
+//! The link: one loopback TCP connection from a driver (docs/protocol.md), or the
+//! process's own stdin and stdout (`--stdio`, run over ssh as the viewer's login). Each
+//! encoded frame is shaped once into the AVCC the viewer's decoder takes (wire.rs)
+//! and written out; input comes back as input packets (input.rs).
 //!
-//! One driver at a time: a new connection that says the token takes over and the old
-//! one is closed. One app at a time, kept running between connections and videos so a
-//! viewer that comes back (or a resize) resumes it.
+//! On TCP, one driver at a time: a new connection that says the token takes over and
+//! the old one is closed. One app at a time, kept running between connections and
+//! videos so a viewer that comes back (or a resize) resumes it. Over stdio there's one
+//! driver, already let in by ssh: when it goes, the app and afterglow go too.
 
 use std::io::{IoSlice, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -27,8 +29,10 @@ pub const VERSION: &str = match option_env!("AFTERGLOW_VERSION") {
 
 /// one connection from a driver: writes from any thread, one at a time
 struct Conn {
-    sock: Mutex<TcpStream>,
+    out: Mutex<Box<dyn Write + Send>>,
     dead: AtomicBool,
+    /// what ends it for both sides: the socket shut down
+    end: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Conn {
@@ -41,13 +45,13 @@ impl Conn {
         if a.is_empty() && b.is_empty() {
             return true;
         }
-        let mut s = self.sock.lock().unwrap();
+        let mut s = self.out.lock().unwrap();
         if self.dead.load(Ordering::Relaxed) {
             return false;
         }
-        if write_both(&mut s, a, b).is_err() {
+        if write_both(&mut **s, a, b).and_then(|_| s.flush()).is_err() {
             self.dead.store(true, Ordering::Relaxed);
-            let _ = s.shutdown(Shutdown::Both);
+            (self.end)();
         }
         !self.dead.load(Ordering::Relaxed)
     }
@@ -57,13 +61,25 @@ impl Conn {
     }
 
     fn close(&self) {
-        let s = self.sock.lock().unwrap();
+        let _s = self.out.lock().unwrap();
         self.dead.store(true, Ordering::Relaxed);
-        let _ = s.shutdown(Shutdown::Both);
+        (self.end)();
+    }
+
+    fn tcp(s: &TcpStream) -> Option<Conn> {
+        let w = s.try_clone().ok()?;
+        let e = s.try_clone().ok()?;
+        Some(Conn {
+            out: Mutex::new(Box::new(w)),
+            dead: AtomicBool::new(false),
+            end: Box::new(move || {
+                let _ = e.shutdown(Shutdown::Both);
+            }),
+        })
     }
 }
 
-fn write_both(s: &mut TcpStream, mut a: &[u8], mut b: &[u8]) -> std::io::Result<()> {
+fn write_both(s: &mut dyn Write, mut a: &[u8], mut b: &[u8]) -> std::io::Result<()> {
     while !a.is_empty() || !b.is_empty() {
         let n = s.write_vectored(&[IoSlice::new(a), IoSlice::new(b)])?;
         if n == 0 {
@@ -114,9 +130,12 @@ struct State {
 
 pub struct Link<H: Host> {
     host: Arc<H>,
-    token: String,
+    /// what a driver says first; none over stdio, where ssh let it in
+    token: Option<String>,
     input: Input,
     state: Mutex<State>,
+    /// the driver the host's notes go to
+    notes_to: Arc<Mutex<Option<Arc<Conn>>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -129,8 +148,64 @@ fn num(j: &Value, k: &str, d: i64, lo: i64, hi: i64) -> i64 {
 
 impl<H: Host> Link<H> {
     pub fn new(host: Arc<H>, token: String, shutdown: Arc<AtomicBool>) -> Arc<Link<H>> {
+        Self::make(host, Some(token), shutdown)
+    }
+
+    /// a link for one driver on stdin and stdout, let in by whatever started us
+    pub fn stdio(host: Arc<H>, shutdown: Arc<AtomicBool>) -> Arc<Link<H>> {
+        Self::make(host, None, shutdown)
+    }
+
+    fn make(host: Arc<H>, token: Option<String>, shutdown: Arc<AtomicBool>) -> Arc<Link<H>> {
         let input = Input::new(host.clone());
-        Arc::new(Link { host, token, input, state: Mutex::default(), shutdown })
+        let notes_to: Arc<Mutex<Option<Arc<Conn>>>> = Arc::default();
+        let to = notes_to.clone();
+        host.on_notes(Arc::new(move |v: Value| {
+            if let Some(c) = to.lock().unwrap().clone() {
+                c.json(msg_out::NOTE, v);
+            }
+        }));
+        Arc::new(Link { host, token, input, state: Mutex::default(), notes_to, shutdown })
+    }
+
+    /// serve the one driver on stdin and stdout until it goes (or a signal), then end
+    /// the app
+    pub fn serve_stdio(self: &Arc<Self>) {
+        // SAFETY: fds 0 and 1 are the process's, read and written here alone; stdout
+        // unbuffered as a File, so no frame is copied into a line buffer first
+        #[cfg(unix)]
+        let (input, output): (Box<dyn Read + Send>, Box<dyn Write + Send>) = unsafe {
+            use std::os::fd::FromRawFd;
+            (Box::new(std::fs::File::from_raw_fd(0)), Box::new(std::fs::File::from_raw_fd(1)))
+        };
+        // flushed after every message, so the line buffer holds nothing back
+        #[cfg(not(unix))]
+        let (input, output): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+            (Box::new(std::io::stdin()), Box::new(std::io::stdout()));
+        let c = Arc::new(Conn { out: Mutex::new(output), dead: AtomicBool::new(false), end: Box::new(|| {}) });
+        let me = self.clone();
+        let _ = thread::Builder::new().name("watch".into()).spawn(move || {
+            me.watch(None);
+            // a signal: everything put away and gone, whatever stdin is doing
+            me.finish();
+            std::process::exit(0);
+        });
+        self.serve(c, input);
+        self.finish();
+    }
+
+    /// the video stopped, the driver let go, the app ended
+    fn finish(&self) {
+        let mut st = self.lock();
+        self.stop_video(&mut st);
+        if let Some(c) = st.current.take() {
+            c.close();
+        }
+        *self.notes_to.lock().unwrap() = None;
+        if st.launched {
+            self.host.terminate();
+            st.launched = false;
+        }
     }
 
     /// serve on 127.0.0.1:port until shutdown is raised
@@ -145,7 +220,8 @@ impl<H: Host> Link<H> {
 
     pub fn serve_on(self: &Arc<Self>, listener: TcpListener, addr: SocketAddr) {
         let me = self.clone();
-        let watcher = thread::Builder::new().name("watch".into()).spawn(move || me.watch(addr)).expect("a thread");
+        let watcher =
+            thread::Builder::new().name("watch".into()).spawn(move || me.watch(Some(addr))).expect("a thread");
         for s in listener.incoming() {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -157,21 +233,13 @@ impl<H: Host> Link<H> {
             let _ = s.set_nodelay(true);
             // a stalled driver fails the write rather than holding the video forever
             let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
-            let Ok(w) = s.try_clone() else { continue };
-            let c = Arc::new(Conn { sock: Mutex::new(w), dead: AtomicBool::new(false) });
+            let Some(c) = Conn::tcp(&s) else { continue };
+            let c = Arc::new(c);
             let me = self.clone();
             let _ = thread::Builder::new().name("conn".into()).spawn(move || me.serve(c, s));
         }
         let _ = watcher.join();
-        let mut st = self.lock();
-        self.stop_video(&mut st);
-        if let Some(c) = st.current.take() {
-            c.close();
-        }
-        if st.launched {
-            self.host.terminate();
-            st.launched = false;
-        }
+        self.finish();
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -179,7 +247,7 @@ impl<H: Host> Link<H> {
     }
 
     /// the capture ending and the app quitting on their own, told to the driver
-    fn watch(&self, addr: SocketAddr) {
+    fn watch(&self, wake: Option<SocketAddr>) {
         while !self.shutdown.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(250));
             let mut st = self.lock();
@@ -197,14 +265,16 @@ impl<H: Host> Link<H> {
             st.launched = false;
             self.stop_video(&mut st);
             if let Some(c) = &st.current {
-                c.json(msg_out::EXITED, json!({}));
+                c.json(msg_out::EXITED, self.host.exit_info());
             }
         }
         // the accept loop woken to see the shutdown
-        let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+        if let Some(addr) = wake {
+            let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+        }
     }
 
-    fn serve(&self, c: Arc<Conn>, mut s: TcpStream) {
+    fn serve(&self, c: Arc<Conn>, mut s: impl Read) {
         let mut reader = wire::Reader::default();
         let mut hello = false;
         let mut buf = vec![0u8; 64 << 10];
@@ -218,7 +288,9 @@ impl<H: Host> Link<H> {
             }
             while let Some((ty, body)) = reader.next_message() {
                 if !hello {
-                    if ty != msg_in::HELLO || !wire::same_token(&body, self.token.as_bytes()) {
+                    let ok = ty == msg_in::HELLO
+                        && self.token.as_ref().is_none_or(|t| wire::same_token(&body, t.as_bytes()));
+                    if !ok {
                         warn!("a connection without the token, closed");
                         break 'read;
                     }
@@ -238,6 +310,7 @@ impl<H: Host> Link<H> {
             // nobody to send to: the video stopped, the app kept for whoever comes next
             self.stop_video(&mut st);
             st.current = None;
+            *self.notes_to.lock().unwrap() = None;
             info!("the driver left");
         }
         c.close();
@@ -251,6 +324,7 @@ impl<H: Host> Link<H> {
             info!("a new driver took over");
         }
         st.current = Some(c.clone());
+        *self.notes_to.lock().unwrap() = Some(c.clone());
         let running = st.launched && self.host.running();
         c.json(
             msg_out::READY,
@@ -291,6 +365,23 @@ impl<H: Host> Link<H> {
                 }
                 c.json(msg_out::EXITED, json!({}));
             }
+            msg_in::CLOSE => {
+                // as the app's own close button: it may ask to save. Where that can't be
+                // asked, ended as quit ends it
+                if self.lock().launched && !self.host.close() {
+                    self.handle(c, msg_in::QUIT, Vec::new());
+                }
+            }
+            msg_in::CLIP => {
+                if self.lock().launched {
+                    self.host.clip(&String::from_utf8_lossy(&body));
+                }
+            }
+            msg_in::RAISE => {
+                if let (true, Ok(b)) = (self.lock().launched, <[u8; 4]>::try_from(&body[..])) {
+                    self.host.raise(u32::from_le_bytes(b));
+                }
+            }
             msg_in::LAUNCH => self.launch(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
             msg_in::VIDEO => self.video(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
             _ => {}
@@ -306,7 +397,7 @@ impl<H: Host> Link<H> {
         let mut st = self.lock();
         let fresh = j.get("fresh").and_then(Value::as_bool).unwrap_or(false);
         if st.launched && self.host.running() && !fresh {
-            c.json(msg_out::LAUNCHED, json!({"ok": true, "resumed": true}));
+            c.json(msg_out::LAUNCHED, json!({"ok": true, "resumed": true, "features": self.host.features()}));
             return;
         }
         let l = Launch {
@@ -316,6 +407,14 @@ impl<H: Host> Link<H> {
             h: (num(&j, "h", 720, 64, 4320) & !1) as u32,
             fps: num(&j, "fps", 60, 10, 240) as u32,
             virtual_display: j.get("virtual_display").and_then(Value::as_bool).unwrap_or(true),
+            argv: j
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
+            dpi: num(&j, "dpi", 96, 48, 480) as u32,
+            scale: j.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(1.0, 4.0) as f32,
+            dbus: j.get("dbus").and_then(Value::as_bool).unwrap_or(false),
         };
         self.stop_video(&mut st);
         if st.launched {
@@ -328,10 +427,13 @@ impl<H: Host> Link<H> {
                 st.launched = true;
                 let ms = t0.elapsed().as_millis() as u64;
                 info!("launched [{}] in {ms}ms", l.name);
-                c.json(msg_out::LAUNCHED, json!({"ok": true, "resumed": false, "ms": ms}));
+                c.json(
+                    msg_out::LAUNCHED,
+                    json!({"ok": true, "resumed": false, "ms": ms, "features": self.host.features()}),
+                );
             }
             Err(e) => {
-                warn!("launch of [{}] failed: {}", l.cmd, e.error);
+                warn!("launch of [{}] failed: {}", l.argv.first().unwrap_or(&l.cmd), e.error);
                 let mut r = json!({"ok": false, "error": e.error});
                 if let Some(code) = e.code {
                     r["code"] = code.into();

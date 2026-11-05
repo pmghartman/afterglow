@@ -236,4 +236,48 @@ describe("afterglow source", () => {
     expect(next.frames[0]!.data[FrameRoom + 4]).toBe(0x65);
     src.quit();
   });
+
+  test("notes, the clipboard, a window raised, a polite close and how the app ended", async () => {
+    fake = new FakeAfterglow("t0ken-t0ken-t0ken-4", (f, type) => {
+      if (type === In.launch)
+        f.send(jsonMessage(Out.launched, { ok: true, features: ["notes", "clipboard", "raise", "close"] }));
+      if (type === In.close) f.send(jsonMessage(Out.exited, { code: 0, log: "bye\n" }));
+    });
+    const src = new AfterglowSource({
+      link: { port: fake.port, token: fake.token },
+      target: "",
+      argv: ["/usr/bin/gedit", "--new-window"],
+      dbus: true,
+      virtualDisplay: true,
+    });
+    const d = new Driver();
+    await src.open(opened(1280, 720), d);
+    expect(bodyJson(fake.sent(In.launch)[0]!.body)).toMatchObject({
+      argv: ["/usr/bin/gedit", "--new-window"],
+      dbus: true,
+      dpi: 96,
+      scale: 1,
+    });
+    const says: Record<string, unknown>[] = [];
+    (d as unknown as { say: (m: Record<string, unknown>) => void }).say = (m) => void says.push(m);
+    fake.send(jsonMessage(Out.note, { t: "title", s: "notes.txt" }));
+    fake.send(jsonMessage(Out.note, { t: "windows", list: [[7, "notes.txt"]], main: 7 }));
+    fake.send(jsonMessage(Out.note, { t: "clip", s: "copied on the host" }));
+    await settle();
+    expect(d.metas).toContainEqual({ t: "title", s: "notes.txt" });
+    expect(d.metas).toContainEqual({ t: "windows", list: [[7, "notes.txt"]], main: 7 });
+    expect(says).toEqual([{ t: "clip", s: "copied on the host" }]);
+    // the viewer's clipboard goes to the host at once, not typed at the next paste
+    src.input(["clip", "from the viewer"], 1280, 720);
+    src.input(["raise", 7], 1280, 720);
+    await settle();
+    expect(new TextDecoder().decode(fake.sent(In.clip)[0]!.body)).toBe("from the viewer");
+    expect(Array.from(fake.sent(In.raise)[0]!.body)).toEqual([7, 0, 0, 0]);
+    // closed as its close button: the app ends when it's ready to, saying how
+    src.close();
+    await settle();
+    expect(fake.sent(In.close).length).toBe(1);
+    expect(fake.sent(In.quit).length).toBe(0);
+    expect(d.exits).toEqual([""]);
+  });
 });

@@ -31,6 +31,7 @@ export {
   message as linkMessage,
   Out,
   type Ready,
+  type Transport,
 } from "./afterglow/link.ts";
 export { AfterglowSource, type AfterglowTarget } from "./afterglow/source.ts";
 

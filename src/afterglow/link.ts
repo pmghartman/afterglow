@@ -14,6 +14,12 @@ export const In = {
   input: 0x06,
   quit: 0x07,
   ping: 0x08,
+  // the viewer's clipboard, for the app's own paste
+  clip: 0x09,
+  // u32 LE: a window from a windows note brought to the front
+  raise: 0x0a,
+  // ask the app to close as its own close button does
+  close: 0x0b,
 } as const;
 
 export const Out = {
@@ -21,6 +27,8 @@ export const Out = {
   launched: 0x82,
   exited: 0x83,
   videoEnded: 0x84,
+  // JSON {t: "title" | "windows" | "clip", ...}
+  note: 0x85,
   pong: 0x88,
   config: 0x90,
   frame: 0x91,
@@ -135,24 +143,49 @@ export type LinkEvents = {
 // where afterglow listens and what it wants said first, as phosphorus wrote it
 export type LinkAddr = { port: number; token: string; host?: string };
 
+// a byte stream to an afterglow some other way: `afterglow --stdio` run over ssh, say.
+// Its writes are whole messages, in order; what comes back is the link's bytes however cut
+export interface Transport {
+  write(b: Uint8Array): void;
+  onData(f: (b: Uint8Array) => void): void;
+  onClose(f: () => void): void;
+  close(): void;
+}
+
 // one connection: open, the token said, afterglow's ready answer back
 export class Link {
   private sock?: Awaited<ReturnType<typeof Bun.connect>>;
+  private pipe?: Transport;
   private queue: Uint8Array[] = [];
   private closed = false;
   private waiting = new Map<number, ((m: Uint8Array) => void)[]>();
   ready?: Ready;
 
   constructor(
-    private addr: LinkAddr,
+    private addr: LinkAddr | Transport,
     private ev: LinkEvents,
   ) {}
 
   async open(timeoutMs = 3000): Promise<Ready> {
     const reader = new LinkReader((m) => this.got(m));
+    if (!("port" in this.addr)) {
+      // a stream already let in by whatever carries it: the hello says nothing
+      const p = this.addr;
+      this.pipe = p;
+      p.onData((d) => {
+        reader.feed(d);
+        if (reader.broken) this.close("afterglow sent a message past the limit");
+      });
+      p.onClose(() => this.close("afterglow closed the link"));
+      const r = this.next(Out.ready, timeoutMs);
+      this.send(In.hello, "");
+      this.ready = jsonOf(await r) as unknown as Ready;
+      return this.ready;
+    }
+    const addr = this.addr;
     this.sock = await Bun.connect({
-      hostname: this.addr.host ?? "127.0.0.1",
-      port: this.addr.port,
+      hostname: addr.host ?? "127.0.0.1",
+      port: addr.port,
       socket: {
         data: (_s, d) => {
           reader.feed(d);
@@ -165,7 +198,7 @@ export class Link {
     });
     this.sock.setNoDelay(true);
     const r = this.next(Out.ready, timeoutMs);
-    this.send(In.hello, this.addr.token);
+    this.send(In.hello, addr.token);
     this.ready = jsonOf(await r) as unknown as Ready;
     return this.ready;
   }
@@ -201,6 +234,7 @@ export class Link {
   send(type: number, body?: Uint8Array | string) {
     if (this.closed) return;
     const m = message(type, body);
+    if (this.pipe) return this.pipe.write(m);
     if (this.queue.length) {
       this.queue.push(m);
       return;
@@ -233,6 +267,7 @@ export class Link {
     if (this.closed) return;
     this.closed = true;
     this.sock?.end();
+    this.pipe?.close();
     this.ev.closed(why);
   }
 }

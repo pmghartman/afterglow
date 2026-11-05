@@ -91,7 +91,21 @@ src.keyframe();
 src.quit();
 ```
 
-On Linux the target is a program's path (`/usr/bin/gedit`); with `virtualDisplay` it runs on an Xvfb of its own, otherwise on the session's `$DISPLAY`.
+On Linux the target is a program's path (`/usr/bin/gedit`), or `argv` the program and its arguments; with `virtualDisplay` it runs on an Xvfb of its own, otherwise on the session's `$DISPLAY`.
+
+Or drive `afterglow --stdio` over any byte stream, ssh's as the viewer's login say: no port, no token, the app ended when the stream closes.
+
+```ts
+const src = new AfterglowSource({
+  transport: () => sshChannel("/var/lib/phosphorus/afterglow/afterglow --stdio"), // { write, onData, onClose, close }
+  target: "",
+  argv: ["/usr/bin/gedit", "--new-window"],
+  dbus: true,
+  virtualDisplay: true,
+});
+```
+
+The app's title and windows come as `sink.meta({ t: "title" | "windows" })`, what it copies as `sink.say({ t: "clip" })`; `["clip", text]` makes the viewer's clipboard the app's, `["raise", id]` brings a window forward, `close()` asks it to close as its close button would.
 
 Input goes in as small arrays and leaves as afterglow's input packets ([`src/afterglow/input.ts`](src/afterglow/input.ts)):
 
@@ -102,7 +116,8 @@ Input goes in as small arrays and leaves as afterglow's input packets ([`src/aft
 | `["w", dx, dy]` | wheel, in notches |
 | `["k", down, code, key, chord]` | a key by its `KeyboardEvent.code` and `.key`; sent as text where the viewer's layout differs from US |
 | `["x", text]` | text typed |
-| `["clip", text]` | the viewer's clipboard: the next Ctrl+V types it |
+| `["clip", text]` | the viewer's clipboard: the app's own (Linux, a display of its own), or typed at the next Ctrl+V |
+| `["raise", id]` | one of the app's windows (from a `windows` note) to the front |
 
 The pointer's shape comes as `sink.meta({ t: "cursor", png, x, y })` (base64 PNG, hotspot), or `{ t: "cursor", name: "none" }` when hidden, for the page to set as its CSS cursor. `drawCursor: true` has the host draw it into the frames instead (`{ t: "cursor", name: "blank" }` then hides the page's).
 
@@ -127,7 +142,7 @@ To install it, an app (Phosphorus's is [`packages/host/host/src/win/afterglow.ts
 2. installs SudoVDA with `drivers\sudovda\install.bat` unless the machine already has it;
 3. creates a service running `tools\afterglowsvc.exe "<path to afterglow.conf>"` (`svcBinPath`).
 
-`afterglow-X.Y-linux-x86_64.tar.gz` holds `afterglow` and the same text files. It needs glibc 2.36 or later, X11 and, for apps on displays of their own, `Xvfb` (Debian and Ubuntu: `xvfb`). To install it, an app:
+`afterglow-X.Y-linux-x86_64.tar.gz` and `afterglow-X.Y-linux-aarch64.tar.gz` hold `afterglow` and the same text files. It needs glibc 2.36 or later, X11 and, for apps on displays of their own, `Xvfb` (Debian and Ubuntu: `xvfb`). To install it, an app:
 
 1. writes `afterglow.conf` and `link.json` with `confText` and `linkText`, readable by the user the apps run as and no one else;
 2. installs a systemd unit from `unitText(<path to afterglow>, <path to afterglow.conf>, <user>)`, enabled and started.
@@ -170,7 +185,7 @@ bun run bench
   - after a resize the display follows;
   - quit closes it.
 
-  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display.
+  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display. Over `--stdio`: an app by its argv, its title and windows as notes, the viewer's clipboard pasted by its own paste, a polite close, an app that dies before a window with its code and output.
 - `bench` builds the host and times input to frame: a key echoed and a key that flips the whole screen, at 720p and 1080p, and open to first frame.
 
 The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the archive lays it out:

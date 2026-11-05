@@ -1,8 +1,8 @@
 //! What the link asks of a platform: start and watch one app, capture and encode its
 //! display, inject the viewer's input.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::input::Inject;
 
@@ -16,6 +16,15 @@ pub struct Launch {
     pub fps: u32,
     /// a display of its own at w×h, where the platform has one to give
     pub virtual_display: bool,
+    /// Linux: the program and its arguments, in place of cmd
+    pub argv: Vec<String>,
+    /// the display's dots per inch, and the viewer's pixel ratio (1.5 and up: the
+    /// toolkits told to scale)
+    pub dpi: u32,
+    pub scale: f32,
+    /// Linux: a session bus of the app's own, so a single-instance app starts here
+    /// rather than handing its window to a copy on the host's own screen
+    pub dbus: bool,
 }
 
 #[derive(Debug)]
@@ -98,6 +107,10 @@ pub trait Sink {
     fn cursor(&mut self, c: &Cursor) -> bool;
 }
 
+/// what the host tells the driver besides frames: `{t: "title", s}`, `{t: "windows",
+/// list: [[id, title]], main}`, `{t: "clip", s}` (the host's clipboard)
+pub type Notes = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
 pub trait Host: Inject + Send + Sync + 'static {
     fn hostname(&self) -> String;
     /// whether an app can have a virtual display of its own here
@@ -111,4 +124,25 @@ pub trait Host: Inject + Send + Sync + 'static {
     /// capture and encode until ctl.stop is raised or the sink says stop (Ok), or the
     /// capture fails (Err, why). Runs on its own thread; the first frame a keyframe
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String>;
+
+    /// where the host's notes go, set once by the link
+    fn on_notes(&self, _f: Notes) {}
+    /// what the launched app can be asked besides input: some of "clipboard", "raise",
+    /// "close", "notes"
+    fn features(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+    /// the viewer's clipboard made the app's, so its own paste pastes it
+    fn clip(&self, _text: &str) {}
+    /// one of the app's windows (an id from a windows note) brought to the front
+    fn raise(&self, _id: u32) {}
+    /// the app asked to close as its own close button would; false where it can't be
+    /// (the driver's close then ends it)
+    fn close(&self) -> bool {
+        false
+    }
+    /// how the app ended, once it has: `{code, log, error}`, any of them
+    fn exit_info(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
 }

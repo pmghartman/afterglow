@@ -1,4 +1,6 @@
-//! afterglow.exe <afterglow.conf>: the link served until shutdown
+//! afterglow <afterglow.conf>: the link served until shutdown
+//! afterglow --stdio: one driver on stdin and stdout (ssh's), the app ended with it
+//! afterglow --features: what this build serves, one line, for a driver probing a host
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -6,15 +8,22 @@ use std::sync::atomic::AtomicBool;
 use afterglow::link::{Link, VERSION};
 use afterglow::{conf, error, info, log, platform};
 
+/// what a driver can count on from this build
+const FEATURES: &str = "stdio argv notes clipboard raise close cursor";
+
 fn main() {
     let arg = std::env::args().nth(1);
     let Some(path) = arg.filter(|a| a != "--help") else {
-        eprintln!("usage: afterglow <afterglow.conf>\n       afterglow --version");
+        eprintln!(
+            "usage: afterglow <afterglow.conf>\n       afterglow --stdio\n       afterglow --version | --features"
+        );
         std::process::exit(2);
     };
-    if path == "--version" {
-        println!("afterglow {VERSION}");
-        return;
+    match path.as_str() {
+        "--version" => return println!("afterglow {VERSION}"),
+        "--features" => return println!("afterglow {VERSION} {FEATURES}"),
+        "--stdio" => return stdio(),
+        _ => {}
     }
     let conf = match std::fs::read_to_string(&path)
         .map_err(|e| format!("can't read {path}: {e}"))
@@ -42,4 +51,24 @@ fn main() {
         std::process::exit(1);
     }
     info!("shut down");
+}
+
+/// the link on stdin and stdout: nothing but the link's bytes on stdout, the log on
+/// stderr (warnings and worse, or AFTERGLOW_LOG's level) or AFTERGLOW_LOG_FILE
+fn stdio() {
+    let level = std::env::var("AFTERGLOW_LOG").map_or(log::Level::Warning, |v| log::Level::parse(&v));
+    let file = std::env::var_os("AFTERGLOW_LOG_FILE").map(std::path::PathBuf::from);
+    log::init(level, file.as_deref());
+    let conf = conf::Conf::stdio();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    platform::on_shutdown(shutdown.clone());
+    let host = match platform::open(&conf) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    info!("afterglow {VERSION} on stdio");
+    Link::stdio(host, shutdown).serve_stdio();
 }

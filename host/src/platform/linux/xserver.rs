@@ -9,20 +9,15 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
-use x11rb::protocol::Event;
 use x11rb::protocol::randr::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, EventMask, InputFocus,
-};
+use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
-use crate::{debug, info, warn};
+use super::wm::Wm;
+use crate::{info, warn};
 
 /// where an X server is and how to get in
 #[derive(Clone)]
@@ -72,15 +67,15 @@ fn random(n: usize) -> Result<Vec<u8>, String> {
 pub struct Xvfb {
     child: Child,
     pub display: Display,
-    stop: Arc<AtomicBool>,
-    wm: Option<JoinHandle<()>>,
+    /// the window manager inside afterglow that runs its windows
+    pub wm: Option<Wm>,
 }
 
 /// the framebuffer Xvfb gets: what a viewer's size can grow to without a new server
 pub const MAX: (u16, u16) = (3840, 2160);
 
 impl Xvfb {
-    pub fn start(bin: &str, w: u16, h: u16) -> Result<Xvfb, String> {
+    pub fn start(bin: &str, w: u16, h: u16, dpi: u32) -> Result<Xvfb, String> {
         let cookie = random(16)?;
         let tag = random(6)?.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let auth = std::env::temp_dir().join(format!("afterglow-{tag}.xauth"));
@@ -109,7 +104,7 @@ impl Xvfb {
         let mut cmd = Command::new(bin);
         cmd.args(["-displayfd", &fds[1].to_string()])
             .args(["-screen", "0", &format!("{}x{}x24", size.0, size.1)])
-            .args(["-nolisten", "tcp", "-noreset", "-auth"])
+            .args(["-nolisten", "tcp", "-noreset", "-dpi", &dpi.to_string(), "-auth"])
             .arg(&auth);
         if let Some(d) = &fbdir {
             cmd.arg("-fbdir").arg(d);
@@ -146,19 +141,17 @@ impl Xvfb {
         write_auth(&number)?;
         let fb = fbdir.map(|d| d.join("Xvfb_screen0")).filter(|f| f.is_file());
         let display = Display { name: format!(":{number}"), cookie: Some(cookie), auth: Some(auth), fb };
-        let mut x = Xvfb { child, display, stop: Arc::new(AtomicBool::new(false)), wm: None };
-        let (conn, screen) = x.display.connect()?;
-        resize(&conn, conn.setup().roots[screen].root, w, h);
-        let (d, stop) = (x.display.clone(), x.stop.clone());
-        x.wm = Some(thread::Builder::new().name("wm".into()).spawn(move || wm(&d, &stop)).map_err(|e| e.to_string())?);
+        let mut x = Xvfb { child, display, wm: None };
+        x.fit(w, h, dpi)?;
+        x.wm = Some(Wm::start(&x.display)?);
         info!("Xvfb on {} at {w}x{h}", x.display.name);
         Ok(x)
     }
 
-    /// its screen set to w×h, for an app taking up a spare one
-    pub fn fit(&self, w: u16, h: u16) -> Result<(), String> {
+    /// its screen set to w×h at dpi, for an app taking up a spare one
+    pub fn fit(&self, w: u16, h: u16, dpi: u32) -> Result<(), String> {
         let (conn, screen) = self.display.connect()?;
-        resize(&conn, conn.setup().roots[screen].root, w, h);
+        resize(&conn, conn.setup().roots[screen].root, w, h, dpi);
         Ok(())
     }
 
@@ -170,12 +163,10 @@ impl Xvfb {
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // its window manager first, while the server's still there to say goodbye to
+        drop(self.wm.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(t) = self.wm.take() {
-            let _ = t.join();
-        }
         if let Some(a) = &self.display.auth {
             let _ = std::fs::remove_file(a);
         }
@@ -220,11 +211,15 @@ fn read_line(f: &mut File, timeout: Duration) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// the screen set to w×h: a mode of that size (made if new), the CRTC moved to it
-pub fn resize(conn: &RustConnection, root: u32, w: u16, h: u16) -> bool {
+/// the screen set to w×h: a mode of that size (made if new), the CRTC moved to it, its
+/// size in millimetres what says dpi
+pub fn resize(conn: &RustConnection, root: u32, w: u16, h: u16, dpi: u32) -> bool {
     let go = || -> Result<(), Box<dyn std::error::Error>> {
         let g = conn.get_geometry(root)?.reply()?;
         if (g.width, g.height) == (w, h) {
+            // the size as it is; the dpi said again in case it's new
+            let mm = |px: u16| (px as u32 * 254 / (dpi.max(1) * 10)).max(1);
+            let _ = conn.randr_set_screen_size(root, w, h, mm(w), mm(h));
             return Ok(());
         }
         conn.randr_query_version(1, 3)?.reply()?;
@@ -250,9 +245,9 @@ pub fn resize(conn: &RustConnection, root: u32, w: u16, h: u16) -> bool {
                 m
             }
         };
-        // the CRTC off, the screen resized, the CRTC on at the new mode; 96 dpi
+        // the CRTC off, the screen resized, the CRTC on at the new mode
         conn.randr_set_crtc_config(crtc, 0, 0, 0, 0, 0, randr::Rotation::ROTATE0, &[])?.reply()?;
-        let mm = |px: u16| (px as u32 * 254 / 960).max(1);
+        let mm = |px: u16| (px as u32 * 254 / (dpi.max(1) * 10)).max(1);
         conn.randr_set_screen_size(root, w, h, mm(w), mm(h))?.check()?;
         conn.randr_set_crtc_config(crtc, 0, 0, 0, 0, mode, randr::Rotation::ROTATE0, &[out])?.reply()?;
         Ok(())
@@ -263,96 +258,6 @@ pub fn resize(conn: &RustConnection, root: u32, w: u16, h: u16) -> bool {
             warn!("the display can't be {w}x{h}: {e}");
             false
         }
-    }
-}
-
-/// a window manager for one app: its windows fill the screen and have the keyboard;
-/// a dialog (WM_TRANSIENT_FOR) keeps its size, centred
-fn wm(d: &Display, stop: &AtomicBool) {
-    let Ok((conn, screen)) = d.connect() else { return };
-    let root = conn.setup().roots[screen].root;
-    let mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY;
-    let taken = conn
-        .change_window_attributes(root, &ChangeWindowAttributesAux::new().event_mask(mask))
-        .map_err(|e| e.to_string())
-        .and_then(|c| c.check().map_err(|e| e.to_string()));
-    if taken.is_err() {
-        warn!("another window manager runs on {}", d.name);
-        return;
-    }
-    // managed windows, newest last: (window, fills the screen)
-    let mut stack: Vec<(u32, bool)> = Vec::new();
-    let screen_size =
-        |conn: &RustConnection| conn.get_geometry(root).ok().and_then(|c| c.reply().ok()).map(|g| (g.width, g.height));
-    let (mut sw, mut sh) = screen_size(&conn).unwrap_or(MAX);
-    let fill = |conn: &RustConnection, win: u32, sw: u16, sh: u16| {
-        let _ = conn.configure_window(
-            win,
-            &ConfigureWindowAux::new().x(0).y(0).width(sw as u32).height(sh as u32).border_width(0),
-        );
-    };
-    let fd = conn.stream().as_raw_fd();
-    while !stop.load(Ordering::Relaxed) {
-        let ev = match conn.poll_for_event() {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                let _ = conn.flush();
-                let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                // SAFETY: one pollfd
-                unsafe { libc::poll(&mut p, 1, 100) };
-                continue;
-            }
-            Err(_) => return,
-        };
-        match ev {
-            Event::MapRequest(e) => {
-                let w = e.window;
-                let transient = conn
-                    .get_property(false, w, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1)
-                    .ok()
-                    .and_then(|c| c.reply().ok())
-                    .is_some_and(|r| r.value_len > 0);
-                if transient {
-                    if let Some(g) = conn.get_geometry(w).ok().and_then(|c| c.reply().ok()) {
-                        let x = (sw as i32 - g.width as i32) / 2;
-                        let y = (sh as i32 - g.height as i32) / 2;
-                        let _ = conn.configure_window(w, &ConfigureWindowAux::new().x(x.max(0)).y(y.max(0)));
-                    }
-                } else {
-                    fill(&conn, w, sw, sh);
-                }
-                let _ = conn.map_window(w);
-                let _ = conn.set_input_focus(InputFocus::POINTER_ROOT, w, x11rb::CURRENT_TIME);
-                stack.retain(|s| s.0 != w);
-                stack.push((w, !transient));
-                debug!("{}: window {w:#x} {}", d.name, if transient { "centred" } else { "fills the screen" });
-            }
-            Event::ConfigureRequest(e) => {
-                let full = stack.iter().find(|s| s.0 == e.window).map(|s| s.1);
-                if full == Some(true) {
-                    fill(&conn, e.window, sw, sh);
-                } else {
-                    let _ = conn.configure_window(e.window, &ConfigureWindowAux::from_configure_request(&e));
-                }
-            }
-            Event::UnmapNotify(e) if e.event == root => {
-                stack.retain(|s| s.0 != e.window);
-                if let Some(&(w, _)) = stack.last() {
-                    let _ = conn.set_input_focus(InputFocus::POINTER_ROOT, w, x11rb::CURRENT_TIME);
-                }
-            }
-            Event::DestroyNotify(e) => stack.retain(|s| s.0 != e.window),
-            Event::ConfigureNotify(e) if e.window == root => {
-                (sw, sh) = (e.width, e.height);
-                for &(w, full) in &stack {
-                    if full {
-                        fill(&conn, w, sw, sh);
-                    }
-                }
-            }
-            _ => {}
-        }
-        let _ = conn.flush();
     }
 }
 

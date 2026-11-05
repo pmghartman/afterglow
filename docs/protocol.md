@@ -4,6 +4,8 @@ One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to 
 
 afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token. It serves nothing else and captures no audio.
 
+Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version>` and what it serves (`stdio argv notes clipboard raise close cursor`), for a driver probing a host.
+
 ## Framing
 
 ```
@@ -17,22 +19,26 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | Type | Name | Body |
 | --- | --- | --- |
 | `0x01` | `hello` | the token, as text. Must be first; anything else, or a wrong token, closes the connection |
-| `0x02` | `launch` | JSON `{cmd, name, w, h, fps, virtual_display, fresh}`: the app's path (Windows: a `.exe`, `.lnk` or `.url`; Linux: a program), its window size, the capture rate, whether it gets a display of its own; `fresh` starts it again even when it runs |
+| `0x02` | `launch` | JSON `{cmd, argv, name, w, h, fps, dpi, scale, dbus, virtual_display, fresh}`: the app's path (Windows: a `.exe`, `.lnk` or `.url`; Linux: a program), or on Linux `argv`, the program and its arguments; its window size, the capture rate, the display's dpi and the viewer's pixel ratio (1.5 and up: GTK and Qt told to scale), on Linux `dbus` for a session bus of its own; whether it gets a display of its own; `fresh` starts it again even when it runs |
 | `0x03` | `video` | JSON `{gen, w, h, fps, kbps, yuv444, draw_cursor}`: start a video, replacing any running. `draw_cursor` draws the pointer into the frames; without it the pointer's shape comes as `cursor` messages |
 | `0x04` | `stop_video` | none |
 | `0x05` | `idr` | none: the next frame is a keyframe |
 | `0x06` | `input` | one input packet (below); ignored while no video runs |
-| `0x07` | `quit` | none: ask the app to close |
+| `0x07` | `quit` | none: end the app |
 | `0x08` | `ping` | `u32`, echoed in `pong` |
+| `0x09` | `clip` | the viewer's clipboard, UTF-8: the app's own paste pastes it |
+| `0x0a` | `raise` | `u32` LE: a window from a `windows` note to the front |
+| `0x0b` | `close` | none: ask the app to close as its own close button does (it may ask to save first); `exited` follows when it has. Where the host can't, as `quit` |
 
 ## afterglow to driver
 
 | Type | Name | Body |
 | --- | --- | --- |
 | `0x81` | `ready` | JSON `{version, virtual_display, hostname, running}`, after a good `hello` |
-| `0x82` | `launched` | JSON `{ok, resumed, ms}` or `{ok: false, error, code}` |
-| `0x83` | `exited` | JSON `{}`: the app is gone |
+| `0x82` | `launched` | JSON `{ok, resumed, ms, features}` or `{ok: false, error, code}`. `features`: what this app can be asked besides input, some of `notes`, `clipboard`, `raise`, `close` |
+| `0x83` | `exited` | JSON `{code, log, error}`, any of them: the app is gone, its exit code, the last of what it wrote, why when it never showed a window |
 | `0x84` | `video_ended` | JSON `{gen, why}`: the capture stopped by itself |
+| `0x85` | `note` | JSON: `{t: "title", s}` the main window's title, `{t: "windows", list: [[id, title]], main}` the app's windows, `{t: "clip", s}` what the app copied. Each as it changes, and all again when a driver comes |
 | `0x88` | `pong` | `u32` |
 | `0x90` | `config` | `[pad][u16 gen][u16 w][u16 h]` then the avcC record |
 | `0x91` | `frame` | `[u8 key][u16 gen][pad 4]` then the frame as AVCC |
@@ -53,6 +59,12 @@ An `input` body is one packet: `u32` big-endian size of what follows it, `u32` l
 | `0x17` | text | UTF-8, any length |
 
 Keys are US-layout Windows virtual-key codes for the physical key: Windows sends them as scan codes, Linux maps them to X keysyms. A character the viewer's layout makes that US doesn't on that key goes as text.
+
+## The app on Linux
+
+With a display of its own, afterglow's window manager runs the app's windows: the main ones fill the display, a dialog (transient, or typed dialog, utility, splash, toolbar or notification) keeps its size, centred, and the newest has the keyboard. `notes` tell the driver the title and the windows, `raise` brings one forward, `close` sends the topmost `WM_DELETE_WINDOW` (or kills its client where it takes none). The viewer's `clip` is owned as CLIPBOARD and PRIMARY, so Ctrl+V and Shift+Insert paste it; what the app copies to CLIPBOARD comes back as a `clip` note.
+
+The app runs with X11 asked of every toolkit (`GDK_BACKEND=x11`, `QT_QPA_PLATFORM=xcb` and the like, no Wayland variables), from its home when started by `argv`, its output kept for `exited`. It's running while its process group is, or while a window of it is up; a launcher that exits after starting it has 3 s to show one.
 
 ## Displays
 

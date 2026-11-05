@@ -16,6 +16,12 @@ pub mod input {
     pub const INPUT: u8 = 0x06;
     pub const QUIT: u8 = 0x07;
     pub const PING: u8 = 0x08;
+    /// the viewer's clipboard text, for the app to paste as its own
+    pub const CLIP: u8 = 0x09;
+    /// `u32` LE: a window from a windows note to the front
+    pub const RAISE: u8 = 0x0a;
+    /// ask the app to close as its own close button does
+    pub const CLOSE: u8 = 0x0b;
 }
 
 /// afterglow to driver
@@ -24,6 +30,8 @@ pub mod output {
     pub const LAUNCHED: u8 = 0x82;
     pub const EXITED: u8 = 0x83;
     pub const VIDEO_ENDED: u8 = 0x84;
+    /// JSON `{t, ...}`: the app's title, its windows, the host's clipboard
+    pub const NOTE: u8 = 0x85;
     pub const PONG: u8 = 0x88;
     /// `[type][pad][u16 vgen][u16 w][u16 h]` then avcC
     pub const CONFIG: u8 = 0x90;

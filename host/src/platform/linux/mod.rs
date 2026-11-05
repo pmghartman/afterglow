@@ -7,6 +7,7 @@
 mod capture;
 mod convert;
 mod encode;
+mod wm;
 mod xserver;
 
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::conf::Conf;
-use crate::host::{Ctl, Host, Launch, LaunchError, Sink, VideoCfg};
+use crate::host::{Ctl, Host, Launch, LaunchError, Notes, Sink, VideoCfg};
 use crate::input::Inject;
 use crate::{debug, info, warn};
 use xserver::{Display, Xvfb};
@@ -51,6 +52,17 @@ struct App {
     /// the app's own X server; dropped after the app
     xvfb: Option<Xvfb>,
     display: Display,
+    dpi: u32,
+    /// the last of what the app wrote, for the viewer when it ends
+    log: Arc<Mutex<Vec<u8>>>,
+    /// when its process group was first found gone, no window ever shown
+    gone_at: Option<Instant>,
+}
+
+impl App {
+    fn wm(&self) -> Option<&wm::Wm> {
+        self.xvfb.as_ref().and_then(|x| x.wm.as_ref())
+    }
 }
 
 pub struct Linux {
@@ -59,15 +71,23 @@ pub struct Linux {
     app: Mutex<Option<App>>,
     xi: Mutex<Option<Xi>>,
     spare: Spare,
+    notes: Mutex<Option<Notes>>,
+    /// how the last app ended
+    ended: Mutex<serde_json::Value>,
 }
 
+/// the most of the app's output kept
+const LOG_KEEP: usize = 16 << 10;
+
 /// an Xvfb started ahead of the launch that takes it: half of an app's time to its first
-/// frame was its X server coming up. Another is started as soon as one is taken
+/// frame was its X server coming up. Another is started as soon as one is taken, unless
+/// this afterglow serves one app and goes (--stdio)
 #[derive(Clone)]
 struct Spare {
     bin: String,
     slot: Arc<Mutex<Option<Xvfb>>>,
     starting: Arc<std::sync::atomic::AtomicBool>,
+    keep: bool,
 }
 
 impl Spare {
@@ -77,7 +97,7 @@ impl Spare {
         }
         let me = self.clone();
         let _ = thread::Builder::new().name("spare-xvfb".into()).spawn(move || {
-            let x = Xvfb::start(&me.bin, xserver::MAX.0, xserver::MAX.1);
+            let x = Xvfb::start(&me.bin, xserver::MAX.0, xserver::MAX.1, 96);
             match x {
                 Ok(x) => *me.slot.lock().unwrap() = Some(x),
                 Err(e) => warn!("no spare X server: {e}"),
@@ -86,10 +106,15 @@ impl Spare {
         });
     }
 
-    /// the spare, if one is up and still serving, set to w×h
-    fn take(&self, w: u16, h: u16) -> Option<Xvfb> {
+    /// the spare, if one is up and still serving, set to w×h at dpi; one being started
+    /// waited for (it's further along than a fresh one would be)
+    fn take(&self, w: u16, h: u16, dpi: u32) -> Option<Xvfb> {
+        let t0 = Instant::now();
+        while self.starting.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(2));
+        }
         let mut x = self.slot.lock().unwrap().take()?;
-        if w > xserver::MAX.0 || h > xserver::MAX.1 || !x.alive() || x.fit(w, h).is_err() {
+        if w > xserver::MAX.0 || h > xserver::MAX.1 || !x.alive() || x.fit(w, h, dpi).is_err() {
             return None;
         }
         Some(x)
@@ -151,11 +176,19 @@ impl Linux {
         if let Some(s) = &session {
             info!("the session's display: {}", s.name);
         }
-        let spare = Spare { bin: xvfb_bin.clone(), slot: Arc::default(), starting: Arc::default() };
+        let spare = Spare { bin: xvfb_bin.clone(), slot: Arc::default(), starting: Arc::default(), keep: !conf.stdio };
         if which(&xvfb_bin) {
             spare.refill();
         }
-        Ok(Arc::new(Linux { xvfb_bin, session, app: Mutex::new(None), xi: Mutex::new(None), spare }))
+        Ok(Arc::new(Linux {
+            xvfb_bin,
+            session,
+            app: Mutex::new(None),
+            xi: Mutex::new(None),
+            spare,
+            notes: Mutex::new(None),
+            ended: Mutex::new(serde_json::json!({})),
+        }))
     }
 
     /// the size the screen input lands on now is
@@ -333,6 +366,20 @@ impl Inject for Linux {
     }
 }
 
+/// what r says, its last LOG_KEEP bytes kept in log
+fn keep_tail(mut r: Box<dyn std::io::Read + Send>, log: &Mutex<Vec<u8>>) {
+    let mut b = [0u8; 4096];
+    while let Ok(n) = r.read(&mut b) {
+        if n == 0 {
+            break;
+        }
+        let mut l = log.lock().unwrap();
+        l.extend_from_slice(&b[..n]);
+        let over = l.len().saturating_sub(LOG_KEEP);
+        l.drain(..over);
+    }
+}
+
 fn group_alive(pgid: i32) -> bool {
     // SAFETY: a signal 0 probe of a process group we made
     unsafe { libc::kill(-pgid, 0) == 0 }
@@ -348,17 +395,24 @@ impl Host for Linux {
     }
 
     fn launch(&self, l: &Launch) -> Result<(), LaunchError> {
-        if l.cmd.is_empty() || l.cmd.chars().any(char::is_control) {
+        let mut argv: Vec<String> = if l.argv.is_empty() { vec![l.cmd.clone()] } else { l.argv.clone() };
+        if argv[0].is_empty() || argv.iter().any(|a| a.contains('\0')) || argv[0].chars().any(char::is_control) {
             return Err(LaunchError::new("not an app this host can start"));
         }
+        if !which(&argv[0]) {
+            return Err(LaunchError::new(format!("{} isn't on this host's PATH", argv[0])));
+        }
         self.terminate();
+        *self.ended.lock().unwrap() = serde_json::json!({});
         let (xvfb, display) = if l.virtual_display && self.virtual_display() {
-            let x = match self.spare.take(l.w as u16, l.h as u16) {
+            let x = match self.spare.take(l.w as u16, l.h as u16, l.dpi) {
                 Some(x) => x,
-                None => Xvfb::start(&self.xvfb_bin, l.w as u16, l.h as u16)
+                None => Xvfb::start(&self.xvfb_bin, l.w as u16, l.h as u16, l.dpi)
                     .map_err(|e| LaunchError { code: Some(503), error: e })?,
             };
-            self.spare.refill();
+            if self.spare.keep {
+                self.spare.refill();
+            }
             let d = x.display.clone();
             (Some(x), d)
         } else {
@@ -374,27 +428,105 @@ impl Host for Linux {
         };
         let xi = xi_for(&display).map_err(|e| LaunchError { code: Some(503), error: e })?;
         use std::os::unix::process::CommandExt;
-        let mut cmd = Command::new(&l.cmd);
-        cmd.env("DISPLAY", &display.name).stdin(Stdio::null()).process_group(0);
-        if let Some(a) = &display.auth {
-            cmd.env("XAUTHORITY", a);
+        // its own session bus: a single-instance app starts here rather than handing its
+        // window to a copy already open on the host's own screen
+        let dbus = l.dbus && which("dbus-run-session");
+        if dbus {
+            argv.splice(0..0, ["dbus-run-session".to_string(), "--".to_string()]);
         }
-        if let Some(dir) = std::path::Path::new(&l.cmd).parent().filter(|p| p.is_dir()) {
-            cmd.current_dir(dir);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+        // X11 for every toolkit, on this display, nothing of a Wayland session it may run in
+        for k in ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN"] {
+            cmd.env_remove(k);
         }
-        let child = cmd.spawn().map_err(|e| LaunchError::new(format!("the app didn't start: {e}")))?;
+        if dbus {
+            cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
+        }
+        cmd.env("DISPLAY", &display.name)
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("GDK_BACKEND", "x11")
+            .env("QT_QPA_PLATFORM", "xcb")
+            .env("SDL_VIDEODRIVER", "x11")
+            .env("MOZ_ENABLE_WAYLAND", "0")
+            .env("ELECTRON_OZONE_PLATFORM_HINT", "x11")
+            .env("NO_AT_BRIDGE", "1")
+            .env("_JAVA_AWT_WM_NONREPARENTING", "1");
+        match &display.auth {
+            Some(a) => {
+                cmd.env("XAUTHORITY", a);
+            }
+            None => {
+                cmd.env_remove("XAUTHORITY");
+            }
+        }
+        if l.scale >= 1.5 {
+            cmd.env("GDK_SCALE", format!("{}", l.scale.round() as u32))
+                .env("QT_SCALE_FACTOR", format!("{:.2}", l.scale));
+        }
+        // a desktop entry's app starts at home, as a launcher starts it; a program by its path beside itself
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).filter(|h| h.is_dir());
+        match (l.argv.is_empty(), home) {
+            (false, Some(h)) => {
+                cmd.current_dir(h);
+            }
+            _ => {
+                if let Some(dir) = std::path::Path::new(&argv[0]).parent().filter(|p| p.is_dir()) {
+                    cmd.current_dir(dir);
+                }
+            }
+        }
+        let mut child = cmd.spawn().map_err(|e| LaunchError::new(format!("{} didn't start: {e}", argv[0])))?;
+        let log: Arc<Mutex<Vec<u8>>> = Arc::default();
+        for r in [
+            child.stdout.take().map(|o| Box::new(o) as Box<dyn std::io::Read + Send>),
+            child.stderr.take().map(|e| Box::new(e) as _),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let log = log.clone();
+            let _ = thread::Builder::new().name("app-log".into()).spawn(move || keep_tail(r, &log));
+        }
         let pgid = child.id() as i32;
-        info!("started [{}] on {}, pid {pgid}", l.cmd, display.name);
+        info!("started [{}] on {}, pid {pgid}", argv.join(" "), display.name);
+        if let Some(w) = xvfb.as_ref().and_then(|x| x.wm.as_ref()) {
+            w.set_notes(self.notes.lock().unwrap().clone());
+        }
         *self.xi.lock().unwrap() = Some(xi);
-        *self.app.lock().unwrap() = Some(App { child, pgid, xvfb, display });
+        *self.app.lock().unwrap() = Some(App { child, pgid, xvfb, display, dpi: l.dpi, log, gone_at: None });
         Ok(())
     }
 
     fn running(&self) -> bool {
         let mut a = self.app.lock().unwrap();
         let Some(app) = a.as_mut() else { return false };
-        let _ = app.child.try_wait();
-        group_alive(app.pgid)
+        let status = app.child.try_wait().ok().flatten();
+        if group_alive(app.pgid) {
+            return true;
+        }
+        let wins = app.wm().map(|w| (w.windows(), w.ever_had_a_window()));
+        match wins {
+            // its process gone, a window of it still up: one it handed off to runs it
+            Some((n, _)) if n > 0 => return true,
+            // never a window yet: a launcher that exits after starting the app gets a moment
+            Some((_, false)) if app.gone_at.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(3) => {
+                return true;
+            }
+            _ => {}
+        }
+        let log = app.log.lock().unwrap();
+        let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(4000)..]).into_owned();
+        let code = status.map(|s| {
+            use std::os::unix::process::ExitStatusExt;
+            s.code().unwrap_or_else(|| -s.signal().unwrap_or(0))
+        });
+        let mut v = serde_json::json!({"log": tail, "code": code});
+        if wins == Some((0, false)) {
+            v["error"] = "it exited before opening a window; an app open already (on the host's screen, or streamed) may have taken the window itself".into();
+        }
+        *self.ended.lock().unwrap() = v;
+        false
     }
 
     fn terminate(&self) {
@@ -419,11 +551,51 @@ impl Host for Linux {
         drop(app.xvfb.take());
     }
 
+    fn on_notes(&self, f: Notes) {
+        *self.notes.lock().unwrap() = Some(f.clone());
+        if let Some(w) = self.app.lock().unwrap().as_ref().and_then(App::wm) {
+            w.set_notes(Some(f));
+        }
+    }
+
+    fn features(&self) -> Vec<&'static str> {
+        match self.app.lock().unwrap().as_ref().and_then(App::wm) {
+            Some(_) => vec!["notes", "clipboard", "raise", "close"],
+            None => Vec::new(),
+        }
+    }
+
+    fn clip(&self, text: &str) {
+        if let Some(w) = self.app.lock().unwrap().as_ref().and_then(App::wm) {
+            w.send(wm::Cmd::Clip(text.to_string()));
+        }
+    }
+
+    fn raise(&self, id: u32) {
+        if let Some(w) = self.app.lock().unwrap().as_ref().and_then(App::wm) {
+            w.send(wm::Cmd::Raise(id));
+        }
+    }
+
+    fn close(&self) -> bool {
+        match self.app.lock().unwrap().as_ref().and_then(App::wm) {
+            Some(w) => {
+                w.send(wm::Cmd::Close);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn exit_info(&self) -> serde_json::Value {
+        self.ended.lock().unwrap().clone()
+    }
+
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
-        let (display, own) = {
+        let (display, own, dpi) = {
             let a = self.app.lock().unwrap();
             let Some(app) = a.as_ref() else { return Err("no app is running".into()) };
-            (app.display.clone(), app.xvfb.is_some())
+            (app.display.clone(), app.xvfb.is_some(), app.dpi)
         };
         let mut grab = capture::Grab::new(&display)?;
         ctl.on_wake(grab.waker());
@@ -431,7 +603,7 @@ impl Host for Linux {
         if own {
             let (conn, screen) = display.connect()?;
             let root = conn.setup().roots[screen].root;
-            xserver::resize(&conn, root, v.w as u16, v.h as u16);
+            xserver::resize(&conn, root, v.w as u16, v.h as u16, dpi);
         }
         grab.geometry()?;
         self.screen_is(grab.w, grab.h);

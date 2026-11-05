@@ -6,12 +6,20 @@
 
 import type { Opened, Sink, Source, Video, VideoSink } from "../source.ts";
 import { InputPacker } from "./input.ts";
-import { configOf, cursorOf, frameOf, In, jsonOf, Link, type LinkAddr, Out } from "./link.ts";
+import { configOf, cursorOf, frameOf, In, jsonOf, Link, type LinkAddr, Out, type Transport } from "./link.ts";
 
 export type AfterglowTarget = {
-  link: LinkAddr;
+  // where afterglow listens (its link file), or a stream to an `afterglow --stdio`
+  // opened for this app (ssh's, as the viewer's login on a Linux host)
+  link?: LinkAddr;
+  transport?: () => Transport | Promise<Transport>;
   // the app: a shortcut or program the host's desk listed
   target: string;
+  // Linux: the program and its arguments (a desktop entry's Exec), in place of target
+  argv?: string[];
+  // Linux: a session bus of the app's own, so a single-instance app starts on the
+  // stream rather than handing its window to a copy on the host's own screen
+  dbus?: boolean;
   // the app gets a display of its own at the viewer's size (SudoVDA on Windows, an
   // Xvfb on Linux): no monitor needed, the console's own left alone
   virtualDisplay: boolean;
@@ -41,8 +49,11 @@ export class AfterglowSource implements Source {
   private cur?: Running;
   private gen = 0;
   private finished = false;
+  // what the launched app can be asked: "clipboard", "raise", "close", "notes"
+  private features = new Set<string>();
   private keys = new InputPacker((pkt) => this.cur && this.link?.send(In.input, pkt));
   timings: Record<string, number> = {};
+  private name = "";
 
   constructor(private t: AfterglowTarget) {}
 
@@ -53,17 +64,24 @@ export class AfterglowSource implements Source {
       message: (m: Uint8Array) => this.got(m),
       closed: (why: string) => this.lost(why),
     };
-    this.link = this.t.connect ? this.t.connect(this.t.link, ev) : new Link(this.t.link, ev);
-    await this.link.open();
+    if (this.t.connect && this.t.link) this.link = this.t.connect(this.t.link, ev);
+    else if (this.t.transport) this.link = new Link(await this.t.transport(), ev);
+    else if (this.t.link) this.link = new Link(this.t.link, ev);
+    else throw new Error("afterglow: neither a link nor a transport to reach it");
+    await this.link.open(this.t.transport ? 15_000 : 3000);
     const t1 = performance.now();
     const fps = this.fpsOf(s.fps);
     const answer = this.link.next(Out.launched, 60_000);
     this.link.json(In.launch, {
       cmd: this.t.target,
+      ...(this.t.argv?.length ? { argv: this.t.argv } : {}),
       name: s.name,
       w: s.w,
       h: s.h,
       fps,
+      dpi: s.dpi,
+      scale: s.scale,
+      dbus: !!this.t.dbus,
       virtual_display: this.t.virtualDisplay,
       fresh: true,
     });
@@ -72,9 +90,11 @@ export class AfterglowSource implements Source {
       this.link.close("launch refused");
       throw new Error(`the app didn't start: ${String(r.error ?? "afterglow refused it")}`);
     }
+    this.features = new Set(Array.isArray(r.features) ? r.features.map(String) : []);
     this.timings = { link: t1 - t0, launch: performance.now() - t1 };
     // the video started now, kept for the viewer about to attach
     this.startVideo({ w: s.w, h: s.h, fps, kbps: 20_000, full: s.full });
+    this.name = s.name;
     sink.meta({ t: "title", s: s.name });
     // drawn in by the host: the page's own hidden, so there's one. Otherwise the
     // host's shapes come as it changes them
@@ -131,8 +151,18 @@ export class AfterglowSource implements Source {
         if (!c.visible || !c.png.length) return this.sink?.meta({ t: "cursor", name: "none" });
         return this.sink?.meta({ t: "cursor", png: Buffer.from(c.png).toString("base64"), x: c.x, y: c.y });
       }
-      case Out.exited:
-        return this.gone("");
+      case Out.note: {
+        const j = jsonOf(m);
+        if (j.t === "title") return this.sink?.meta({ t: "title", s: String(j.s ?? "") || this.name });
+        if (j.t === "windows") return this.sink?.meta({ t: "windows", list: j.list, main: j.main });
+        if (j.t === "clip") return this.sink?.say({ t: "clip", s: String(j.s ?? "") });
+        return;
+      }
+      case Out.exited: {
+        const j = jsonOf(m);
+        const code = typeof j.code === "number" ? j.code : undefined;
+        return this.gone(String(j.error ?? ""), typeof j.log === "string" ? j.log : undefined, code);
+      }
     }
   }
 
@@ -161,6 +191,16 @@ export class AfterglowSource implements Source {
   }
 
   input(m: unknown[], w: number, h: number) {
+    // the clipboard and the windows are the app's, video or not
+    if (m[0] === "clip" && this.features.has("clipboard")) {
+      return this.link?.send(In.clip, String(m[1] ?? "").slice(0, 256 << 10));
+    }
+    if (m[0] === "raise") {
+      if (!this.features.has("raise")) return;
+      const b = new Uint8Array(4);
+      new DataView(b.buffer).setUint32(0, Math.max(0, Math.round(Number(m[1]) || 0)) >>> 0, true);
+      return this.link?.send(In.raise, b);
+    }
     const c = this.cur;
     if (!c) return;
     this.keys.input(m, c.v.w || w, c.v.h || h);
@@ -169,7 +209,10 @@ export class AfterglowSource implements Source {
   // the video restarts at the new size when the session asks; afterglow's display follows
   resize() {}
 
+  // as the app's own close button: where afterglow can ask it that way, the app stays
+  // until it closes (it may ask to save first); otherwise it's ended
   close() {
+    if (this.features.has("close")) return this.link?.send(In.close);
     this.cur = undefined;
     this.link?.send(In.quit);
   }
@@ -179,13 +222,13 @@ export class AfterglowSource implements Source {
     this.gone(`afterglow went away: ${why}`);
   }
 
-  private gone(error: string) {
+  private gone(error: string, log?: string, code?: number) {
     this.cur = undefined;
     if (this.finished) return;
     this.finished = true;
     this.link?.close();
     this.t.done?.();
-    this.sink?.exit(error);
+    this.sink?.exit(error, log, code);
   }
 
   quit() {

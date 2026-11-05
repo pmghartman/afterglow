@@ -97,12 +97,15 @@ impl H264 {
             l.uiColorPrimaries = 1;
             l.uiTransferCharacteristics = 1;
             l.uiColorMatrix = 1;
+            // quiet from the start: its init warns on stderr otherwise, which over ssh
+            // is the viewer's session's
+            let mut quiet: c_int = WELS_LOG_QUIET as c_int;
+            call!(enc, SetOption, ENCODER_OPTION_TRACE_LEVEL, &mut quiet as *mut c_int as *mut c_void);
             let r = call!(enc, InitializeExt, &p);
             if r != 0 {
                 APILoader::WelsDestroySVCEncoder(enc);
                 return Err(format!("OpenH264 refused {w}x{h} at {fps} fps, {kbps} kbps ({r})"));
             }
-            let mut quiet: c_int = WELS_LOG_QUIET as c_int;
             call!(enc, SetOption, ENCODER_OPTION_TRACE_LEVEL, &mut quiet as *mut c_int as *mut c_void);
             let mut fmt: c_int = videoFormatI420 as c_int;
             call!(enc, SetOption, ENCODER_OPTION_DATAFORMAT, &mut fmt as *mut c_int as *mut c_void);
