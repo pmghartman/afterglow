@@ -1,5 +1,6 @@
 //! Each platform's host: Windows (DXGI capture, Media Foundation H.264, SendInput,
-//! SudoVDA), and X11 (an X server's screen, OpenH264, XTest) where the link is tested.
+//! SudoVDA), and Linux (an Xvfb per app or the session's X display, MIT-SHM and
+//! XDamage capture, OpenH264, XTest).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -10,9 +11,9 @@ pub mod windows;
 pub use windows::Windows as Native;
 
 #[cfg(target_os = "linux")]
-pub mod x11;
+pub mod linux;
 #[cfg(target_os = "linux")]
-pub use x11::X11 as Native;
+pub use linux::Linux as Native;
 
 /// this platform's host, set up from the config
 pub fn open(conf: &crate::conf::Conf) -> Result<Arc<Native>, String> {

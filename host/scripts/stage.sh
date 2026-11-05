@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# afterglow built and staged for release: afterglow.exe, its service in tools\, the
-# SudoVDA install scripts, the licence and where the source is. The signed SudoVDA
-# driver package is staged by the workflow after it.
+# afterglow tested, built and staged for release, the licence and where the source is
+# beside it. Windows: afterglow.exe, its service in tools\, the SudoVDA install scripts
+# (the signed driver package is staged by the workflow after). Linux: afterglow.
 # usage: stage.sh OUT_DIR [VERSION] [TARGET]   (TARGET: a Rust target, default the host's)
 set -euo pipefail
 OUT=$(realpath -m "$1")
@@ -16,10 +16,15 @@ cargo build --release --locked ${TARGET:+--target "$TARGET"}
 BIN=target/${TARGET:+$TARGET/}release
 
 rm -rf "$OUT"
-mkdir -p "$OUT/tools" "$OUT/drivers/sudovda"
-cp "$BIN/afterglow.exe" "$OUT/"
-cp "$BIN/afterglowsvc.exe" "$OUT/tools/"
-cp drivers/sudovda/install.bat drivers/sudovda/uninstall.bat "$OUT/drivers/sudovda/"
+mkdir -p "$OUT"
+if [ -f "$BIN/afterglow.exe" ]; then
+  mkdir -p "$OUT/tools" "$OUT/drivers/sudovda"
+  cp "$BIN/afterglow.exe" "$OUT/"
+  cp "$BIN/afterglowsvc.exe" "$OUT/tools/"
+  cp drivers/sudovda/install.bat drivers/sudovda/uninstall.bat "$OUT/drivers/sudovda/"
+else
+  cp "$BIN/afterglow" "$OUT/"
+fi
 cp LICENSE "$OUT/LICENSE.txt"
 cp NOTICE "$OUT/NOTICE.txt"
 REPO=${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pmghartman/afterglow}
@@ -30,4 +35,4 @@ $REPO at commit ${GITHUB_SHA:-unknown} (tag v$VER), its Rust dependencies at the
 versions host/Cargo.lock pins.
 TXT
 echo "$VER" > "$OUT/VERSION"
-ls -la "$OUT" "$OUT/tools"
+ls -laR "$OUT"

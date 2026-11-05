@@ -1,13 +1,12 @@
-// afterglow's files as the app that installs it writes them: its config, its empty
-// app list and the link file the driver reads to find it. Plain text and paths, no
-// Windows calls, so a host app's installer is tested anywhere; installing the service
+// afterglow's files as the app that installs it writes them: its config, the link file
+// the driver reads to find it, its Windows service line or Linux systemd unit. Plain
+// text and paths, so a host app's installer is tested anywhere; installing the service
 // and the SudoVDA driver is the host app's own (phosphorus: packages/host/host/src/win/afterglow.ts)
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { LinkAddr } from "./link.ts";
 
-// the link's port: one of its own, clear of GameStream's 47984-48010 should the
-// host also run a Sunshine or Apollo
+// the link's port on 127.0.0.1
 export const linkPort = 47100;
 
 export type AfterglowPaths = { data: string; conf: string; apps: string; link: string; log: string };
@@ -42,6 +41,29 @@ export const linkText = (port: number, token: string) => `${JSON.stringify({ por
 
 // the service's command line: its program, then the config it starts afterglow with
 export const svcBinPath = (root: string, conf: string) => `"${join(root, "tools", "afterglowsvc.exe")}" "${conf}"`;
+
+// Linux: the systemd unit that keeps afterglow running, as the user its apps run as.
+// It needs no desktop session: each app gets an Xvfb of its own. Stopping it lets
+// afterglow close the app and its display before anything is killed
+export function unitText(bin: string, conf: string, user: string): string {
+  return [
+    "[Unit]",
+    "Description=afterglow, phosphorus's streaming host",
+    "After=network.target",
+    "",
+    "[Service]",
+    `ExecStart="${bin}" "${conf}"`,
+    `User=${user}`,
+    "Restart=on-failure",
+    "RestartSec=3",
+    "KillMode=mixed",
+    "TimeoutStopSec=15",
+    "",
+    "[Install]",
+    "WantedBy=multi-user.target",
+    "",
+  ].join("\n");
+}
 
 // a token from a link file, kept across starts so a running afterglow and the
 // frontend agree on it; a fresh one when there's none worth keeping

@@ -2,7 +2,7 @@
 // and AfterglowSource driven directly against a stand-in afterglow on a real loopback
 // socket: the token said first, the app launched, frames handed on with their room in
 // front, an earlier video's frames dropped, a keyframe asked for without a restart,
-// input as GameStream packets, the app's exit
+// input as afterglow's packets, the app's exit
 
 import { afterEach, describe, expect, test } from "bun:test";
 import {
@@ -133,7 +133,7 @@ describe("afterglow source", () => {
     expect(d.frames[0]!.room).toBe(true);
     expect(Array.from(d.frames[0]!.data.subarray(FrameRoom))).toEqual([0, 0, 0, 2, 0x65, 0x88]);
 
-    // input: GameStream packets, a mouse move at the video's size
+    // input: afterglow's packets, a mouse move at the video's size
     src.input(["m", 640, 360], 1280, 720);
     src.input(["k", true, "KeyA", "a", false], 1280, 720);
     await settle();

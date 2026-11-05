@@ -1,8 +1,7 @@
-// @phosphorus/afterglow: streaming a Windows host's apps to a viewer. Two sources, one
-// contract (source.ts):
-//   AfterglowSource drives afterglow (host/), the Rust host, over one loopback link
-//   GlowSource drives a host's own Sunshine or Apollo over GameStream (glow/)
-// Each hands back H.264 as AVCC with room for the driver's header in front
+// @phosphorus/afterglow: a host's native apps streamed to a viewer as low-latency H.264.
+// AfterglowSource drives afterglow (host/, Windows and Linux) over one loopback link
+// (docs/protocol.md) and keeps the contract a driver expects of a source (source.ts):
+// H.264 as AVCC with room for the driver's header in front, input back
 
 export {
   type AfterglowPaths,
@@ -15,7 +14,9 @@ export {
   readLink,
   svcBinPath,
   tokenOf,
+  unitText,
 } from "./afterglow/config.ts";
+export { asText, InputPacker, modOf, pack, vkOf } from "./afterglow/input.ts";
 export {
   configOf,
   frameOf,
@@ -31,25 +32,5 @@ export {
   type Ready,
 } from "./afterglow/link.ts";
 export { AfterglowSource, type AfterglowTarget } from "./afterglow/source.ts";
-
-export { type Identity, makeIdentity, signatureOf } from "./glow/cert.ts";
-export {
-  addClient,
-  addLauncher,
-  filesOf,
-  GlowHost,
-  launcherName,
-  type Platform,
-  parseConf,
-  unixLike,
-  windows,
-} from "./glow/host.ts";
-export { InputPacker } from "./glow/input.ts";
-export { confOf, type Instance, startInstance } from "./glow/instance.ts";
-export { type App, apps as hostApps, cancel, type Host, pair, serverInfo } from "./glow/lumen.ts";
-export { avccOf, Depacketizer, nalsOf } from "./glow/photon.ts";
-export { GlowSource, type GlowTarget } from "./glow/source.ts";
-export { pack, Sealer } from "./glow/spark.ts";
-export { asText, utf8Chunks, vkOf } from "./glow/vk.ts";
 
 export { FrameRoom, type Opened, type Sink, type Source, type Start, type Video, type VideoSink } from "./source.ts";

@@ -1,7 +1,7 @@
 // the contract a streaming source keeps with the app that drives it (phosphorus's
 // AppSession): opened once with the viewer's window, then asked for videos, keyframes
-// and input until it quits. Each source here (GlowSource, AfterglowSource) keeps it;
-// the driver declares its own copy and TypeScript checks the two agree
+// and input until it quits. AfterglowSource keeps it; the driver declares its own copy
+// and TypeScript checks the two agree
 
 export type Start = {
   argv: string[];

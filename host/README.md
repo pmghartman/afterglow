@@ -1,6 +1,6 @@
 # afterglow host
 
-The streaming host, in Rust: one app at a time launched, its display captured and encoded as H.264, the viewer's input injected, all driven over one loopback link ([`docs/protocol.md`](../docs/protocol.md)). Ported from [Apollo](https://github.com/ClassicOldSong/Apollo) (itself a fork of LizardByte's [Sunshine](https://github.com/LizardByte/Sunshine)), keeping only what the link uses: no GameStream servers, web UI, tray, audio, gamepads, touch or pen.
+The streaming host, in Rust, for Windows and Linux: one app at a time launched, its display captured and encoded as H.264, the viewer's input injected, all driven over one loopback link ([`docs/protocol.md`](../docs/protocol.md)). The Windows side was ported from [Apollo](https://github.com/ClassicOldSong/Apollo) (itself a fork of LizardByte's [Sunshine](https://github.com/LizardByte/Sunshine)), keeping only what the link uses: no GameStream servers, web UI, tray, audio, gamepads, touch or pen.
 
 ## Layout
 
@@ -8,11 +8,11 @@ The streaming host, in Rust: one app at a time launched, its display captured an
 | --- | --- |
 | `src/wire.rs` | the link's framing and the Annex B to AVCC reshaping, no platform code |
 | `src/link.rs` | the link: the token, one driver at a time, launch, videos and their generations, input, the app's exit |
-| `src/input.rs` | GameStream input packets into events; held keys repeated, everything let go when a video stops |
+| `src/input.rs` | input packets into events; held keys repeated, everything let go when a video stops |
 | `src/conf.rs` | `afterglow.conf` (`key = value`); unknown keys ignored, so a config written for the C++ host works |
 | `src/host.rs` | what the link asks of a platform |
 | `src/platform/windows/` | DXGI desktop duplication with the pointer drawn in (`capture.rs`), the D3D11 video processor and Media Foundation's H.264 encoder (`encode.rs`), SendInput (`input.rs`), the app in a job in the console user's session (`process.rs`), SudoVDA (`vdisplay.rs`), display modes and the primary display (`display.rs`), and the service (`svc.rs`) |
-| `src/platform/x11.rs` | the same on an X server: GetImage and XFixes, OpenH264, XTest. What the end-to-end test runs |
+| `src/platform/linux/` | an Xvfb per app with its cookie, RandR resizing and a window manager that keeps the app's windows filling it (`xserver.rs`); MIT-SHM capture driven by XDamage, the pointer from XFixes, BGRX to I420 (`capture.rs`); OpenH264, XTest and the app as a process group (`mod.rs`) |
 | `tests/link.rs` | the link on a real socket against a stand-in platform |
 
 ## On Windows
@@ -35,6 +35,16 @@ Capture runs on whichever desktop has the input, so UAC prompts and the lock scr
 
 The service runs as SYSTEM; keep the config and token readable by SYSTEM and Administrators only.
 
+## On Linux
+
+`afterglow <afterglow.conf>`, run by systemd as the user the apps run as (the client's `unitText`). It needs no desktop session. With `virtual_display` an app gets an Xvfb of its own: started at 3840x2160 with a random MIT-MAGIC-COOKIE-1 in a file only its user can read, set to the viewer's size with RandR, and run by a window manager inside afterglow that makes the app's windows fill it, centres its dialogs and gives it the keyboard. Without one, it runs on `$DISPLAY`, the session's own.
+
+Capture waits on XDamage, so nothing is read while nothing is drawn, then reads the screen through MIT-SHM, shared memory with the X server and no copy over its socket. The pointer comes from XFixes and is drawn in. Frames are converted to I420 (BT.709 limited) and encoded by OpenH264 in screen-content real-time mode on up to four threads. Input goes through XTest; text the keyboard map lacks gets a spare keycode for the moment it's typed. Stopping (SIGTERM) asks the app's process group to end, kills it after 5 s, then its Xvfb.
+
+| Key | Value |
+| --- | --- |
+| `xvfb` | the Xvfb to run; `Xvfb` on the `PATH` when unset |
+
 ## Building
 
 ```bash
@@ -42,7 +52,7 @@ cargo test
 cargo build --release
 ```
 
-On Windows that's the host; from Linux, `--target x86_64-pc-windows-gnu` cross-builds it with mingw-w64 installed, and wine runs its tests (`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine`). On Linux it's the X11 backend: `DISPLAY` names the X server to capture.
+Each builds its own platform's host. From Linux, `--target x86_64-pc-windows-gnu` cross-builds the Windows one with mingw-w64 installed, and wine runs its tests (`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine`). The Linux build needs a C++ compiler (OpenH264 is built from source) and, optionally, `nasm` for its assembly.
 
 `scripts/stage.sh OUT_DIR VERSION [TARGET]` tests, builds and stages a release as the zip lays it out. The SudoVDA driver package isn't built here: the release workflow takes it from Apollo's installer and checks it against its signed catalog.
 

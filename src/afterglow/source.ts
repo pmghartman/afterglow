@@ -1,20 +1,19 @@
-// the afterglow source: a window app on a Windows host, run in the session signed in
-// at its console and captured and encoded by afterglow, phosphorus's own host
-// installed beside it, over one loopback link. Against glow's GameStream
-// path: no pairing, no HTTPS or RTSP round trips before the first frame, no RTP to
-// rebuild frames from, no AES; the frame the encoder made is the one the viewer
-// gets, copied once. The app runs on between videos and viewers, as with glow
+// the afterglow source: a native app on a Windows or Linux host, run (on Windows in the
+// session signed in at its console) and captured and encoded by afterglow, installed
+// beside it, over one loopback link. One message launches, one starts a video; the
+// frame the encoder made is the one the viewer gets, copied once. The app runs on
+// between videos and viewers
 
-import { InputPacker } from "../glow/input.ts";
 import type { Opened, Sink, Source, Video, VideoSink } from "../source.ts";
+import { InputPacker } from "./input.ts";
 import { configOf, frameOf, In, jsonOf, Link, type LinkAddr, Out } from "./link.ts";
 
 export type AfterglowTarget = {
   link: LinkAddr;
   // the app: a shortcut or program the host's desk listed
   target: string;
-  // the app gets a display of its own at the viewer's size (afterglow's virtual
-  // display): no monitor needed, the console's own left alone
+  // the app gets a display of its own at the viewer's size (SudoVDA on Windows, an
+  // Xvfb on Linux): no monitor needed, the console's own left alone
   virtualDisplay: boolean;
   // the capture rate when the viewer names none
   fps?: number;
@@ -38,7 +37,7 @@ export class AfterglowSource implements Source {
   private cur?: Running;
   private gen = 0;
   private finished = false;
-  private keys = new InputPacker((_ch, pkt) => this.cur && this.link?.send(In.input, pkt));
+  private keys = new InputPacker((pkt) => this.cur && this.link?.send(In.input, pkt));
   timings: Record<string, number> = {};
 
   constructor(private t: AfterglowTarget) {}

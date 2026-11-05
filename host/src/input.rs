@@ -1,4 +1,4 @@
-//! GameStream input packets, as the client's `InputPacker` writes them, into events for
+//! afterglow's input packets (docs/protocol.md), as the client's `InputPacker` writes them, into events for
 //! the platform to inject; and the key state around them: a held key repeats, a stopped
 //! video leaves nothing held down.
 //!
@@ -251,7 +251,7 @@ fn repeat(state: &(Mutex<State>, Condvar), sink: &dyn Inject) {
 mod tests {
     use super::*;
 
-    // packets as src/glow/spark.ts's pack writes them
+    // packets as src/afterglow/input.ts's pack writes them
     fn packet(magic: u32, body: &[u8]) -> Vec<u8> {
         let mut b = (4 + body.len() as u32).to_be_bytes().to_vec();
         b.extend_from_slice(&magic.to_le_bytes());

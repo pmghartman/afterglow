@@ -1,7 +1,7 @@
 {
   "name": "@phosphorus/afterglow",
   "version": "0.0.0",
-  "description": "Stream a Windows host's apps as low-latency H.264: afterglow, a host driven over one loopback link, and glow, a GameStream client",
+  "description": "Native apps streamed as low-latency H.264: afterglow, a Rust host for Windows and Linux driven over one loopback link, and its client",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",

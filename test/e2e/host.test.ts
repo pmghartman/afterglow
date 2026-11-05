@@ -1,8 +1,9 @@
-// the real host (host/, built) on a real X server, driven by AfterglowSource over the
-// real link: xterm launched, its screen streamed as H.264 that ffmpeg decodes, a
-// command typed into it that runs, a keyframe asked for, a resize, quit. Runs where
-// AFTERGLOW_BIN names a built afterglow and Xvfb, xterm and ffmpeg are installed
-// (`bun run test:host`); skipped otherwise
+// the real host (host/, built) driven by AfterglowSource over the real link. xterm on a
+// display of its own (the host's Xvfb): filling it, streamed as H.264 that ffmpeg
+// decodes, a command typed into it that runs, the pointer drawn where it went, a
+// keyframe asked for, a resize the display follows, quit. Then xterm on the session's
+// own display (an Xvfb this test starts). Runs where AFTERGLOW_BIN names a built
+// afterglow and Xvfb, xterm and ffmpeg are installed (`bun run test:e2e`); skipped otherwise
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -114,6 +115,24 @@ function lastFrame(stream: Uint8Array, w: number, h: number): Uint8Array {
   return all.subarray(all.length - w * h);
 }
 
+// the viewer's latest picture, gray
+const shotOf = (v: Viewer, w: number, h: number) =>
+  lastFrame(
+    annexB(
+      v.configs[0]!.avcc,
+      v.frames.map((f) => f.avcc),
+    ),
+    w,
+    h,
+  );
+
+// pixels around (x0, y0) that pass
+function count(shot: Uint8Array, w: number, x0: number, y0: number, r: number, f: (p: number) => boolean) {
+  let n = 0;
+  for (let y = y0 - r; y < y0 + r; y++) for (let x = x0 - r; x < x0 + r; x++) if (f(shot[y * w + x]!)) n++;
+  return n;
+}
+
 const opened = (w: number, h: number): Opened => ({
   argv: [],
   name: "xterm",
@@ -147,11 +166,14 @@ test.skipIf(!run)(
     expect(v.configs[0]).toMatchObject({ w: 1280, h: 720 });
     expect(v.frames[0]!.key).toBe(true);
 
-    // xterm draws its window: frames follow. Then a command typed as text and an Enter key
+    // xterm maps its window: the host's window manager makes it fill the display
     await settle(1500);
+    const filled = shotOf(v, 1280, 720);
+    expect(count(filled, 1280, 1200, 680, 20, (p) => p > 200)).toBeGreaterThan(1000);
+
+    // a command typed as text and an Enter key: the window manager gave xterm the keyboard
     const proof = join(dir, "typed");
     const before = v.frames.length;
-    src.input(["m", 300, 200], 1280, 720);
     src.input(["x", `echo afterglow > ${proof}`], 1280, 720);
     src.input(["k", true, "Enter", "Enter", false], 1280, 720);
     src.input(["k", false, "Enter", "Enter", false], 1280, 720);
@@ -164,25 +186,13 @@ test.skipIf(!run)(
     src.keyframe();
     await until(() => v.frames.filter((f) => f.key).length > keysBefore, 2000, "the keyframe");
 
-    // the pointer moved over the bare root window: drawn into the frames where it went
+    // the pointer moved: xterm's I-beam drawn into the frames where it went, nowhere else
     const moved = v.frames.length;
     src.input(["m", 900, 500], 1280, 720);
     await until(() => v.frames.length > moved, 2000, "a frame of the pointer's move");
-    const shot = lastFrame(
-      annexB(
-        v.configs[0]!.avcc,
-        v.frames.map((f) => f.avcc),
-      ),
-      1280,
-      720,
-    );
-    const lit = (x0: number, y0: number, r: number) => {
-      let n = 0;
-      for (let y = y0 - r; y < y0 + r; y++) for (let x = x0 - r; x < x0 + r; x++) if (shot[y * 1280 + x]! > 128) n++;
-      return n;
-    };
-    expect(lit(900, 500, 12)).toBeGreaterThan(10);
-    expect(lit(640, 360, 12)).toBe(0);
+    const shot = shotOf(v, 1280, 720);
+    expect(count(shot, 1280, 900, 500, 12, (p) => p < 100)).toBeGreaterThan(5);
+    expect(count(shot, 1280, 640, 360, 12, (p) => p < 100)).toBe(0);
 
     // everything so far decodes, at the size asked
     const d = decode(
@@ -205,9 +215,7 @@ test.skipIf(!run)(
     await until(() => next.frames.length > 0, 5000, "the resized video's first frame");
     expect(next.configs[0]).toMatchObject({ w: 960, h: 540 });
     expect(next.frames[0]!.key).toBe(true);
-    // no window manager: the keyboard follows the pointer, so back over xterm first
-    src.input(["m", 100, 100], 960, 540);
-    await settle(300);
+    await settle(500);
     const typedAt = performance.now();
     const had = next.frames.length;
     src.input(["x", "x"], 960, 540);
@@ -223,6 +231,8 @@ test.skipIf(!run)(
     );
     expect(d2.err).toBe("");
     expect(d2.size).toBe("960,540");
+    // the display followed the video: xterm fills 960x540, not a corner of 1280x720
+    expect(count(shotOf(next, 960, 540), 960, 900, 500, 20, (p) => p > 200)).toBeGreaterThan(1000);
 
     // the app asked to quit: the host closes it and says so
     src.close();
@@ -232,7 +242,31 @@ test.skipIf(!run)(
   60_000,
 );
 
-test.skipIf(!run)("a second driver finds the host free, a missing app refused", async () => {
-  const src = new AfterglowSource({ link: { port, token }, target: "/nonexistent/app", virtualDisplay: false });
-  await expect(src.open(opened(640, 480), new Viewer())).rejects.toThrow("the app didn't start");
-});
+test.skipIf(!run)(
+  "xterm on the session's own display, then a missing app refused",
+  async () => {
+    const v = new Viewer();
+    const src = new AfterglowSource({ link: { port, token }, target: Bun.which("xterm")!, virtualDisplay: false });
+    await src.open(opened(1280, 720), v);
+    src.video({ w: 640, h: 360, fps: 30, kbps: 2000, full: false }, v);
+    await until(() => v.frames.length > 0, 5000, "a frame of the session's display");
+    // the session's display isn't resized: its 1280x720 scaled into the video
+    expect(v.configs[0]).toMatchObject({ w: 640, h: 360 });
+    expect(
+      decode(
+        annexB(
+          v.configs[0]!.avcc,
+          v.frames.map((f) => f.avcc),
+        ),
+        640,
+        360,
+      ).size,
+    ).toBe("640,360");
+    src.quit();
+    await settle(300);
+
+    const missing = new AfterglowSource({ link: { port, token }, target: "/nonexistent/app", virtualDisplay: false });
+    await expect(missing.open(opened(640, 480), new Viewer())).rejects.toThrow("the app didn't start");
+  },
+  30_000,
+);

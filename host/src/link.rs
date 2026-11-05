@@ -1,7 +1,6 @@
-//! The link: one loopback TCP connection from a driver in place of GameStream. No
-//! pairing, RTSP, ENet, AES or RTP: each encoded frame is reshaped once into the AVCC
-//! the viewer's decoder takes (wire.rs) and written to the socket; input comes back on
-//! it as GameStream input packets.
+//! The link: one loopback TCP connection from a driver (docs/protocol.md). Each
+//! encoded frame is reshaped once into the AVCC the viewer's decoder takes (wire.rs)
+//! and written to the socket; input comes back on it as input packets (input.rs).
 //!
 //! One driver at a time: a new connection that says the token takes over and the old
 //! one is closed. One app at a time, kept running between connections and videos so a

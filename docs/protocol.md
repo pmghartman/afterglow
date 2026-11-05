@@ -17,11 +17,11 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | Type | Name | Body |
 | --- | --- | --- |
 | `0x01` | `hello` | the token, as text. Must be first; anything else, or a wrong token, closes the connection |
-| `0x02` | `launch` | JSON `{cmd, name, w, h, fps, virtual_display, fresh}`: the app's path or shortcut, its window size, the capture rate, whether it gets a virtual display of its own |
+| `0x02` | `launch` | JSON `{cmd, name, w, h, fps, virtual_display, fresh}`: the app's path (Windows: a `.exe`, `.lnk` or `.url`; Linux: a program), its window size, the capture rate, whether it gets a display of its own; `fresh` starts it again even when it runs |
 | `0x03` | `video` | JSON `{gen, w, h, fps, kbps, yuv444}`: start a video, replacing any running |
 | `0x04` | `stop_video` | none |
 | `0x05` | `idr` | none: the next frame is a keyframe |
-| `0x06` | `input` | one GameStream input packet (`host/src/input.rs`): mouse moves, buttons, wheels, keys as US-layout virtual keys, UTF-8 text; ignored while no video runs |
+| `0x06` | `input` | one input packet (below); ignored while no video runs |
 | `0x07` | `quit` | none: ask the app to close |
 | `0x08` | `ping` | `u32`, echoed in `pong` |
 
@@ -36,6 +36,26 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | `0x88` | `pong` | `u32` |
 | `0x90` | `config` | `[pad][u16 gen][u16 w][u16 h]` then the avcC record |
 | `0x91` | `frame` | `[u8 key][u16 gen][pad 4]` then the frame as AVCC |
+
+## Input
+
+An `input` body is one packet: `u32` big-endian size of what follows it, `u32` little-endian kind, the event. Coordinates and amounts are big-endian `i16`. The host (`host/src/input.rs`) tracks what's held: a held key repeats after 500 ms every 40 ms, and everything held is let go when a video stops.
+
+| Kind | Event | After the kind |
+| --- | --- | --- |
+| `0x03`, `0x04` | key down, up | `u8` flags, `u16` LE virtual key with `0x8000` set, `u8` modifiers (1 shift, 2 ctrl, 4 alt, 8 meta), `u16` 0 |
+| `0x05` | pointer to | `x`, `y`, `0`, `w - 1`, `h - 1`: (x, y) within the video's w by h |
+| `0x07` | pointer by | `dx`, `dy` |
+| `0x08`, `0x09` | button down, up | `u8`: 1 left, 2 middle, 3 right, 4 and 5 back and forward |
+| `0x0a` | wheel | amount (120 a notch, up positive), twice, then `0` |
+| `0x55000001` | horizontal wheel | amount (right positive) |
+| `0x17` | text | UTF-8, any length |
+
+Keys are US-layout Windows virtual-key codes for the physical key: Windows sends them as scan codes, Linux maps them to X keysyms. A character the viewer's layout makes that US doesn't on that key goes as text.
+
+## Displays
+
+With `virtual_display` the app gets a display of its own at `w` by `h`: on Windows from SudoVDA (made the primary display with `dd_configuration_option = ensure_primary`), on Linux an Xvfb that only afterglow and the app hold the cookie for, run by a window manager inside afterglow that keeps the app's windows filling it and gives it the keyboard. Each `video` sets that display to its own size first, so the app redraws at the viewer's. Without one, the app runs on the console's primary display (Windows) or the session's `$DISPLAY` (Linux), scaled into the video. `ready`'s `virtual_display` says whether this host can give one.
 
 ## Generations
 

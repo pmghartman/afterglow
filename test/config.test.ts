@@ -15,6 +15,7 @@ import {
   readLink,
   svcBinPath,
   tokenOf,
+  unitText,
 } from "../src/index.ts";
 
 test("the config: the link on, its log, the virtual display primary", () => {
@@ -61,4 +62,12 @@ test("the link file read back, nothing when it's missing or bad", () => {
   expect(readLink(p.link)).toBeUndefined();
   writeFileSync(p.link, linkText(linkPort, "short"));
   expect(readLink(p.link)).toBeUndefined();
+});
+
+test("the Linux unit: afterglow as the apps' user, stopped gently", () => {
+  const u = unitText("/opt/afterglow/afterglow", "/var/lib/phosphorus/afterglow/afterglow.conf", "pmh");
+  expect(u).toContain('ExecStart="/opt/afterglow/afterglow" "/var/lib/phosphorus/afterglow/afterglow.conf"');
+  expect(u).toContain("User=pmh");
+  expect(u).toContain("KillMode=mixed");
+  expect(u.endsWith("\n")).toBe(true);
 });

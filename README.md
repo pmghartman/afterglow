@@ -1,8 +1,8 @@
 <h1 align="center">afterglow</h1>
 
 <p align="center">
-  Stream a Windows machine's apps to a browser as low-latency H.264.<br>
-  A Rust host driven over one loopback socket, and a GameStream client for hosts that already run Sunshine or Apollo.
+  Native apps streamed as low-latency H.264, driven over one loopback socket.<br>
+  A Rust host for Windows and Linux, and the TypeScript client that drives it.
 </p>
 
 <p align="center">
@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="#whats-here">What's here</a> ·
+  <a href="#the-protocol">The protocol</a> ·
   <a href="#using-the-client">Using the client</a> ·
   <a href="#the-host">The host</a> ·
   <a href="#development">Development</a> ·
@@ -21,33 +22,32 @@
 
 ---
 
-afterglow is the Windows app-streaming stack of [Phosphorus](https://github.com/pmghartman/phosphorus). Phosphorus installs the host on every Windows machine in a mesh and drives it with the client here; nothing in this repo depends on Phosphorus, and any Bun program can drive it the same way.
+afterglow is how [Phosphorus](https://github.com/pmghartman/phosphorus) streams a machine's native apps. Phosphorus installs the host on each Windows and Linux machine in a mesh and drives it with the client here; nothing in this repo depends on Phosphorus, and any Bun program can drive it the same way.
 
 ## What's here
 
 | Path | What it is | Licence |
 | --- | --- | --- |
-| [`host/`](host) | **afterglow**, the host, in Rust: DXGI desktop capture, Media Foundation H.264 (the GPU's encoder, or Windows' software one), SendInput and the SudoVDA virtual display, served over one token-checked loopback link. Ported from [Apollo](https://github.com/ClassicOldSong/Apollo) (itself a fork of [Sunshine](https://github.com/LizardByte/Sunshine)). `afterglow.exe` plus the `afterglowsvc.exe` service wrapper. An X11 backend runs the same link on Linux, for tests. | GPL-3.0-only |
-| [`src/afterglow/`](src/afterglow) | `AfterglowSource`, the link's client: launch an app, get its frames already shaped as AVCC, send input back. Also the config and link files an installer writes. | Apache-2.0 |
-| [`src/glow/`](src/glow) | **glow**, a GameStream client for a host's own Sunshine or Apollo: pairing and app control (`lumen`), RTSP setup (`ignite`), the ENet control stream sealed with AES-GCM (`spark`), RTP to whole frames (`photon`). Written from the protocol's public description. | Apache-2.0 |
-| [`src/source.ts`](src/source.ts) | The contract both sources keep with whatever drives them. | Apache-2.0 |
+| [`host/`](host) | **afterglow**, the host, in Rust. It launches one app at a time, captures and encodes its display as H.264, and injects the viewer's input. On Windows: DXGI capture, Media Foundation H.264 (the GPU's encoder, or Windows' software one), SendInput, a SudoVDA virtual display per app, and the `afterglowsvc.exe` service. On Linux: an Xvfb per app (or the session's display), MIT-SHM capture driven by XDamage, OpenH264, XTest. | GPL-3.0-only |
+| [`src/afterglow/`](src/afterglow) | `AfterglowSource`, the client: launch an app, get its frames already shaped as AVCC, send input back. Also the config, link file, service line and systemd unit an installer writes. | Apache-2.0 |
+| [`src/source.ts`](src/source.ts) | The contract a source keeps with whatever drives it. | Apache-2.0 |
 | [`docs/protocol.md`](docs/protocol.md) | The link's wire format. | |
 
-### afterglow against GameStream
+## The protocol
 
-| | glow, over GameStream | afterglow |
-| --- | --- | --- |
-| Setup | a separate Sunshine or Apollo install, a certificate added to its state, `apps.json` edited, a restart or a PIN | installed with the app that drives it, nothing to pair |
-| To the first frame | serverinfo, launch over HTTPS, RTSP OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY, ENet connect | one `launch` message, one `video` message |
-| Each frame | RTP-packetized, FEC computed, sent as datagrams, rebuilt from them | the encoder's frame reshaped once to AVCC, one socket write, copied once on arrival |
-| Control and input | ENet, AES-GCM sealed | plain messages on the same loopback socket |
-| Audio | captured and Opus-encoded | not captured |
-| Listening | web UI, nvhttp, RTSP, mDNS, UPnP, tray | the link on `127.0.0.1` only |
-| Encoders | NVENC, AMF, Quick Sync, x264 | Media Foundation's: the GPU vendor's, else Windows' software H.264 |
+One TCP connection on `127.0.0.1`: length-prefixed messages, a token said first, then JSON to launch an app and start a video, and binary for everything per frame ([`docs/protocol.md`](docs/protocol.md)).
 
-Both give each app a virtual display sized to the viewer's window (where the host has SudoVDA), so a machine with no monitor streams; ask for a keyframe instead of restarting the video; and keep the app running between viewers.
+- **To the first frame:** one `launch`, one `video`. No pairing, TLS, RTSP or session setup.
+- **Each frame:** the encoder's output reshaped once into AVCC, the form WebCodecs' `VideoDecoder` takes, behind 8 bytes of room. One socket write on the host, one copy on the client, and the driver overwrites the room with its own header and forwards it as it is. No packetization, FEC or reassembly.
+- **When frames are made:** a frame is captured and encoded when the screen changes (DXGI's frame updates on Windows, XDamage on Linux), within the video's rate, and again once a second when nothing does. A keyframe is a message, not a restart.
+- **Input:** small binary events on the same socket, injected as they arrive.
+- **Displays:** each app gets a display at the viewer's window size, so a machine with no monitor streams. The display follows the viewer through resizes, and the app keeps running between videos and viewers.
 
-Measured on loopback against Sunshine through glow: a changed pixel to a whole frame p50 14 ms, p95 18 ms at 120 fps; open to first frame 0.3 s.
+Measured on Linux (Xvfb, xterm, OpenH264 at 30 fps, `bun run test:e2e`):
+- open to first frame: 90 ms, including starting the app's Xvfb;
+- a key typed to the frame showing it: 9 to 26 ms.
+
+Windows hasn't been measured on GPU hardware yet.
 
 ## Using the client
 
@@ -84,9 +84,9 @@ src.keyframe();
 src.quit();
 ```
 
-`GlowSource` keeps the same contract against a GameStream host; `GlowHost` finds the local Sunshine or Apollo, adds the client's certificate without a PIN where it can write the host's state, and gives it one launcher app so no app list needs editing.
+On Linux the target is a program's path (`/usr/bin/gedit`); with `virtualDisplay` it runs on an Xvfb of its own, otherwise on the session's `$DISPLAY`.
 
-Input goes in as small arrays and leaves as GameStream input packets ([`src/glow/input.ts`](src/glow/input.ts)):
+Input goes in as small arrays and leaves as afterglow's input packets ([`src/afterglow/input.ts`](src/afterglow/input.ts)):
 
 | Message | Meaning |
 | --- | --- |
@@ -97,11 +97,13 @@ Input goes in as small arrays and leaves as GameStream input packets ([`src/glow
 | `["x", text]` | text typed |
 | `["clip", text]` | the viewer's clipboard: the next Ctrl+V types it |
 
-`@phosphorus/afterglow/testing` exports `FakeAfterglow`, the link's server end on a real loopback socket, for testing a driver without Windows. The real host also runs on Linux under X11 (`bun run test:e2e`).
+`@phosphorus/afterglow/testing` exports `FakeAfterglow`, the link's server end on a real loopback socket, for testing a driver without a host.
 
 ## The host
 
-Each [release](https://github.com/pmghartman/afterglow/releases/latest) carries `afterglow-X.Y-windows-x86_64.zip`:
+Each [release](https://github.com/pmghartman/afterglow/releases/latest) carries a build for each platform.
+
+`afterglow-X.Y-windows-x86_64.zip`:
 
 ```
 afterglow.exe              the host
@@ -116,17 +118,24 @@ To install it, an app (Phosphorus's is [`packages/host/host/src/win/afterglow.ts
 2. installs SudoVDA with `drivers\sudovda\install.bat` unless the machine already has it;
 3. creates a service running `tools\afterglowsvc.exe "<path to afterglow.conf>"` (`svcBinPath`).
 
-afterglow then listens on `127.0.0.1:47100` (`linkPort`) and nowhere else. See [`host/README.md`](host/README.md) for how it's built and laid out.
+`afterglow-X.Y-linux-x86_64.tar.gz` holds `afterglow` and the same text files. It needs glibc 2.36 or later, X11 and, for apps on displays of their own, `Xvfb` (Debian and Ubuntu: `xvfb`). To install it, an app:
+
+1. writes `afterglow.conf` and `link.json` with `confText` and `linkText`, readable by the user the apps run as and no one else;
+2. installs a systemd unit from `unitText(<path to afterglow>, <path to afterglow.conf>, <user>)`, enabled and started.
+
+It needs no desktop session: each app gets an Xvfb that only afterglow and the app hold the cookie for, and a window manager inside afterglow keeps the app's windows filling it.
+
+afterglow then listens on `127.0.0.1:47100` (`linkPort`) and nowhere else. The token is a credential: whoever holds it can launch apps and type into them. See [`host/README.md`](host/README.md) for how the host is built and laid out.
 
 Verify a download:
 
 ```bash
-gh attestation verify afterglow-0.1-windows-x86_64.zip --repo pmghartman/afterglow
+gh attestation verify afterglow-0.1-linux-x86_64.tar.gz --repo pmghartman/afterglow
 ```
 
 ## Development
 
-Requires Bun 1.4.4 or later.
+Requires Bun 1.4.4 or later and a Rust toolchain (stable, 1.85 or later).
 
 ```bash
 bun install
@@ -136,39 +145,47 @@ bun install
 bun run check && bun run lint && bun test
 ```
 
-The host needs a Rust toolchain (stable, 1.85 or later):
-
 ```bash
-bun run test:host
+bun run test:host && bun run test:e2e
 ```
 
-```bash
-bun run test:e2e
-```
+- `bun test` runs the client's tests anywhere: the input packets and key mapping, the link's framing, `AfterglowSource` against `FakeAfterglow`, and the installer's files.
+- `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, and capture's colour conversion.
+- `test:e2e` builds the host and runs it for real (needs `Xvfb`, `xterm` and `ffmpeg`). `AfterglowSource` launches xterm on an Xvfb of the host's own and checks that:
+  - it fills the display, and ffmpeg decodes the stream;
+  - a typed command runs, and the pointer is drawn where it moved;
+  - after a resize the display follows;
+  - quit closes it.
 
-`bun test` runs the client's tests anywhere: glow's packet builders and parsers, ENet, the control stream's sealing, the RTP depacketizer, the link's framing, and `AfterglowSource` against `FakeAfterglow`. `test:host` runs the host's tests: the framing and frame shaping, input decoding and key repeat, and the link served on a real socket against a stand-in platform. `test:e2e` builds the host and runs it for real on an X server (needs `Xvfb`, `xterm` and `ffmpeg`): `AfterglowSource` launches xterm through it, ffmpeg decodes the stream, a typed command runs, the pointer is drawn where it moved, a resize, quit.
+  Then it runs xterm on the session's own display.
 
-The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the zip lays it out:
+The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the archive lays it out:
 
 ```bash
 host/scripts/stage.sh "$PWD/afterglow-out" 0.0.0
 ```
 
-Format with `bun run fmt` and `cargo fmt --manifest-path host/Cargo.toml`. A change to the link's wire format touches both ends (`host/src/wire.rs`, `host/src/link.rs` and `src/afterglow/link.ts`) and `docs/protocol.md`.
+Format with `bun run fmt` and `cargo fmt --manifest-path host/Cargo.toml`. A change to the link's wire format touches both ends (`host/src/wire.rs`, `host/src/link.rs`, `host/src/input.rs` and `src/afterglow/`) and `docs/protocol.md`.
 
 ## Releases
 
-Manual, as Phosphorus's: run **release** from the Actions tab (optionally **Bump Major Version**, or **Build only** to try the Windows build without publishing). [`release.yml`](.github/workflows/release.yml) takes the version one past the highest `vMAJOR.MINOR` tag, runs the checks and tests (the host's end-to-end run included), builds the host at that version and smoke-runs it on Windows, and publishes `vX.Y` with the host zip, its `SHA256SUMS` and a build provenance attestation; the notes list the merged pull requests.
+Manual, as Phosphorus's: run **release** from the Actions tab (optionally **Bump Major Version**, or **Build only** to try the builds without publishing). [`release.yml`](.github/workflows/release.yml):
+- takes the version one past the highest `vMAJOR.MINOR` tag;
+- runs the checks and tests, the host's end-to-end run on Linux included;
+- builds the host for Windows (smoke-run on the runner) and Linux;
+- publishes `vX.Y` with both archives, their `SHA256SUMS` and build provenance attestations. The notes list the merged pull requests.
 
 A `vX.Y` tag pushed by hand is released instead, built from its own commit, when it has no release yet.
 
-Every run ends by purging the repo's Actions storage: all caches (nothing in the workflow writes one; older runs' are removed) and all artifacts but a build-only or failed run's own zip, which stays downloadable for the day it's kept.
+Every run ends by purging the repo's Actions storage:
+- all caches: nothing in the workflow writes one, and older runs' are removed;
+- all artifacts except a build-only or failed run's own builds, which stay downloadable for the day they're kept.
 
-Consumers pin the client by that tag. Phosphorus installs the host zip of the version its pin names, so bumping the pin moves both.
+Consumers pin the client by that tag. Phosphorus installs the host of the version its pin names, so bumping the pin moves both.
 
 ## Licence
 
 Two licences, by directory:
 
-- `host/` is **GPL-3.0-only** ([`host/LICENSE`](host/LICENSE), [`host/NOTICE`](host/NOTICE)): ported from Apollo and Sunshine, which are. Each build's `SOURCE.txt` names the commit it was built from.
-- Everything else, including the TypeScript client, is **Apache-2.0** ([`LICENSE`](LICENSE)). The client talks to the host over a socket and contains none of its code; glow was written from GameStream's public description, nothing taken from Sunshine's or Moonlight's code.
+- `host/` is **GPL-3.0-only** ([`host/LICENSE`](host/LICENSE), [`host/NOTICE`](host/NOTICE)): its Windows side was ported from Apollo and Sunshine, which are. Each build's `SOURCE.txt` names the commit it was built from.
+- Everything else, including the TypeScript client, is **Apache-2.0** ([`LICENSE`](LICENSE)). The client talks to the host over a socket and contains none of its code.

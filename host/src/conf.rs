@@ -18,6 +18,8 @@ pub struct Conf {
     pub adapter: String,
     /// `software`: no hardware encoder tried
     pub encoder: String,
+    /// Linux: the Xvfb that gives an app a display of its own; `Xvfb` on the PATH when empty
+    pub xvfb: String,
 }
 
 pub fn parse(text: &str) -> Result<Conf, String> {
@@ -29,6 +31,7 @@ pub fn parse(text: &str) -> Result<Conf, String> {
         primary: false,
         adapter: String::new(),
         encoder: String::new(),
+        xvfb: String::new(),
     };
     for line in text.lines() {
         let line = line.trim();
@@ -45,6 +48,7 @@ pub fn parse(text: &str) -> Result<Conf, String> {
             "dd_configuration_option" => c.primary = v == "ensure_primary",
             "adapter_name" => c.adapter = v.to_string(),
             "encoder" => c.encoder = v.to_ascii_lowercase(),
+            "xvfb" => c.xvfb = v.to_string(),
             _ => {}
         }
     }
