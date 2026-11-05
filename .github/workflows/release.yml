@@ -33,8 +33,8 @@ concurrency:
 env:
   APOLLO_REPO: ClassicOldSong/Apollo
   APOLLO_TAG: v0.4.6
-  # the installer's checksum once known; empty, it's printed for pinning
-  APOLLO_INSTALLER_SHA256: ""
+  # Apollo-0.4.6.exe; its SudoVDA 1.10.9.289 package verified against its catalog
+  APOLLO_INSTALLER_SHA256: 42b2aefaacb3474511517a56b96ee9f0517f30ac38b5dd2fda9fd5b478f5021a
 
 jobs:
   version:
