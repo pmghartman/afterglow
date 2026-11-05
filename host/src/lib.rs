@@ -7,6 +7,7 @@ pub mod log;
 pub mod avc;
 pub mod conf;
 pub mod convert;
+pub mod desk;
 pub mod h264;
 pub mod host;
 pub mod icons;

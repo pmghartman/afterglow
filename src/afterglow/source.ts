@@ -15,6 +15,11 @@ export type AfterglowTarget = {
   transport?: () => Transport | Promise<Transport>;
   // the app: a shortcut or program the host's desk listed
   target: string;
+  // or, in place of target, a process already running taken as the app (Windows; its
+  // pid and start time from Link.processes): nothing started, its windows streamed and
+  // moved to a display of its own with virtualDisplay. Let go, it runs on; close asks
+  // it to close
+  attach?: { pid: number; started?: number; shell?: boolean };
   // Linux: the program and its arguments (a desktop entry's Exec), in place of target
   argv?: string[];
   // Linux: a session bus of the app's own, so a single-instance app starts on the
@@ -74,24 +79,41 @@ export class AfterglowSource implements Source {
     const t1 = performance.now();
     const fps = this.fpsOf(s.fps);
     const answer = this.link.next(Out.launched, 60_000);
-    this.link.json(In.launch, {
-      cmd: this.t.target,
-      ...(this.t.argv?.length ? { argv: this.t.argv } : {}),
-      name: s.name,
-      w: s.w,
-      h: s.h,
-      fps,
-      dpi: s.dpi,
-      scale: s.scale,
-      dbus: !!this.t.dbus,
-      ...(this.t.login ? { login: this.t.login } : {}),
-      virtual_display: this.t.virtualDisplay,
-      fresh: true,
-    });
+    const at = this.t.attach;
+    if (at) {
+      this.link.json(In.attach, {
+        pid: at.pid,
+        ...(at.started !== undefined ? { started: at.started } : {}),
+        shell: !!at.shell,
+        name: s.name,
+        w: s.w,
+        h: s.h,
+        fps,
+        dpi: s.dpi,
+        scale: s.scale,
+        virtual_display: this.t.virtualDisplay,
+      });
+    } else {
+      this.link.json(In.launch, {
+        cmd: this.t.target,
+        ...(this.t.argv?.length ? { argv: this.t.argv } : {}),
+        name: s.name,
+        w: s.w,
+        h: s.h,
+        fps,
+        dpi: s.dpi,
+        scale: s.scale,
+        dbus: !!this.t.dbus,
+        ...(this.t.login ? { login: this.t.login } : {}),
+        virtual_display: this.t.virtualDisplay,
+        fresh: true,
+      });
+    }
     const r = jsonOf(await answer);
     if (r.ok !== true) {
-      this.link.close("launch refused");
-      throw new Error(`the app didn't start: ${String(r.error ?? "afterglow refused it")}`);
+      this.link.close(at ? "attach refused" : "launch refused");
+      const why = String(r.error ?? "afterglow refused it");
+      throw new Error(at ? `the app couldn't be attached to: ${why}` : `the app didn't start: ${why}`);
     }
     this.features = new Set(Array.isArray(r.features) ? r.features.map(String) : []);
     this.timings = { link: t1 - t0, launch: performance.now() - t1 };

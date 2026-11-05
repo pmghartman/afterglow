@@ -22,6 +22,9 @@ pub struct Conf {
     pub xvfb: String,
     /// served on stdin and stdout for one app, not on a port for any
     pub stdio: bool,
+    /// folders a driver's delete may reach besides the user's own (profile, desktops,
+    /// home): `delete_roots`, a list as PATH is (crate::desk::roots_of)
+    pub delete_roots: Vec<String>,
 }
 
 impl Conf {
@@ -37,6 +40,7 @@ impl Conf {
             encoder: std::env::var("AFTERGLOW_ENCODER").unwrap_or_default(),
             xvfb: std::env::var("AFTERGLOW_XVFB").unwrap_or_default(),
             stdio: true,
+            delete_roots: crate::desk::roots_of(&std::env::var("AFTERGLOW_DELETE_ROOTS").unwrap_or_default()),
         }
     }
 }
@@ -52,6 +56,7 @@ pub fn parse(text: &str) -> Result<Conf, String> {
         encoder: String::new(),
         xvfb: String::new(),
         stdio: false,
+        delete_roots: Vec::new(),
     };
     for line in text.lines() {
         let line = line.trim();
@@ -69,6 +74,7 @@ pub fn parse(text: &str) -> Result<Conf, String> {
             "adapter_name" => c.adapter = v.to_string(),
             "encoder" => c.encoder = v.to_ascii_lowercase(),
             "xvfb" => c.xvfb = v.to_string(),
+            "delete_roots" => c.delete_roots = crate::desk::roots_of(v),
             _ => {}
         }
     }
@@ -98,6 +104,18 @@ mod tests {
         assert_eq!(c.log_level, crate::log::Level::Warning);
         assert!(c.primary);
         assert!(c.encoder.is_empty());
+        assert!(c.delete_roots.is_empty());
+    }
+
+    #[test]
+    fn delete_roots_listed_as_path_is() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let (a, b) = if cfg!(windows) { ("D:\\Shared", "E:\\Work") } else { ("/srv/shared", "/mnt/work") };
+        let c = parse(&format!(
+            "phos_link_port = 1\nphos_link_token = abababababababababab\ndelete_roots = {a}{sep}relative{sep}{b}\n"
+        ))
+        .unwrap();
+        assert_eq!(c.delete_roots, [a, b]);
     }
 
     #[test]

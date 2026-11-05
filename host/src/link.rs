@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::desk::End;
 use crate::host::{Ctl, Cursor, Host, Launch, Login, Sink, VideoCfg};
 use crate::input::Input;
 use crate::wire::{self, input as msg_in, output as msg_out};
@@ -339,6 +340,7 @@ impl<H: Host> Link<H> {
                 "virtual_display": self.host.virtual_display(),
                 "hostname": self.host.hostname(),
                 "running": running,
+                "features": self.host.desk_features(),
             }),
         );
     }
@@ -389,9 +391,20 @@ impl<H: Host> Link<H> {
                 }
             }
             msg_in::LAUNCH => self.launch(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
+            msg_in::ATTACH => self.attach(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
+            msg_in::PROCESSES | msg_in::END | msg_in::DELETE => {
+                self.desk(c, ty, serde_json::from_slice(&body).unwrap_or(Value::Null))
+            }
             msg_in::VIDEO => self.video(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
             _ => {}
         }
+    }
+
+    /// what the launched app can be asked, then what the host's desktop can be
+    fn features(&self) -> Vec<&'static str> {
+        let mut f = self.host.features();
+        f.extend(self.host.desk_features());
+        f
     }
 
     /// the app started, or found running already
@@ -403,30 +416,10 @@ impl<H: Host> Link<H> {
         let mut st = self.lock();
         let fresh = j.get("fresh").and_then(Value::as_bool).unwrap_or(false);
         if st.launched && self.host.running() && !fresh {
-            c.json(msg_out::LAUNCHED, json!({"ok": true, "resumed": true, "features": self.host.features()}));
+            c.json(msg_out::LAUNCHED, json!({"ok": true, "resumed": true, "features": self.features()}));
             return;
         }
-        let l = Launch {
-            cmd: j.get("cmd").and_then(Value::as_str).unwrap_or("").to_string(),
-            name: j.get("name").and_then(Value::as_str).unwrap_or("phosphorus").to_string(),
-            w: (num(&j, "w", 1280, 64, 7680) & !1) as u32,
-            h: (num(&j, "h", 720, 64, 4320) & !1) as u32,
-            fps: num(&j, "fps", 60, 10, 240) as u32,
-            virtual_display: j.get("virtual_display").and_then(Value::as_bool).unwrap_or(true),
-            argv: j
-                .get("argv")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                .unwrap_or_default(),
-            dpi: num(&j, "dpi", 96, 48, 480) as u32,
-            scale: j.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(1.0, 4.0) as f32,
-            dbus: j.get("dbus").and_then(Value::as_bool).unwrap_or(false),
-            login: j.get("login").and_then(|l| {
-                let pass = l.get("password").and_then(Value::as_str).filter(|p| !p.is_empty())?;
-                let user = l.get("user").and_then(Value::as_str).unwrap_or("");
-                Some(Login { user: user.to_string(), password: pass.to_string() })
-            }),
-        };
+        let l = launch_of(&j);
         self.stop_video(&mut st);
         if st.launched {
             self.host.terminate();
@@ -438,10 +431,7 @@ impl<H: Host> Link<H> {
                 st.launched = true;
                 let ms = t0.elapsed().as_millis() as u64;
                 info!("launched [{}] in {ms}ms", l.name);
-                c.json(
-                    msg_out::LAUNCHED,
-                    json!({"ok": true, "resumed": false, "ms": ms, "features": self.host.features()}),
-                );
+                c.json(msg_out::LAUNCHED, json!({"ok": true, "resumed": false, "ms": ms, "features": self.features()}));
             }
             Err(e) => {
                 warn!("launch of [{}] failed: {}", l.argv.first().unwrap_or(&l.cmd), e.error);
@@ -452,6 +442,121 @@ impl<H: Host> Link<H> {
                 c.json(msg_out::LAUNCHED, r);
             }
         }
+    }
+
+    /// a process already running taken as the app: its windows followed as a launched
+    /// app's are, nothing started. Answered as a launch is
+    fn attach(&self, c: &Arc<Conn>, j: Value) {
+        let Some(pid) = j.get("pid").and_then(Value::as_u64).filter(|&p| p > 0 && p <= u32::MAX as u64) else {
+            c.json(msg_out::LAUNCHED, json!({"ok": false, "attached": true, "error": "an attach without a pid"}));
+            return;
+        };
+        let pid = pid as u32;
+        let started = j.get("started").and_then(Value::as_u64);
+        let shell = j.get("shell").and_then(Value::as_bool).unwrap_or(false);
+        let l = launch_of(&j);
+        let mut st = self.lock();
+        self.stop_video(&mut st);
+        if st.launched {
+            self.host.terminate();
+            st.launched = false;
+        }
+        let t0 = Instant::now();
+        match self.host.attach(pid, started, shell, &l) {
+            Ok(()) => {
+                st.launched = true;
+                let ms = t0.elapsed().as_millis() as u64;
+                info!("attached to pid {pid} [{}] in {ms}ms", l.name);
+                c.json(
+                    msg_out::LAUNCHED,
+                    json!({"ok": true, "resumed": false, "attached": true, "ms": ms, "features": self.features()}),
+                );
+            }
+            Err(e) => {
+                warn!("attach to pid {pid} refused: {}", e.error);
+                let mut r = json!({"ok": false, "attached": true, "error": e.error});
+                if let Some(code) = e.code {
+                    r["code"] = code.into();
+                }
+                c.json(msg_out::LAUNCHED, r);
+            }
+        }
+    }
+
+    /// the desktop's processes listed, one ended, a file deleted: each on a thread of its
+    /// own, so input and video go on while it waits, answered to the driver that asked
+    /// with the request's `id` echoed
+    fn desk(&self, c: &Arc<Conn>, ty: u8, j: Value) {
+        let host = self.host.clone();
+        let c = c.clone();
+        let _ = thread::Builder::new().name("desk".into()).spawn(move || {
+            let id = j.get("id").cloned();
+            let (out, mut r) = match ty {
+                msg_in::PROCESSES => {
+                    let all = j.get("all").and_then(Value::as_bool).unwrap_or(false);
+                    let r = match host.processes(all) {
+                        Ok(l) => {
+                            info!("processes listed{}: {}", if all { ", all" } else { "" }, l.len());
+                            json!({"ok": true, "list": l.iter().map(|p| p.json()).collect::<Vec<_>>()})
+                        }
+                        Err(e) => {
+                            warn!("processes not listed: {e}");
+                            json!({"ok": false, "error": e})
+                        }
+                    };
+                    (msg_out::PROCESSES, r)
+                }
+                msg_in::END => {
+                    let r = match End::of(&j) {
+                        None => json!({"ok": false, "error": "an end without a pid"}),
+                        Some(e) => {
+                            let what = if e.kill { "kill" } else { "close" };
+                            info!("asked to {what} pid {}{}", e.pid, if e.shell { ", the shell allowed" } else { "" });
+                            match host.end(&e) {
+                                Ok(d) => {
+                                    info!(
+                                        "pid {} {}{}",
+                                        e.pid,
+                                        d.how,
+                                        if d.gone { ", gone" } else { ", still running" }
+                                    );
+                                    json!({"ok": true, "pid": e.pid, "how": d.how, "gone": d.gone})
+                                }
+                                Err(err) => {
+                                    warn!("pid {} not ended: {err}", e.pid);
+                                    json!({"ok": false, "pid": e.pid, "error": err})
+                                }
+                            }
+                        }
+                    };
+                    (msg_out::ENDED, r)
+                }
+                _ => {
+                    let path = j.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                    let permanent = j.get("permanent").and_then(Value::as_bool).unwrap_or(false);
+                    let r = if path.is_empty() {
+                        json!({"ok": false, "path": path, "error": "a delete without a path"})
+                    } else {
+                        info!("asked to delete [{path}]{}", if permanent { " for good" } else { "" });
+                        match host.delete(&path, permanent) {
+                            Ok(recycled) => {
+                                info!("[{path}] {}", if recycled { "recycled" } else { "deleted" });
+                                json!({"ok": true, "path": path, "recycled": recycled})
+                            }
+                            Err(e) => {
+                                warn!("[{path}] not deleted: {e}");
+                                json!({"ok": false, "path": path, "error": e})
+                            }
+                        }
+                    };
+                    (msg_out::DELETED, r)
+                }
+            };
+            if let Some(id) = id {
+                r["id"] = id;
+            }
+            c.json(out, r);
+        });
     }
 
     /// a fresh video at this size and rate, its first frame a keyframe
@@ -516,5 +621,30 @@ impl<H: Host> Link<H> {
         }
         // no key left held down on the host
         self.input.reset();
+    }
+}
+
+/// a launch's (or an attach's) fields, each clamped to what a host can take
+fn launch_of(j: &Value) -> Launch {
+    Launch {
+        cmd: j.get("cmd").and_then(Value::as_str).unwrap_or("").to_string(),
+        name: j.get("name").and_then(Value::as_str).unwrap_or("phosphorus").to_string(),
+        w: (num(j, "w", 1280, 64, 7680) & !1) as u32,
+        h: (num(j, "h", 720, 64, 4320) & !1) as u32,
+        fps: num(j, "fps", 60, 10, 240) as u32,
+        virtual_display: j.get("virtual_display").and_then(Value::as_bool).unwrap_or(true),
+        argv: j
+            .get("argv")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default(),
+        dpi: num(j, "dpi", 96, 48, 480) as u32,
+        scale: j.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(1.0, 4.0) as f32,
+        dbus: j.get("dbus").and_then(Value::as_bool).unwrap_or(false),
+        login: j.get("login").and_then(|l| {
+            let pass = l.get("password").and_then(Value::as_str).filter(|p| !p.is_empty())?;
+            let user = l.get("user").and_then(Value::as_str).unwrap_or("");
+            Some(Login { user: user.to_string(), password: pass.to_string() })
+        }),
     }
 }

@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::desk::{End, Ended, Proc};
 use crate::input::Inject;
 
 /// the account to sign in at the console when no one is, kept out of every log
@@ -163,4 +164,34 @@ pub trait Host: Inject + Send + Sync + 'static {
     fn exit_info(&self) -> serde_json::Value {
         serde_json::json!({})
     }
+
+    /// what this host can do on its desktop besides the app (docs/protocol.md, "The
+    /// desktop"): some of "processes" (listed and ended), "attach", "delete"
+    fn desk_features(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+    /// the console user's processes: with windows, topmost first; with `all`, the rest
+    /// too (crate::desk::order)
+    fn processes(&self, _all: bool) -> Result<Vec<Proc>, String> {
+        Err(NOT_HERE.into())
+    }
+    /// a process already running taken as the app, its windows followed as a launched
+    /// app's are (onto a display of its own with l.virtual_display), nothing started.
+    /// Any app before it is let go first. terminate() then lets it go and leaves it running
+    fn attach(&self, _pid: u32, _started: Option<u64>, _shell: bool, _l: &Launch) -> Result<(), LaunchError> {
+        Err(LaunchError::new(NOT_HERE))
+    }
+    /// one of the user's processes asked to close (its windows' close), or killed. Runs
+    /// on a thread of its own: it may wait up to e.wait_ms
+    fn end(&self, _e: &End) -> Result<Ended, String> {
+        Err(NOT_HERE.into())
+    }
+    /// a file or folder within the user's folders deleted: to the Recycle Bin (Linux: the
+    /// trash) unless permanent. True back when it was recycled. Runs on a thread of its own
+    fn delete(&self, _path: &str, _permanent: bool) -> Result<bool, String> {
+        Err(NOT_HERE.into())
+    }
 }
+
+/// what a host says of a desktop action it doesn't have
+pub const NOT_HERE: &str = "this host can't do that";

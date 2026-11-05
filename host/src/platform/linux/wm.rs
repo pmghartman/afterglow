@@ -8,9 +8,10 @@
 //! at its size like a dialog.
 //! It tells the driver the main window's title and the app's windows as they change,
 //! brings one to the front when asked, closes the app as its own close button would
-//! (WM_DELETE_WINDOW), and carries the clipboard both ways: the viewer's text owned
-//! here as CLIPBOARD and PRIMARY for the app to paste, what the app copies (XFixes
-//! says when) read and sent on. Commands come from the link on a queue and a wake pipe.
+//! (WM_DELETE_WINDOW; a window asked for by _NET_CLOSE_WINDOW the same), and carries
+//! the clipboard both ways: the viewer's text owned here as CLIPBOARD and PRIMARY for
+//! the app to paste, what the app copies (XFixes says when) read and sent on. Commands
+//! come from the link on a queue and a wake pipe.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -154,6 +155,7 @@ struct Atoms {
     allowed: u32,
     act_close: u32,
     act_full: u32,
+    net_close: u32,
 }
 
 fn atoms(c: &RustConnection) -> Result<Atoms, String> {
@@ -187,6 +189,7 @@ fn atoms(c: &RustConnection) -> Result<Atoms, String> {
         "_NET_WM_ALLOWED_ACTIONS",
         "_NET_WM_ACTION_CLOSE",
         "_NET_WM_ACTION_FULLSCREEN",
+        "_NET_CLOSE_WINDOW",
     ];
     let cookies: Vec<_> = names.iter().map(|n| c.intern_atom(false, n.as_bytes())).collect();
     let mut a = Vec::with_capacity(names.len());
@@ -220,6 +223,7 @@ fn atoms(c: &RustConnection) -> Result<Atoms, String> {
         allowed: a[26],
         act_close: a[27],
         act_full: a[28],
+        net_close: a[29],
     })
 }
 
@@ -442,7 +446,10 @@ impl State<'_> {
             return;
         }
         let Some(i) = self.stack.iter().position(|s| s.0 == w) else { return };
-        if e.type_ == self.a.active {
+        if e.type_ == self.a.net_close {
+            // a pager or afterglow's driver asking, as the window's close button would
+            self.close_window(w);
+        } else if e.type_ == self.a.active {
             let s = self.stack.remove(i);
             self.stack.push(s);
             self.focus(w);
@@ -502,16 +509,7 @@ impl State<'_> {
             Cmd::Close => {
                 // the topmost: a dialog in front is what the close button would close
                 let Some(&(w, _)) = self.stack.last() else { return };
-                let polite = self.prop(w, self.a.protocols, AtomEnum::ATOM.into(), 256).is_some_and(|(_, v)| {
-                    v.chunks_exact(4).any(|b| u32::from_ne_bytes(b.try_into().unwrap()) == self.a.delete)
-                });
-                if polite {
-                    let e =
-                        ClientMessageEvent::new(32, w, self.a.protocols, [self.a.delete, x11rb::CURRENT_TIME, 0, 0, 0]);
-                    let _ = self.c.send_event(false, w, EventMask::NO_EVENT, e);
-                } else {
-                    let _ = self.c.kill_client(w);
-                }
+                self.close_window(w);
             }
             Cmd::Clip(text) => {
                 self.clip = text.into_bytes();
@@ -520,6 +518,20 @@ impl State<'_> {
                     let _ = self.c.set_selection_owner(self.clipwin, sel, x11rb::CURRENT_TIME);
                 }
             }
+        }
+    }
+
+    /// a window asked to close as its close button would (WM_DELETE_WINDOW); one that
+    /// takes no such request has its client disconnected
+    fn close_window(&self, w: u32) {
+        let polite = self.prop(w, self.a.protocols, AtomEnum::ATOM.into(), 256).is_some_and(|(_, v)| {
+            v.chunks_exact(4).any(|b| u32::from_ne_bytes(b.try_into().unwrap()) == self.a.delete)
+        });
+        if polite {
+            let e = ClientMessageEvent::new(32, w, self.a.protocols, [self.a.delete, x11rb::CURRENT_TIME, 0, 0, 0]);
+            let _ = self.c.send_event(false, w, EventMask::NO_EVENT, e);
+        } else {
+            let _ = self.c.kill_client(w);
         }
     }
 
@@ -646,6 +658,7 @@ fn run(
         a.act_full,
         a.net_name,
         a.wtype,
+        a.net_close,
     ];
     let _ = c.change_property32(PropMode::REPLACE, root, a.supported, AtomEnum::ATOM, &net);
     for w in [root, clipwin] {
@@ -718,13 +731,9 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::linux::xserver::Xvfb;
+    use crate::platform::linux::xserver::{ONE_XVFB, Xvfb};
     use std::time::{Duration, Instant};
     use x11rb::protocol::xproto::{Atom, PropMode};
-
-    /// tests with an Xvfb of their own, one at a time: two servers coming up with their
-    /// framebuffers beside the encoder's tests starve each other
-    static ONE_XVFB: Mutex<()> = Mutex::new(());
 
     fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
         let t0 = Instant::now();

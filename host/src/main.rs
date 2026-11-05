@@ -2,6 +2,8 @@
 //! afterglow --stdio: one driver on stdin and stdout (ssh's), the app ended with it
 //! afterglow --icons: app icons for the specs on stdin, a JSON line each on stdout
 //! afterglow --features: what this build serves, one line, for a driver probing a host
+//! afterglow --delete: (Windows) one delete as whoever runs it, what afterglow starts as
+//! the console user (platform/windows/desk.rs)
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -9,11 +11,11 @@ use std::sync::atomic::AtomicBool;
 use afterglow::link::{Link, PROTO, VERSION};
 use afterglow::{conf, error, icons, info, log, platform};
 
-/// what a driver can count on from this build; icons is Windows only
+/// what a driver can count on from this build; icons and attach are Windows only
 const FEATURES: &str = if cfg!(windows) {
-    "stdio argv notes clipboard raise close cursor icons"
+    "stdio argv notes clipboard raise close cursor icons processes attach delete"
 } else {
-    "stdio argv notes clipboard raise close cursor"
+    "stdio argv notes clipboard raise close cursor processes delete"
 };
 
 fn main() {
@@ -29,6 +31,8 @@ fn main() {
         "--features" => return println!("afterglow {VERSION} proto={PROTO} {FEATURES}"),
         "--stdio" => return stdio(),
         "--icons" => std::process::exit(icons::run()),
+        #[cfg(windows)]
+        "--delete" => std::process::exit(platform::windows::delete_main()),
         _ => {}
     }
     let conf = match std::fs::read_to_string(&path)

@@ -1,7 +1,8 @@
 //! The link served on a real loopback socket against a stand-in platform: the token
 //! first, launch, a video's config and frames shaped as the driver reads them, a
 //! keyframe asked for, input handed on, ping, quit, the app exiting on its own, a new
-//! driver taking over.
+//! driver taking over; the desktop's processes listed, one attached to, ended, a file
+//! deleted, none of it before the token.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use afterglow::desk::{End, Ended, Proc};
 use afterglow::host::{Ctl, Cursor, Host, Launch, LaunchError, Sink, VideoCfg};
 use afterglow::input::Inject;
 use afterglow::link::Link;
@@ -25,6 +27,8 @@ struct Fake {
     events: Mutex<Vec<String>>,
     idrs: Mutex<u32>,
     videos: Mutex<Vec<VideoCfg>>,
+    /// what the desktop was asked: "processes all", "attach 7", "end 7 kill", "delete /x"
+    desk: Mutex<Vec<String>>,
 }
 
 impl Inject for Fake {
@@ -66,6 +70,49 @@ impl Host for Fake {
     }
     fn terminate(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+    fn desk_features(&self) -> Vec<&'static str> {
+        vec!["processes", "attach", "delete"]
+    }
+    fn processes(&self, all: bool) -> Result<Vec<Proc>, String> {
+        self.desk.lock().unwrap().push(format!("processes{}", if all { " all" } else { "" }));
+        let p = Proc {
+            pid: 7,
+            ppid: 1,
+            exe: "C:\\x\\notepad.exe".into(),
+            name: "notepad.exe".into(),
+            started: 1_700_000_000_000,
+            windows: vec![(0x1234, "notes - Notepad".into())],
+        };
+        let mut l = vec![p];
+        if all {
+            l.push(Proc { pid: 8, name: "bg.exe".into(), ..Proc::default() });
+        }
+        Ok(l)
+    }
+    fn attach(&self, pid: u32, started: Option<u64>, shell: bool, l: &Launch) -> Result<(), LaunchError> {
+        self.desk.lock().unwrap().push(format!("attach {pid} {started:?} {shell} {}x{}", l.w, l.h));
+        if pid != 7 {
+            return Err(LaunchError::new("there's no process 9"));
+        }
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn end(&self, e: &End) -> Result<Ended, String> {
+        self.desk.lock().unwrap().push(format!("end {}{}", e.pid, if e.kill { " kill" } else { "" }));
+        if e.pid == 4 {
+            return Err("System keeps the session running: it's never ended here".into());
+        }
+        // a slow close: the link serves on meanwhile
+        thread::sleep(Duration::from_millis(300));
+        Ok(Ended { how: if e.kill { "killed" } else { "closed" }, gone: true })
+    }
+    fn delete(&self, path: &str, permanent: bool) -> Result<bool, String> {
+        self.desk.lock().unwrap().push(format!("delete {path}{}", if permanent { " for good" } else { "" }));
+        if path.starts_with("C:\\Windows") {
+            return Err(format!("{path} is outside the user's folders"));
+        }
+        Ok(!permanent)
     }
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
         self.videos.lock().unwrap().push(*v);
@@ -172,6 +219,109 @@ fn a_wrong_token_is_closed_unanswered() {
     let mut d = Driver::open(port);
     d.send(i::PING, &[1, 2, 3, 4]);
     assert_eq!(d.next(), None);
+}
+
+#[test]
+fn the_desktop_untouched_before_the_token() {
+    let (fake, port, _) = serve();
+    for (ty, body) in [
+        (i::PROCESSES, json!({"all": true})),
+        (i::END, json!({"pid": 7, "kill": true})),
+        (i::DELETE, json!({"path": "C:\\Users\\me\\Desktop\\x.txt"})),
+        (i::ATTACH, json!({"pid": 7})),
+    ] {
+        let mut d = Driver::open(port);
+        d.json(ty, body.clone());
+        assert_eq!(d.next(), None);
+        // a wrong token first, then the ask: closed at the token
+        let mut d = Driver::open(port);
+        d.send(i::HELLO, b"0123456789abcdef0124");
+        d.json(ty, body);
+        assert_eq!(d.next(), None);
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert!(fake.desk.lock().unwrap().is_empty());
+}
+
+#[test]
+fn processes_listed_one_attached_one_ended_a_file_deleted() {
+    let (fake, port, _) = serve();
+    let mut d = Driver::open(port);
+    d.send(i::HELLO, TOKEN.as_bytes());
+    // what the host's desktop can do, said before any app
+    assert_eq!(d.wait_json(o::READY)["features"], json!(["processes", "attach", "delete"]));
+
+    d.json(i::PROCESSES, json!({"id": 1}));
+    let l = d.wait_json(o::PROCESSES);
+    assert_eq!(l["ok"], true);
+    assert_eq!(l["id"], 1);
+    assert_eq!(
+        l["list"],
+        json!([{"pid": 7, "ppid": 1, "exe": "C:\\x\\notepad.exe", "name": "notepad.exe", "started": 1_700_000_000_000u64,
+            "windows": [[0x1234, "notes - Notepad"]]}])
+    );
+    d.json(i::PROCESSES, json!({"all": true, "id": "b"}));
+    let l = d.wait_json(o::PROCESSES);
+    assert_eq!((l["id"].as_str(), l["list"].as_array().unwrap().len()), (Some("b"), 2));
+
+    // ended: a slow close answered later, a ping meanwhile not held up behind it
+    d.json(i::END, json!({"pid": 7, "id": 3}));
+    d.send(i::PING, &[5, 5, 5, 5]);
+    assert_eq!(d.next().unwrap(), (o::PONG, vec![5, 5, 5, 5]));
+    assert_eq!(d.wait_json(o::ENDED), json!({"ok": true, "id": 3, "pid": 7, "how": "closed", "gone": true}));
+    d.json(i::END, json!({"pid": 7, "kill": true}));
+    assert_eq!(d.wait_json(o::ENDED)["how"], "killed");
+    d.json(i::END, json!({"pid": 4, "id": 4}));
+    let e = d.wait_json(o::ENDED);
+    assert_eq!((e["ok"].as_bool(), e["pid"].as_u64(), e["id"].as_u64()), (Some(false), Some(4), Some(4)));
+    assert!(e["error"].as_str().unwrap().contains("never ended"));
+    d.json(i::END, json!({"kill": true}));
+    assert_eq!(d.wait_json(o::ENDED), json!({"ok": false, "error": "an end without a pid"}));
+
+    // deleted: to the bin unless asked otherwise
+    d.json(i::DELETE, json!({"path": "C:\\Users\\me\\Desktop\\x.txt", "id": 5}));
+    assert_eq!(
+        d.wait_json(o::DELETED),
+        json!({"ok": true, "id": 5, "path": "C:\\Users\\me\\Desktop\\x.txt", "recycled": true})
+    );
+    d.json(i::DELETE, json!({"path": "C:\\Users\\me\\y", "permanent": true}));
+    assert_eq!(d.wait_json(o::DELETED)["recycled"], false);
+    d.json(i::DELETE, json!({"path": "C:\\Windows\\win.ini"}));
+    let r = d.wait_json(o::DELETED);
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().unwrap().contains("outside"));
+    d.json(i::DELETE, json!({}));
+    assert_eq!(d.wait_json(o::DELETED)["error"], "a delete without a path");
+
+    // attached: answered as a launch, the video then runs as for a launched app
+    d.json(i::ATTACH, json!({"pid": 9}));
+    let a = d.wait_json(o::LAUNCHED);
+    assert_eq!((a["ok"].as_bool(), a["attached"].as_bool()), (Some(false), Some(true)));
+    assert_eq!(a["error"], "there's no process 9");
+    d.json(i::ATTACH, json!({"pid": 7, "started": 1_700_000_000_000u64, "w": 1024, "h": 768}));
+    let a = d.wait_json(o::LAUNCHED);
+    assert_eq!((a["ok"].as_bool(), a["attached"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(a["features"], json!(["processes", "attach", "delete"]));
+    d.json(i::VIDEO, json!({"gen": 2}));
+    assert_eq!(&d.wait(o::FRAME)[1..3], &[2, 0]);
+    d.send(i::QUIT, &[]);
+    d.wait(o::EXITED);
+    assert!(!fake.running());
+    assert_eq!(
+        *fake.desk.lock().unwrap(),
+        [
+            "processes",
+            "processes all",
+            "end 7",
+            "end 7 kill",
+            "end 4",
+            "delete C:\\Users\\me\\Desktop\\x.txt",
+            "delete C:\\Users\\me\\y for good",
+            "delete C:\\Windows\\win.ini",
+            "attach 9 None false 1280x720",
+            "attach 7 Some(1700000000000) false 1024x768",
+        ]
+    );
 }
 
 #[test]

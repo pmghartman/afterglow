@@ -5,7 +5,7 @@
 //! OpenH264; input injected with XTest. The app is a process group of its own.
 
 mod capture;
-
+mod desk;
 mod encode;
 mod wm;
 mod xserver;
@@ -79,6 +79,8 @@ pub struct Linux {
     ended: Mutex<serde_json::Value>,
     /// when input was last injected (since epoch()): the stats time what it caused
     input_at: std::sync::atomic::AtomicU64,
+    /// where deletes may reach besides the user's home
+    delete_roots: Vec<String>,
 }
 
 /// a fixed instant to time from across threads
@@ -201,7 +203,19 @@ impl Linux {
             notes: Mutex::new(None),
             ended: Mutex::new(serde_json::json!({})),
             input_at: Default::default(),
+            delete_roots: conf.delete_roots.clone(),
         }))
+    }
+
+    /// the displays the user's windows are on: the app's, and the session's
+    fn displays(&self) -> Vec<Display> {
+        let mut v: Vec<Display> = self.app.lock().unwrap().as_ref().map(|a| a.display.clone()).into_iter().collect();
+        if let Some(s) = &self.session {
+            if !v.iter().any(|d| d.name == s.name) {
+                v.push(s.clone());
+            }
+        }
+        v
     }
 
     /// the size the screen input lands on now is
@@ -609,6 +623,26 @@ impl Host for Linux {
 
     fn exit_info(&self) -> serde_json::Value {
         self.ended.lock().unwrap().clone()
+    }
+
+    fn desk_features(&self) -> Vec<&'static str> {
+        vec!["processes", "delete"]
+    }
+
+    fn processes(&self, all: bool) -> Result<Vec<crate::desk::Proc>, String> {
+        Ok(desk::processes(&self.displays(), all))
+    }
+
+    fn end(&self, e: &crate::desk::End) -> Result<crate::desk::Ended, String> {
+        desk::end(&self.displays(), e)
+    }
+
+    fn delete(&self, path: &str, permanent: bool) -> Result<bool, String> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).filter(|h| h.is_absolute());
+        let Some(home) = home else { return Err("this user has no home to delete within".into()) };
+        let mut roots = vec![home.to_string_lossy().into_owned()];
+        roots.extend(self.delete_roots.iter().cloned());
+        desk::delete(path, permanent, &roots, &desk::trash_dir(&home))
     }
 
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
