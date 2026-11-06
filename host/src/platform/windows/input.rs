@@ -119,6 +119,14 @@ fn extended(vk: u8) -> bool {
     )
 }
 
+impl WinInput {
+    /// the displays woken, as a touch of the mouse wakes them: a move of nothing, so the
+    /// pointer stays where it is and nothing is clicked or typed
+    pub fn wake(&self) {
+        send(&[mouse(MOUSEEVENTF_MOVE, 0, 0, 0)]);
+    }
+}
+
 impl Inject for WinInput {
     fn mouse_abs(&self, x: f32, y: f32) {
         let r = *self.rect.lock().unwrap();

@@ -243,6 +243,9 @@ fn follow(owner: &Owner, shared: &Mutex<String>, stop: &AtomicBool, launched: u6
     while !stop.load(Ordering::Relaxed) {
         let now = shared.lock().unwrap().clone();
         if now != display {
+            if !display.is_empty() {
+                info!("the app's windows follow its display to {now}");
+            }
             display = now;
             said_lost = false;
             asked.clear();

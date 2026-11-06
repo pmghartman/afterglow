@@ -552,6 +552,30 @@ impl Drop for Mmcss {
     }
 }
 
+/// the system and its displays kept on while this lives: a remote viewer's input isn't
+/// the console's, so Windows would otherwise count the session idle and turn the
+/// displays off, sleep or lock under them
+struct Awake;
+
+impl Awake {
+    fn start() -> Awake {
+        use windows::Win32::System::Power::{
+            ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+        };
+        // SAFETY: this thread's own execution state, put back in Drop
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+        Awake
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        use windows::Win32::System::Power::{ES_CONTINUOUS, SetThreadExecutionState};
+        // SAFETY: as above
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    }
+}
+
 /// frames given again after a change at most, while the encoder holds some back
 const FLUSH_FRAMES: u32 = 8;
 
@@ -785,6 +809,10 @@ impl Host for Windows {
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
         com_init();
         let _mmcss = Mmcss::capture();
+        // the machine kept awake and its displays on while it's watched, and woken if
+        // they'd gone off (a locked console's do): what's on them is the video
+        let _awake = Awake::start();
+        self.input.wake();
         // its bitrate as retuned since, kept across a capture set up again
         let mut v = *v;
         let mut name = self.run.lock().unwrap().vdisplay.clone();

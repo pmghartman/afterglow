@@ -50,6 +50,7 @@ features = [
   "Win32_System_JobObjects",
   "Win32_System_Ole",
   "Win32_System_Pipes",
+  "Win32_System_Power",
   "Win32_System_RemoteDesktop",
   "Win32_System_StationsAndDesktops",
   "Win32_System_SystemInformation",
