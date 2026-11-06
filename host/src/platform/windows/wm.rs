@@ -287,15 +287,6 @@ fn follow(
                         Owner::Job(_) if took.contains(&pid) && !before.contains(&(h.0 as isize)) => true,
                         Owner::Job(_) => {
                             let fresh = !before.contains(&(h.0 as isize));
-                            if early && fresh && !looked.get(&pid).copied().unwrap_or(false) {
-                                // a window new since the launch, of a process older than it
-                                if let Some((exe, _)) = process_of(pid).filter(|(e, _)| !SHELL.contains(&e.as_str())) {
-                                    info!(
-                                        "a window of {exe} (pid {pid}), running already, new since the launch: taken as the app's"
-                                    );
-                                    took.insert(pid);
-                                }
-                            }
                             if early {
                                 // started since the launch, and not the shell's: the app's
                                 let take = *looked.entry(pid).or_insert_with(|| {
@@ -311,6 +302,16 @@ fn follow(
                                 });
                                 if take {
                                     adopted.insert(pid);
+                                } else if fresh && !took.contains(&pid) {
+                                    // a window new since the launch, of a process older than it
+                                    if let Some((exe, _)) =
+                                        process_of(pid).filter(|(e, _)| !SHELL.contains(&e.as_str()))
+                                    {
+                                        info!(
+                                            "a window of {exe} (pid {pid}), running already, new since the launch: taken as the app's"
+                                        );
+                                        took.insert(pid);
+                                    }
                                 }
                             }
                             let mine = adopted.contains(&pid) || (fresh && took.contains(&pid));
