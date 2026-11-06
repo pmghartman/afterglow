@@ -1,7 +1,7 @@
 //! The link served on a real loopback socket against a stand-in platform: the token
 //! first, launch, a video's config and frames shaped as the driver reads them, a
 //! keyframe asked for, input handed on, ping, quit, the app exiting on its own, a new
-//! driver taking over; the desktop's processes listed, one attached to, ended, a file
+//! driver taking over, a new bitrate taken by the running video; the desktop's processes listed, one attached to, ended, a file
 //! deleted, none of it before the token.
 
 use std::io::{Read, Write};
@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use afterglow::desk::{End, Ended, Proc};
-use afterglow::host::{Ctl, Cursor, Host, Launch, LaunchError, Sink, VideoCfg};
+use afterglow::host::{Ctl, Cursor, Host, Launch, LaunchError, Retune, Sink, VideoCfg};
 use afterglow::input::Inject;
 use afterglow::link::Link;
 use afterglow::wire::{self, input as i, output as o};
@@ -27,6 +27,8 @@ struct Fake {
     events: Mutex<Vec<String>>,
     idrs: Mutex<u32>,
     videos: Mutex<Vec<VideoCfg>>,
+    /// retunes the running video took
+    retuned: Mutex<Vec<Retune>>,
     /// what the desktop was asked: "processes all", "attach 7", "end 7 kill", "delete /x"
     desk: Mutex<Vec<String>>,
 }
@@ -114,6 +116,9 @@ impl Host for Fake {
         }
         Ok(!permanent)
     }
+    fn retunes(&self, v: &VideoCfg) -> bool {
+        !v.draw_cursor
+    }
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
         self.videos.lock().unwrap().push(*v);
         // the pointer's shape first, unless it's drawn in
@@ -127,6 +132,11 @@ impl Host for Fake {
         let mut idr = true;
         let mut n = 0u8;
         while !ctl.stop.load(Ordering::SeqCst) {
+            if let Some(r) = ctl.take_retune() {
+                self.retuned.lock().unwrap().push(r);
+                out.regen(r.vgen);
+                idr = true;
+            }
             if ctl.idr.swap(false, Ordering::SeqCst) {
                 *self.idrs.lock().unwrap() += 1;
                 idr = true;
@@ -450,4 +460,46 @@ fn a_new_driver_takes_over_and_finds_the_app_running() {
     b.json(i::VIDEO, json!({"gen": 2}));
     let f = b.wait(o::FRAME);
     assert_eq!(&f[1..3], &[2, 0]);
+}
+
+#[test]
+fn a_new_bitrate_retunes_the_running_video() {
+    let (fake, port, shutdown) = serve();
+    let mut d = Driver::open(port);
+    d.send(i::HELLO, TOKEN.as_bytes());
+    d.wait(o::READY);
+    d.json(i::LAUNCH, json!({"cmd": "C:\\App.lnk", "fresh": true}));
+    assert_eq!(d.wait_json(o::LAUNCHED)["ok"], true);
+    d.json(i::VIDEO, json!({"gen": 1, "w": 1280, "h": 720, "fps": 60, "kbps": 8000}));
+    assert_eq!(&d.wait(o::CONFIG)[1..3], &[1, 0]);
+    d.wait(o::FRAME);
+
+    // only the bitrate differs: the same capture, its config and a keyframe under gen 2
+    d.json(i::VIDEO, json!({"gen": 2, "w": 1280, "h": 720, "fps": 60, "kbps": 4000}));
+    let cfg = d.wait(o::CONFIG);
+    assert_eq!(&cfg[1..7], &[2, 0, 0x00, 0x05, 0xd0, 0x02]);
+    let f = d.wait(o::FRAME);
+    assert_eq!(&f[..3], &[1, 2, 0]);
+    // and every frame after it is gen 2's
+    let p = d.wait(o::FRAME);
+    assert_eq!(&p[..3], &[0, 2, 0]);
+    assert_eq!(fake.videos.lock().unwrap().len(), 1);
+    assert_eq!(*fake.retuned.lock().unwrap(), [Retune { vgen: 2, kbps: 4000 }]);
+
+    // another size: a video of its own
+    d.json(i::VIDEO, json!({"gen": 3, "w": 800, "h": 600, "fps": 60, "kbps": 4000}));
+    assert_eq!(&d.wait(o::CONFIG)[1..3], &[3, 0]);
+    let vs = fake.videos.lock().unwrap().clone();
+    assert_eq!(vs.len(), 2);
+    assert_eq!((vs[1].w, vs[1].h, vs[1].kbps), (800, 600, 4000));
+
+    // one the host doesn't retune (the pointer drawn in) is restarted, then a new rate
+    // for it is too
+    d.json(i::VIDEO, json!({"gen": 4, "w": 800, "h": 600, "kbps": 4000, "draw_cursor": true}));
+    assert_eq!(&d.wait(o::CONFIG)[1..3], &[4, 0]);
+    d.json(i::VIDEO, json!({"gen": 5, "w": 800, "h": 600, "kbps": 9000, "draw_cursor": true}));
+    assert_eq!(&d.wait(o::CONFIG)[1..3], &[5, 0]);
+    assert_eq!(fake.videos.lock().unwrap().len(), 4);
+    assert_eq!(fake.retuned.lock().unwrap().len(), 1);
+    shutdown.store(true, Ordering::SeqCst);
 }
