@@ -246,6 +246,42 @@ test.skipIf(!run)(
     // own is hidden, the viewer draws it
     expect(count(resized, 960, 900, 500, 12, (p) => p < 100)).toBe(0);
 
+    // a still screen: a frame a second to keep the stream alive, and the host idle (a
+    // refinement with nothing left to send once left it spinning a core, no frame sent)
+    await settle(1000);
+    const cpu = () => {
+      const f = readFileSync(`/proc/${host!.pid}/stat`, "utf8").split(") ")[1]!.split(" ");
+      return (Number(f[11]) + Number(f[12])) / 100;
+    };
+    const stillFrom = next.frames.length;
+    const c0 = cpu();
+    await settle(3000);
+    const used = cpu() - c0;
+    const still = next.frames.length - stillFrom;
+    console.log(`still for 3 s: ${still} frames, ${used.toFixed(2)} s of the host's CPU`);
+    expect(still).toBeGreaterThanOrEqual(2);
+    expect(still).toBeLessThanOrEqual(6);
+    expect(used).toBeLessThan(0.5);
+
+    // only the bitrate changed: the running capture carries on, its config and a
+    // keyframe under the new video's gen at once
+    const retuned = new Viewer();
+    const asked = performance.now();
+    src.video({ w: 960, h: 540, fps: 30, kbps: 1500, full: false }, retuned);
+    await until(() => retuned.frames.length > 0, 2000, "the retuned video's first frame");
+    console.log(`a new bitrate to its first frame: ${(retuned.frames[0]!.at - asked).toFixed(1)} ms`);
+    expect(retuned.configs[0]).toMatchObject({ w: 960, h: 540 });
+    expect(retuned.frames[0]!.key).toBe(true);
+    const d3 = decode(
+      annexB(
+        retuned.configs[0]!.avcc,
+        retuned.frames.map((f) => f.avcc),
+      ),
+      960,
+      540,
+    );
+    expect(d3.err).toBe("");
+
     // the app asked to quit: the host closes it and says so
     src.close();
     await until(() => v.exits.length > 0 || next.exits.length > 0 || done > 0, 8000, "the app's exit");
