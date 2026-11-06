@@ -103,22 +103,36 @@ struct Out {
     vgen: u16,
     w: u16,
     h: u16,
+    /// parked (Run::parked): nothing goes out
+    muted: Arc<AtomicBool>,
+    /// the pointer's shape as last said, said again at the start of a retuned video
+    cursor: Option<Vec<u8>>,
 }
 
 impl Sink for Out {
     fn frame(&mut self, nals: &[&[u8]], key: bool) -> bool {
+        if self.muted.load(Ordering::Relaxed) {
+            return true;
+        }
         let s = self.shaper.shape(nals, key, self.vgen, self.w, self.h);
         self.conn.send2(s.config, s.frame)
     }
 
     fn cursor(&mut self, c: &Cursor) -> bool {
-        self.conn.send(&wire::cursor_message(c))
+        let m = wire::cursor_message(c);
+        let ok = self.muted.load(Ordering::Relaxed) || self.conn.send(&m);
+        self.cursor = Some(m);
+        ok
     }
 
     fn regen(&mut self, vgen: u16) {
         self.vgen = vgen;
-        // the next keyframe's config goes out again, under the new gen
+        // the next keyframe's config goes out again, under the new gen, and the pointer's
+        // shape, as at the start of any video
         self.shaper = wire::Shaper::default();
+        if let (false, Some(m)) = (self.muted.load(Ordering::Relaxed), &self.cursor) {
+            self.conn.send(m);
+        }
     }
 }
 
@@ -131,7 +145,21 @@ struct Run {
     /// what it was asked as, its bitrate as last retuned
     cfg: VideoCfg,
     thread: Option<JoinHandle<()>>,
+    /// stopped by the driver, the capture kept a moment for a video that only changes
+    /// the bitrate (a driver's rate control stops one video and starts the next): since
+    /// when, and its frames held back meanwhile
+    parked: Option<Instant>,
+    muted: Arc<AtomicBool>,
 }
+
+impl Run {
+    fn alive(&self) -> bool {
+        self.ended.lock().unwrap().is_none() && self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+}
+
+/// how long a stopped video's capture is kept for one that only changes its bitrate
+const PARK: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 struct State {
@@ -263,8 +291,12 @@ impl<H: Host> Link<H> {
         while !self.shutdown.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(250));
             let mut st = self.lock();
+            // a parked video no one took up: stopped now
+            if st.video.as_ref().is_some_and(|r| r.parked.is_some_and(|t| t.elapsed() >= PARK)) {
+                self.stop_video(&mut st);
+            }
             if let Some(r) = &st.video {
-                let why = r.ended.lock().unwrap().take();
+                let why = r.ended.lock().unwrap().take().filter(|_| r.parked.is_none());
                 if let (Some(why), Some(c)) = (why, &st.current) {
                     warn!("video {} ended: {why}", r.vgen);
                     c.json(msg_out::VIDEO_ENDED, json!({"gen": r.vgen, "why": why}));
@@ -356,12 +388,12 @@ impl<H: Host> Link<H> {
     fn handle(&self, c: &Arc<Conn>, ty: u8, body: Vec<u8>) {
         match ty {
             msg_in::INPUT => {
-                if self.lock().video.is_some() {
+                if self.lock().video.as_ref().is_some_and(|r| r.parked.is_none()) {
                     self.input.handle(&body);
                 }
             }
             msg_in::IDR => {
-                if let Some(r) = &self.lock().video {
+                if let Some(r) = self.lock().video.as_ref().filter(|r| r.parked.is_none()) {
                     r.ctl.ask_idr();
                 }
             }
@@ -370,7 +402,7 @@ impl<H: Host> Link<H> {
             }
             msg_in::STOP_VIDEO => {
                 let mut st = self.lock();
-                self.stop_video(&mut st);
+                self.park_video(&mut st);
             }
             msg_in::QUIT => {
                 let mut st = self.lock();
@@ -586,9 +618,12 @@ impl<H: Host> Link<H> {
         // next frame a keyframe under the new gen, rather than set up again from nothing
         let launched = st.launched;
         if let Some(r) = st.video.as_mut() {
-            let alive = r.ended.lock().unwrap().is_none() && r.thread.as_ref().is_some_and(|t| !t.is_finished());
-            if alive && launched && (VideoCfg { kbps: v.kbps, ..r.cfg }) == v && self.host.retunes(&v) {
+            if r.alive() && launched && (VideoCfg { kbps: v.kbps, ..r.cfg }) == v && self.host.retunes(&v) {
                 info!("video {vgen}: video {} at {} kbps", r.vgen, v.kbps);
+                // frames out again from here: any of the old gen before the keyframe are
+                // ones the driver drops
+                r.parked = None;
+                r.muted.store(false, Ordering::Relaxed);
                 r.ctl.ask_retune(Retune { vgen, kbps: v.kbps });
                 r.vgen = vgen;
                 r.cfg = v;
@@ -602,7 +637,9 @@ impl<H: Host> Link<H> {
         }
         let ctl = Arc::new(Ctl::default());
         let ended: Arc<Mutex<Option<String>>> = Arc::default();
-        let (host, ctl2, ended2, conn) = (self.host.clone(), ctl.clone(), ended.clone(), c.clone());
+        let muted = Arc::new(AtomicBool::new(false));
+        let (host, ctl2, ended2, conn, muted2) =
+            (self.host.clone(), ctl.clone(), ended.clone(), c.clone(), muted.clone());
         info!(
             "video {vgen}: {}x{} at {} fps, {} kbps{}",
             v.w,
@@ -614,8 +651,15 @@ impl<H: Host> Link<H> {
         let thread = thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                let mut out =
-                    Out { conn: conn.clone(), shaper: wire::Shaper::default(), vgen, w: v.w as u16, h: v.h as u16 };
+                let mut out = Out {
+                    conn: conn.clone(),
+                    shaper: wire::Shaper::default(),
+                    vgen,
+                    w: v.w as u16,
+                    h: v.h as u16,
+                    muted: muted2,
+                    cursor: None,
+                };
                 let r = host.video(&v, &ctl2, &mut out);
                 if ctl2.stop.load(Ordering::Relaxed) || conn.dead.load(Ordering::Relaxed) {
                     return;
@@ -630,7 +674,21 @@ impl<H: Host> Link<H> {
                 *ended2.lock().unwrap() = Some(why);
             })
             .expect("a thread");
-        st.video = Some(Run { ctl, ended, vgen, cfg: v, thread: Some(thread) });
+        st.video = Some(Run { ctl, ended, vgen, cfg: v, thread: Some(thread), parked: None, muted });
+    }
+
+    /// the driver's stop: a video the host can retune parked a moment (Run::parked),
+    /// anything else stopped. Either way nothing more goes out and no key stays held
+    fn park_video(&self, st: &mut State) {
+        match st.video.as_mut() {
+            Some(r) if r.parked.is_none() && r.alive() && self.host.retunes(&r.cfg) => {
+                r.parked = Some(Instant::now());
+                r.muted.store(true, Ordering::Relaxed);
+                self.input.reset();
+            }
+            Some(r) if r.parked.is_some() => {}
+            _ => self.stop_video(st),
+        }
     }
 
     /// the running video stopped and joined; the app left running

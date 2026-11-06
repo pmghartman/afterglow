@@ -486,12 +486,43 @@ fn a_new_bitrate_retunes_the_running_video() {
     assert_eq!(fake.videos.lock().unwrap().len(), 1);
     assert_eq!(*fake.retuned.lock().unwrap(), [Retune { vgen: 2, kbps: 4000 }]);
 
+    // as AfterglowSource changes the bitrate: the video stopped, then the next asked.
+    // Stopped, nothing more of it comes; the next is the same capture, retuned
+    d.send(i::STOP_VIDEO, &[]);
+    d.send(i::PING, &[2, 2, 2, 2]);
+    loop {
+        let (t, _) = d.next().unwrap();
+        if t == o::PONG {
+            break;
+        }
+        assert_ne!(t, o::CONFIG);
+    }
+    thread::sleep(Duration::from_millis(200));
+    d.send(i::PING, &[3, 3, 3, 3]);
+    let (t, _) = d.next().unwrap();
+    assert_eq!(t, o::PONG, "nothing of a stopped video goes out");
+    d.json(i::VIDEO, json!({"gen": 9, "w": 1280, "h": 720, "fps": 60, "kbps": 6000}));
+    // its pointer shape again, its config and keyframe under gen 9
+    assert_eq!(d.wait(o::CURSOR)[0], 1);
+    assert_eq!(&d.wait(o::CONFIG)[1..3], &[9, 0]);
+    assert_eq!(&d.wait(o::FRAME)[..3], &[1, 9, 0]);
+    assert_eq!(fake.videos.lock().unwrap().len(), 1);
+    assert_eq!(fake.retuned.lock().unwrap().last(), Some(&Retune { vgen: 9, kbps: 6000 }));
+
+    // stopped and nothing after: the capture let go once the moment's past
+    d.send(i::STOP_VIDEO, &[]);
+    thread::sleep(Duration::from_millis(2000));
+    d.json(i::VIDEO, json!({"gen": 10, "w": 1280, "h": 720, "fps": 60, "kbps": 6000}));
+    assert_eq!(&d.wait(o::CONFIG)[1..3], &[10, 0]);
+    assert_eq!(fake.videos.lock().unwrap().len(), 2);
+    assert_eq!(fake.retuned.lock().unwrap().len(), 2);
+
     // another size: a video of its own
     d.json(i::VIDEO, json!({"gen": 3, "w": 800, "h": 600, "fps": 60, "kbps": 4000}));
     assert_eq!(&d.wait(o::CONFIG)[1..3], &[3, 0]);
     let vs = fake.videos.lock().unwrap().clone();
-    assert_eq!(vs.len(), 2);
-    assert_eq!((vs[1].w, vs[1].h, vs[1].kbps), (800, 600, 4000));
+    assert_eq!(vs.len(), 3);
+    assert_eq!((vs[2].w, vs[2].h, vs[2].kbps), (800, 600, 4000));
 
     // one the host doesn't retune (the pointer drawn in) is restarted, then a new rate
     // for it is too
@@ -499,7 +530,7 @@ fn a_new_bitrate_retunes_the_running_video() {
     assert_eq!(&d.wait(o::CONFIG)[1..3], &[4, 0]);
     d.json(i::VIDEO, json!({"gen": 5, "w": 800, "h": 600, "kbps": 9000, "draw_cursor": true}));
     assert_eq!(&d.wait(o::CONFIG)[1..3], &[5, 0]);
-    assert_eq!(fake.videos.lock().unwrap().len(), 4);
-    assert_eq!(fake.retuned.lock().unwrap().len(), 1);
+    assert_eq!(fake.videos.lock().unwrap().len(), 5);
+    assert_eq!(fake.retuned.lock().unwrap().len(), 2);
     shutdown.store(true, Ordering::SeqCst);
 }

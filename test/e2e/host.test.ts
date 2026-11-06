@@ -265,8 +265,10 @@ test.skipIf(!run)(
 
     // only the bitrate changed: the running capture carries on, its config and a
     // keyframe under the new video's gen at once
+    // as Phosphorus's rate control does it: the video stopped, the next asked
     const retuned = new Viewer();
     const asked = performance.now();
+    src.stopVideo();
     src.video({ w: 960, h: 540, fps: 30, kbps: 1500, full: false }, retuned);
     await until(() => retuned.frames.length > 0, 2000, "the retuned video's first frame");
     console.log(`a new bitrate to its first frame: ${(retuned.frames[0]!.at - asked).toFixed(1)} ms`);
