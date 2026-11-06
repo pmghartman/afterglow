@@ -134,6 +134,38 @@ pub struct Cursor {
     pub rgba: Vec<u8>,
 }
 
+impl Cursor {
+    /// the pixels that invert the screen under them (`inverted`, a flag a pixel), which
+    /// RGBA can't say, drawn black, ringed in white where they meet transparency: an
+    /// I-beam then shows on a dark page as on a light one, as browsers draw it
+    pub fn outline_inverted(&mut self, inverted: &[bool]) {
+        let (w, h) = (self.w as usize, self.h as usize);
+        if inverted.len() != w * h || self.rgba.len() != w * h * 4 || !inverted.contains(&true) {
+            return;
+        }
+        for (i, _) in inverted.iter().enumerate().filter(|(_, v)| **v) {
+            self.rgba[i * 4..i * 4 + 4].copy_from_slice(&[0, 0, 0, 255]);
+        }
+        let mut ring = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if self.rgba[i * 4 + 3] != 0 {
+                    continue;
+                }
+                let near = (y.saturating_sub(1)..(y + 2).min(h))
+                    .any(|ny| (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| inverted[ny * w + nx]));
+                if near {
+                    ring.push(i);
+                }
+            }
+        }
+        for i in ring {
+            self.rgba[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+}
+
 /// where a video goes
 pub trait Sink {
     /// one access unit: its NAL units without start codes, whether it's a keyframe.
@@ -223,3 +255,32 @@ pub trait Host: Inject + Send + Sync + 'static {
 
 /// what a host says of a desktop action it doesn't have
 pub const NOT_HERE: &str = "this host can't do that";
+
+#[cfg(test)]
+mod tests {
+    use super::Cursor;
+
+    #[test]
+    fn an_inverting_pointer_drawn_black_ringed_in_white() {
+        // 3x3, transparent, its middle pixel inverting
+        let mut c = Cursor { visible: true, w: 3, h: 3, hot_x: 1, hot_y: 1, rgba: vec![0; 36] };
+        let mut inv = vec![false; 9];
+        inv[4] = true;
+        c.outline_inverted(&inv);
+        for i in 0..9 {
+            let px = &c.rgba[i * 4..i * 4 + 4];
+            assert_eq!(px, if i == 4 { [0, 0, 0, 255] } else { [255, 255, 255, 255] }, "pixel {i}");
+        }
+    }
+
+    #[test]
+    fn opaque_pixels_kept_and_nothing_inverting_left_alone() {
+        let mut c = Cursor { visible: true, w: 2, h: 1, hot_x: 0, hot_y: 0, rgba: vec![9, 9, 9, 255, 0, 0, 0, 0] };
+        let before = c.rgba.clone();
+        c.outline_inverted(&[false, false]);
+        assert_eq!(c.rgba, before);
+        // the opaque neighbour of an inverting pixel stays as it was
+        c.outline_inverted(&[false, true]);
+        assert_eq!(c.rgba, [9, 9, 9, 255, 0, 0, 0, 255]);
+    }
+}

@@ -509,13 +509,15 @@ fn blend(shape: &[u8], pitch: usize, ty: u32, h: usize, x: usize, y: usize, d: &
 
 /// DXGI's pointer shape as straight-alpha RGBA for a browser's cursor. What inverts the
 /// screen under it (a monochrome XOR, a masked colour's XOR pixels) can't be said in
-/// RGBA: it's drawn black, so an I-beam stays visible on the light pages it's mostly over
+/// RGBA: it's drawn black ringed in white, so an I-beam shows on a dark page as on a light one
 pub fn cursor_of(shape: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Cursor {
     let mono = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32;
     let masked = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32;
     let (w, h) = (si.Width as usize, if mono { si.Height as usize / 2 } else { si.Height as usize });
     let pitch = si.Pitch as usize;
     let mut rgba = vec![0u8; w * h * 4];
+    // the pixels that invert what's under them
+    let mut inv = vec![false; w * h];
     for y in 0..h {
         for x in 0..w {
             let d = &mut rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
@@ -524,35 +526,35 @@ pub fn cursor_of(shape: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Cursor {
                 let (Some(&a), Some(&b)) = (shape.get(y * pitch + x / 8), shape.get((y + h) * pitch + x / 8)) else {
                     continue;
                 };
-                d.copy_from_slice(match (a & bit != 0, b & bit != 0) {
-                    (false, false) => &[0, 0, 0, 255],
-                    (false, true) => &[255, 255, 255, 255],
-                    (true, false) => &[0, 0, 0, 0],
-                    (true, true) => &[0, 0, 0, 255],
-                });
+                match (a & bit != 0, b & bit != 0) {
+                    (false, false) => d.copy_from_slice(&[0, 0, 0, 255]),
+                    (false, true) => d.copy_from_slice(&[255, 255, 255, 255]),
+                    (true, false) => {}
+                    (true, true) => inv[y * w + x] = true,
+                }
                 continue;
             }
             let Some(s) = shape.get(y * pitch + x * 4..y * pitch + x * 4 + 4) else { continue };
             if masked {
                 // alpha 0: the colour as it is; 0xff: XORed with the screen, nothing where it's 0
-                let xor = s[3] != 0;
-                let none = s[..3] == [0, 0, 0];
-                d.copy_from_slice(&match (xor, none) {
-                    (false, _) => [s[2], s[1], s[0], 255],
-                    (true, true) => [0, 0, 0, 0],
-                    (true, false) => [0, 0, 0, 255],
-                });
+                if s[3] == 0 {
+                    d.copy_from_slice(&[s[2], s[1], s[0], 255]);
+                } else if s[..3] != [0, 0, 0] {
+                    inv[y * w + x] = true;
+                }
                 continue;
             }
             d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
         }
     }
-    Cursor {
+    let mut c = Cursor {
         visible: true,
         w: w as u32,
         h: h as u32,
         hot_x: si.HotSpot.x.max(0) as u32,
         hot_y: si.HotSpot.y.max(0) as u32,
         rgba,
-    }
+    };
+    c.outline_inverted(&inv);
+    c
 }
