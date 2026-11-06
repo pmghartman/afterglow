@@ -291,6 +291,42 @@ test.skipIf(!run)(
 );
 
 test.skipIf(!run)(
+  "a still, flat screen: a frame a second, the host idle",
+  async () => {
+    // xterm drawn black on black: every macroblock flat, so refinement finds nothing
+    // left to send (which once left the video loop refining again with no wait, a core
+    // spinning and the keepalive never sent)
+    const v = new Viewer();
+    const src = new AfterglowSource({
+      link: { port, token },
+      target: "",
+      argv: [Bun.which("xterm")!, "-bg", "black", "-fg", "black", "-cr", "black"],
+      virtualDisplay: true,
+    });
+    await src.open(opened(640, 360), v);
+    src.video({ w: 640, h: 360, fps: 30, kbps: 4000, full: false }, v);
+    await until(() => v.frames.length > 0, 5000, "the first frame");
+    await settle(1500);
+    const cpu = () => {
+      const f = readFileSync(`/proc/${host!.pid}/stat`, "utf8").split(") ")[1]!.split(" ");
+      return (Number(f[11]) + Number(f[12])) / 100;
+    };
+    const from = v.frames.length;
+    const c0 = cpu();
+    await settle(3000);
+    const used = cpu() - c0;
+    const still = v.frames.length - from;
+    console.log(`flat and still for 3 s: ${still} frames, ${used.toFixed(2)} s of the host's CPU`);
+    expect(still).toBeGreaterThanOrEqual(2);
+    expect(still).toBeLessThanOrEqual(6);
+    expect(used).toBeLessThan(0.5);
+    src.quit();
+    await settle(500);
+  },
+  30_000,
+);
+
+test.skipIf(!run)(
   "the pointer drawn in where it moved, nowhere else",
   async () => {
     const v = new Viewer();
