@@ -184,16 +184,9 @@ impl Windows {
         match vda.add(DISPLAY_GUID, w, h, millihz, "Phosphorus", DISPLAY_SERIAL) {
             Ok(name) => {
                 info!("virtual display {name}: {w}x{h}@{fps}");
-                // Windows puts back the mode it last kept for this display first, and
-                // can turn a change down while it does: asked again for a moment
-                let t0 = Instant::now();
-                loop {
-                    let last = t0.elapsed() >= MODE_SETTLE;
-                    if display::set_mode(&name, w, h, millihz, last) || last {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
+                // asked once: Windows may be putting back the mode it kept for this
+                // display, and then the video's fit_display asks again
+                display::set_mode(&name, w, h, millihz, false);
                 if self.conf.primary {
                     display::make_primary(&name);
                 }
@@ -212,10 +205,19 @@ impl Windows {
     /// was added at and a few standard ones, so for any other it's added again at this
     /// one: the app's windows follow it there. Its name, which may be new, back
     fn fit_display(&self, name: &str, w: u32, h: u32, fps: u32) -> Option<String> {
-        if display::set_mode(name, w, h, fps * 1000, false) {
-            return Some(name.to_string());
+        // a size it offers but turns down: Windows putting back the mode it kept for this
+        // display (seen for a second after it's added), so asked again for a moment
+        let t0 = Instant::now();
+        loop {
+            if display::set_mode(name, w, h, fps * 1000, false) {
+                return Some(name.to_string());
+            }
+            if !display::offers(name, w, h) || t0.elapsed() >= MODE_SETTLE {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        info!("{name} has no {w}x{h} mode: added again at that size");
+        info!("{name} won't take {w}x{h}: added again at that size");
         self.remove_display();
         let new = self.add_display(w, h, fps);
         let mut r = self.run.lock().unwrap();
@@ -513,9 +515,9 @@ impl Windows {
 /// how often SudoVDA is looked for again while it isn't there
 const VDA_RETRY: Duration = Duration::from_secs(10);
 
-/// how long a display just added is asked again for its mode, while Windows is putting
-/// back the one it kept for it
-const MODE_SETTLE: Duration = Duration::from_millis(1000);
+/// how long a display is asked again for a size it offers but turns down, while Windows
+/// is putting back the mode it kept for it
+const MODE_SETTLE: Duration = Duration::from_millis(2000);
 
 /// how long the screen is still before what was coded coarsely is refined
 const REFINE_AFTER: Duration = Duration::from_millis(60);
@@ -693,10 +695,13 @@ impl Host for Windows {
             return Err(LaunchError { code: Some(503), error: "no display or encoder to capture with".into() });
         }
         let cwd = Path::new(&l.cmd).parent().filter(|p| p.is_dir()).and_then(|p| p.to_str()).map(str::to_string);
+        // what was on the desktop before, so a window the launch opens in an app already
+        // running is known by being new
+        let before = if vname.is_some() { wm::snapshot() } else { Default::default() };
         match process::App::start(&cmd, cwd.as_deref()) {
             Ok(app) => {
                 // on a display of its own, the app alone: its windows fill it, the desktop unseen
-                let follower = vname.clone().map(|n| wm::Follower::start(app.job(), n));
+                let follower = vname.clone().map(|n| wm::Follower::start(app.job(), n, before));
                 *self.run.lock().unwrap() = Running { app: Some(app), attached: None, vdisplay: vname, follower };
                 Ok(())
             }

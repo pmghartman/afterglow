@@ -78,19 +78,20 @@ pub struct Follower {
 }
 
 impl Follower {
-    /// the windows of everything in job kept to the display by this GDI name
-    pub fn start(job: HANDLE, display: String) -> Follower {
+    /// the windows of everything in job kept to the display by this GDI name; `before`
+    /// the desktop's windows from before the launch (snapshot())
+    pub fn start(job: HANDLE, display: String, before: HashSet<isize>) -> Follower {
         // a handle isn't Send: its value crosses, the job outlives the follower
-        Self::spawn(Owner::Job(job.0 as usize), display)
+        Self::spawn(Owner::Job(job.0 as usize), display, before)
     }
 
     /// the windows of a process attached to kept to the display; put back where they
     /// were when the follower is dropped
     pub fn attach(pid: u32, display: String) -> Follower {
-        Self::spawn(Owner::Pid(pid), display)
+        Self::spawn(Owner::Pid(pid), display, HashSet::new())
     }
 
-    fn spawn(owner: Owner, display: String) -> Follower {
+    fn spawn(owner: Owner, display: String, before: HashSet<isize>) -> Follower {
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         // SAFETY: fills the struct it's given
@@ -101,7 +102,7 @@ impl Follower {
         let d = display.clone();
         let thread = thread::Builder::new()
             .name("windows".into())
-            .spawn(move || follow(&owner, &d, &s, ticks(launched), &out))
+            .spawn(move || follow(&owner, &d, &s, ticks(launched), &before, &out))
             .ok();
         Follower { stop, thread, seen, started: Instant::now(), display }
     }
@@ -216,7 +217,14 @@ fn process_of(pid: u32) -> Option<(String, u64)> {
 /// display, a window that places itself) until either changes
 const ASKS: u8 = 3;
 
-fn follow(owner: &Owner, shared: &Mutex<String>, stop: &AtomicBool, launched: u64, out: &Seen) {
+fn follow(
+    owner: &Owner,
+    shared: &Mutex<String>,
+    stop: &AtomicBool,
+    launched: u64,
+    before: &HashSet<isize>,
+    out: &Seen,
+) {
     // onto the app's desktop before COM: a thread with a window of its own can't change desktops
     if let Err(e) = user_desktop() {
         warn!("the window follower can't reach the user's desktop: {e}");
@@ -240,6 +248,11 @@ fn follow(owner: &Owner, shared: &Mutex<String>, stop: &AtomicBool, launched: u6
     let mut marked: Vec<isize> = Vec::new();
     let mut asked: HashMap<isize, Asked> = HashMap::new();
     let mut display = String::new();
+    // processes already running whose window new since the launch (not in `before`) was
+    // taken as the app's: an app that's single-instance (Notepad, a browser) opens the
+    // launch's window in its older process, and only that window and its new ones after
+    // are the app's
+    let mut took: HashSet<u32> = HashSet::new();
     while !stop.load(Ordering::Relaxed) {
         let now = shared.lock().unwrap().clone();
         if now != display {
@@ -271,7 +284,18 @@ fn follow(owner: &Owner, shared: &Mutex<String>, stop: &AtomicBool, launched: u6
                             true
                         }
                         Owner::Job(_) if adopted.contains(&pid) => true,
+                        Owner::Job(_) if took.contains(&pid) && !before.contains(&(h.0 as isize)) => true,
                         Owner::Job(_) => {
+                            let fresh = !before.contains(&(h.0 as isize));
+                            if early && fresh && !looked.get(&pid).copied().unwrap_or(false) {
+                                // a window new since the launch, of a process older than it
+                                if let Some((exe, _)) = process_of(pid).filter(|(e, _)| !SHELL.contains(&e.as_str())) {
+                                    info!(
+                                        "a window of {exe} (pid {pid}), running already, new since the launch: taken as the app's"
+                                    );
+                                    took.insert(pid);
+                                }
+                            }
                             if early {
                                 // started since the launch, and not the shell's: the app's
                                 let take = *looked.entry(pid).or_insert_with(|| {
@@ -289,15 +313,17 @@ fn follow(owner: &Owner, shared: &Mutex<String>, stop: &AtomicBool, launched: u6
                                     adopted.insert(pid);
                                 }
                             }
-                            if !adopted.contains(&pid) && !said_none {
+                            let mine = adopted.contains(&pid) || (fresh && took.contains(&pid));
+                            if !mine && !said_none {
                                 strangers.push(pid);
                             }
-                            adopted.contains(&pid)
+                            mine
                         }
                     };
                     if ours {
                         let first = seen.insert(h.0 as isize);
-                        if first && adopted.contains(&pid) {
+                        // from outside the job: closed by its window when the app is, never ended
+                        if first && matches!(owner, Owner::Job(_)) && !in_job.contains(&pid) {
                             out.adopted.lock().unwrap().push(h.0 as isize);
                         }
                         if first && matches!(owner, Owner::Pid(_)) {
@@ -377,15 +403,47 @@ unsafe extern "system" fn collect(h: HWND, l: LPARAM) -> BOOL {
     true.into()
 }
 
-/// the desktop's visible top-level windows that are someone's main window or dialog,
-/// what would be done with each, and its process
-fn top_windows() -> Vec<(HWND, Kind, u32)> {
+/// every top-level window on the user's desktop (Default) as it stands, shown or not: what
+/// was there before a launch
+pub fn snapshot() -> HashSet<isize> {
+    let mut all: Vec<HWND> = Vec::new();
+    let name = super::wide("Default");
+    // SAFETY: collect only pushes to the Vec whose address it's given; the desktop is
+    // closed after
+    unsafe {
+        let l = LPARAM(&mut all as *mut Vec<HWND> as isize);
+        match OpenDesktopW(
+            PCWSTR(name.as_ptr()),
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0,
+        ) {
+            Ok(d) => {
+                let _ = EnumDesktopWindows(Some(d), Some(collect), l);
+                let _ = CloseDesktop(d);
+            }
+            Err(_) => {
+                let _ = EnumWindows(Some(collect), l);
+            }
+        }
+    }
+    all.into_iter().map(|h| h.0 as isize).collect()
+}
+
+/// every top-level window on the thread's desktop, shown or not
+fn all_windows() -> Vec<HWND> {
     let mut all: Vec<HWND> = Vec::new();
     // SAFETY: collect only pushes to the Vec whose address it's given
     unsafe {
         let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut Vec<HWND> as isize));
     }
-    all.into_iter().filter_map(|h| shown(h).map(|(k, pid)| (h, k, pid))).collect()
+    all
+}
+
+/// the desktop's visible top-level windows that are someone's main window or dialog,
+/// what would be done with each, and its process
+fn top_windows() -> Vec<(HWND, Kind, u32)> {
+    all_windows().into_iter().filter_map(|h| shown(h).map(|(k, pid)| (h, k, pid))).collect()
 }
 
 /// a window someone would call one of an app's: visible, top-level and of some size,

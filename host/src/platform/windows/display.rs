@@ -244,6 +244,11 @@ pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32, say: bool) -> bool {
     false
 }
 
+/// whether the display offers w×h at some rate
+pub fn offers(name: &str, w: u32, h: u32) -> bool {
+    sizes_of(&wide(name)).contains(&(w, h))
+}
+
 /// the sizes a display offers, each once
 fn sizes_of(name: &[u16]) -> Vec<(u32, u32)> {
     let mut out = Vec::new();

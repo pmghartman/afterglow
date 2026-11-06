@@ -6,15 +6,18 @@ use std::mem::size_of;
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::GENERIC_ALL;
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DF_ALLOWOTHERACCOUNTHOOK, OpenDesktopW,
     OpenInputDesktop, SetThreadDesktop,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    FindWindowW, GetSystemMetrics, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SPI_GETSCREENSAVERRUNNING, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, WM_CLOSE,
+    XBUTTON1, XBUTTON2,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use crate::input::Inject;
 
@@ -124,6 +127,35 @@ impl WinInput {
     /// pointer stays where it is and nothing is clicked or typed
     pub fn wake(&self) {
         send(&[mouse(MOUSEEVENTF_MOVE, 0, 0, 0)]);
+        // a screensaver ignores a move of nothing: it's asked to close, as Windows
+        // documents for ending one, so the video shows the app and not it
+        if screensaver_running() {
+            sync_desktop();
+            // SAFETY: a message posted to the window found, which only fails if it's gone
+            unsafe {
+                if let Ok(h) = FindWindowW(w!("WindowsScreenSaverClass"), PCWSTR::null()) {
+                    if PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() {
+                        crate::info!("the screensaver ended, so the display shows");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// whether a screensaver is up on the console
+fn screensaver_running() -> bool {
+    let mut on = windows::core::BOOL(0);
+    // SAFETY: the query fills the BOOL it's given
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETSCREENSAVERRUNNING,
+            0,
+            Some(&mut on as *mut _ as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && on.as_bool()
     }
 }
 
