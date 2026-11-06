@@ -388,8 +388,8 @@ fn top_windows() -> Vec<(HWND, Kind, u32)> {
     all.into_iter().filter_map(|h| shown(h).map(|(k, pid)| (h, k, pid))).collect()
 }
 
-/// a window someone would call one of an app's: visible, top-level, not a tool window,
-/// not cloaked, a main window or a dialog (not a caption-less popup an app places
+/// a window someone would call one of an app's: visible, top-level and of some size,
+/// not a tool window, not cloaked, a main window or a dialog (not a caption-less popup an app places
 /// itself); what would be done with it, and its process
 fn shown(h: HWND) -> Option<(Kind, u32)> {
     // SAFETY: queries on a window handle; a window gone since answers false or fails
@@ -405,6 +405,11 @@ fn shown(h: HWND) -> Option<(Kind, u32)> {
         }
         let mut cloaked = 0u32;
         if DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4).is_ok() && cloaked != 0 {
+            return None;
+        }
+        // "visible" and of no size: a toolkit's helper (wxWidgets makes many), not a window
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r).is_err() || r.right - r.left < 2 || r.bottom - r.top < 2 {
             return None;
         }
         let mut pid = 0u32;
