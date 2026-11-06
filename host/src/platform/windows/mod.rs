@@ -111,8 +111,13 @@ struct Running {
 pub struct Windows {
     conf: Conf,
     vda: Mutex<Option<vdisplay::Vda>>,
+    /// when the driver was last looked for, so a machine without it isn't asked at
+    /// every connection
+    vda_tried: Mutex<Instant>,
     run: Mutex<Running>,
     input: input::WinInput,
+    /// the capture is waiting on the secure desktop (Windows::waiting)
+    wait: AtomicBool,
 }
 
 impl Windows {
@@ -131,25 +136,39 @@ impl Windows {
         if process::running_as_system() {
             info!("running as SYSTEM: apps start as the console's user");
         }
-        let vda = vdisplay::Vda::open().map_err(|e| warn!("no virtual displays: {e}")).ok();
+        let vda = vdisplay::Vda::open(true).map_err(|e| warn!("no virtual displays: {e}")).ok();
         Ok(Arc::new(Windows {
             conf: conf.clone(),
             vda: Mutex::new(vda),
+            vda_tried: Mutex::new(Instant::now()),
             run: Mutex::new(Running { app: None, attached: None, vdisplay: None, follower: None }),
             input: input::WinInput::default(),
+            wait: AtomicBool::new(false),
         }))
     }
 
     fn vda_ok(&self) -> bool {
         let mut v = self.vda.lock().unwrap();
         if !v.as_ref().is_some_and(|d| d.ok()) {
-            // the driver installed or restarted since: try it again
-            *v = vdisplay::Vda::open().ok();
+            // the driver installed or restarted since: tried again, now and then
+            let mut tried = self.vda_tried.lock().unwrap();
+            if tried.elapsed() >= VDA_RETRY {
+                *tried = Instant::now();
+                *v = match vdisplay::Vda::open(false) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        debug!("no virtual displays still: {e}");
+                        None
+                    }
+                };
+            }
         }
         v.as_ref().is_some_and(|d| d.ok())
     }
 
-    fn add_display(&self, l: &Launch) -> Option<String> {
+    /// a virtual display added at w×h, set to that mode (and made primary, asked): its
+    /// GDI name
+    fn add_display(&self, w: u32, h: u32, fps: u32) -> Option<String> {
         if !self.vda_ok() {
             return None;
         }
@@ -161,11 +180,20 @@ impl Windows {
                 _ => warn!("the virtual display can't render on {}", self.conf.adapter),
             }
         }
-        let millihz = l.fps * 1000;
-        match vda.add(DISPLAY_GUID, l.w, l.h, millihz, "Phosphorus", DISPLAY_SERIAL) {
+        let millihz = fps * 1000;
+        match vda.add(DISPLAY_GUID, w, h, millihz, "Phosphorus", DISPLAY_SERIAL) {
             Ok(name) => {
-                info!("virtual display {name}: {}x{}@{}", l.w, l.h, l.fps);
-                display::set_mode(&name, l.w, l.h, millihz);
+                info!("virtual display {name}: {w}x{h}@{fps}");
+                // Windows puts back the mode it last kept for this display first, and
+                // can turn a change down while it does: asked again for a moment
+                let t0 = Instant::now();
+                loop {
+                    let last = t0.elapsed() >= MODE_SETTLE;
+                    if display::set_mode(&name, w, h, millihz, last) || last {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
                 if self.conf.primary {
                     display::make_primary(&name);
                 }
@@ -180,6 +208,24 @@ impl Windows {
         }
     }
 
+    /// the app's display set to the video's size. SudoVDA offers the size a display
+    /// was added at and a few standard ones, so for any other it's added again at this
+    /// one: the app's windows follow it there. Its name, which may be new, back
+    fn fit_display(&self, name: &str, w: u32, h: u32, fps: u32) -> Option<String> {
+        if display::set_mode(name, w, h, fps * 1000, false) {
+            return Some(name.to_string());
+        }
+        info!("{name} has no {w}x{h} mode: added again at that size");
+        self.remove_display();
+        let new = self.add_display(w, h, fps);
+        let mut r = self.run.lock().unwrap();
+        r.vdisplay = new.clone();
+        if let (Some(f), Some(n)) = (&r.follower, &new) {
+            f.set_display(n);
+        }
+        new
+    }
+
     fn remove_display(&self) {
         if let Some(v) = self.vda.lock().unwrap().as_ref() {
             if v.remove(DISPLAY_GUID) {
@@ -188,8 +234,30 @@ impl Windows {
         }
     }
 
+    /// the capture waiting on what it can't capture (the secure desktop without the
+    /// right to it), said once as it starts and once as it ends
+    fn waiting(&self, why: Option<&str>) {
+        let was = self.wait.swap(why.is_some(), Ordering::Relaxed);
+        match why {
+            Some(w) if !was => info!("the capture waits: {w}"),
+            None if was => info!("the capture goes on"),
+            _ => {}
+        }
+    }
+
+    /// afterglow's own encoder unless Media Foundation's is asked for, or the pointer is
+    /// drawn in (the GPU composes it)
+    fn own_encoder(&self, v: &VideoCfg) -> bool {
+        !matches!(self.conf.encoder.as_str(), "hardware" | "mf" | "software") && !v.draw_cursor
+    }
+
     /// capture and encode one display until stopped or lost
-    fn stream(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink, name: Option<&str>) -> Result<bool, String> {
+    fn stream(&self, v: &mut VideoCfg, ctl: &Ctl, out: &mut dyn Sink, name: Option<&str>) -> Result<bool, String> {
+        // onto the desktop with the input (the secure one for UAC and the lock screen)
+        // before anything is made on this thread: one that owns a window can't move
+        if !input::sync_desktop() {
+            debug!("the capture couldn't move to the desktop with the input");
+        }
         let Some(o) = display::find(name) else { return Err("no display to capture".into()) };
         *self.input.rect.lock().unwrap() = input::Rect {
             left: o.rect.left,
@@ -199,19 +267,18 @@ impl Windows {
         };
         let (dev, ctx) =
             capture::device_for(&o).map_err(|e| format!("no Direct3D device on {}: {e}", o.adapter_name))?;
-        // afterglow's own encoder unless Media Foundation's is asked for, or the pointer is
-        // drawn in (the GPU composes it)
-        let own = !matches!(self.conf.encoder.as_str(), "hardware" | "mf" | "software") && !v.draw_cursor;
+        let own = self.own_encoder(v);
         let mut dup = match capture::Dup::new(&o, &dev, &ctx, v.draw_cursor, own) {
             Ok(d) => d,
             Err(capture::Lost::Again) => return Ok(true),
             Err(capture::Lost::Wait(why)) => {
-                debug!("{why}");
+                self.waiting(Some(&why));
                 thread::sleep(Duration::from_millis(200));
                 return Ok(true);
             }
             Err(capture::Lost::Fail(why)) => return Err(why),
         };
+        self.waiting(None);
         if own {
             info!("capturing {} ({}x{}) on {}, afterglow's own encoder", o.name, dup.w, dup.h, o.adapter_name);
             return self.stream_own(v, ctl, out, &mut dup);
@@ -255,7 +322,7 @@ impl Windows {
                     return Ok(true);
                 }
                 Err(capture::Lost::Wait(why)) => {
-                    debug!("{why}");
+                    self.waiting(Some(&why));
                     thread::sleep(Duration::from_millis(100));
                     return Ok(true);
                 }
@@ -305,7 +372,13 @@ impl Windows {
     /// only the rectangles duplication says changed are read back, converted and coded
     /// (at another size, all of it scaled in); what's coarse is refined once the
     /// screen is still. As the Linux host's
-    fn stream_own(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink, dup: &mut capture::Dup) -> Result<bool, String> {
+    fn stream_own(
+        &self,
+        v: &mut VideoCfg,
+        ctl: &Ctl,
+        out: &mut dyn Sink,
+        dup: &mut capture::Dup,
+    ) -> Result<bool, String> {
         let (w, h) = (v.w as usize, v.h as usize);
         let cores = thread::available_parallelism().map_or(1, |n| n.get());
         let mut enc = crate::avc::Encoder::new(w, h, v.fps, cores);
@@ -345,7 +418,7 @@ impl Windows {
                     return Ok(true);
                 }
                 Err(capture::Lost::Wait(why)) => {
-                    debug!("{why}");
+                    self.waiting(Some(&why));
                     thread::sleep(Duration::from_millis(100));
                     return Ok(true);
                 }
@@ -360,6 +433,13 @@ impl Windows {
                 // an idle display presents nothing until something draws: past a moment, a
                 // black keyframe, so the viewer has the config and a picture
                 continue;
+            }
+            // a new gen and bitrate: the same capture goes on, a keyframe under the new gen
+            if let Some(r) = ctl.take_retune() {
+                out.regen(r.vgen);
+                v.kbps = r.kbps;
+                rate.retarget(r.kbps, v.fps);
+                ctl.idr.store(true, Ordering::Relaxed);
             }
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
             let now = Instant::now();
@@ -388,7 +468,6 @@ impl Windows {
                 pending = false;
                 next_slot = (next_slot + period).max(now);
             }
-            last = now;
             let [y, u, vv] = yuv.planes();
             let frame = crate::avc::Frame { y, u, v: vv };
             let (opts, act) = if refine {
@@ -406,9 +485,17 @@ impl Windows {
             let d = enc.encode(&frame, &opts);
             stats.encoded(t0.elapsed());
             rate.seen(&d, opts.qp, act);
+            // whether refinement has more to do, frame or not: a refinement that found
+            // nothing to send leaves nothing coarse, and isn't tried again at once
+            coarse = enc.coarse(crate::avc::QP_FINE) > 0;
+            if refine {
+                next_refine = now + period;
+            }
             if !d.frame {
                 continue;
             }
+            // the keepalive counts from the last frame that went out
+            last = now;
             sent = true;
             stats.au(d.bytes);
             if !out.frame(&enc.nals(), d.key) {
@@ -417,15 +504,18 @@ impl Windows {
             if change {
                 changed_at = now;
             }
-            if refine {
-                next_refine = now + period;
-            }
-            coarse = enc.coarse(crate::avc::QP_FINE) > 0;
             stats.tick(0);
         }
         Ok(false)
     }
 }
+
+/// how often SudoVDA is looked for again while it isn't there
+const VDA_RETRY: Duration = Duration::from_secs(10);
+
+/// how long a display just added is asked again for its mode, while Windows is putting
+/// back the one it kept for it
+const MODE_SETTLE: Duration = Duration::from_millis(1000);
 
 /// how long the screen is still before what was coded coarsely is refined
 const REFINE_AFTER: Duration = Duration::from_millis(60);
@@ -571,7 +661,7 @@ impl Host for Windows {
             process::sign_in(login).map_err(LaunchError::new)?;
         }
         self.terminate();
-        let vname = if l.virtual_display { self.add_display(l) } else { None };
+        let vname = if l.virtual_display { self.add_display(l.w, l.h, l.fps) } else { None };
         if display::find(vname.as_deref()).is_none() {
             if vname.is_some() {
                 self.remove_display();
@@ -593,6 +683,10 @@ impl Host for Windows {
                 Err(LaunchError::new(e))
             }
         }
+    }
+
+    fn retunes(&self, v: &VideoCfg) -> bool {
+        self.own_encoder(v)
     }
 
     fn running(&self) -> bool {
@@ -667,7 +761,7 @@ impl Host for Windows {
         let process = desk::take(pid, started, shell).map_err(LaunchError::new)?;
         let a = Attached { pid, process };
         self.terminate();
-        let vname = if l.virtual_display { self.add_display(l) } else { None };
+        let vname = if l.virtual_display { self.add_display(l.w, l.h, l.fps) } else { None };
         if display::find(vname.as_deref()).is_none() {
             if vname.is_some() {
                 self.remove_display();
@@ -691,15 +785,17 @@ impl Host for Windows {
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String> {
         com_init();
         let _mmcss = Mmcss::capture();
-        let name = self.run.lock().unwrap().vdisplay.clone();
+        // its bitrate as retuned since, kept across a capture set up again
+        let mut v = *v;
+        let mut name = self.run.lock().unwrap().vdisplay.clone();
         // the virtual display follows the viewer's window: the app redraws at its size
-        if let Some(n) = &name {
-            display::set_mode(n, v.w, v.h, v.fps * 1000);
+        if let Some(n) = name.clone() {
+            name = self.fit_display(&n, v.w, v.h, v.fps);
         }
         let mut fails = 0u32;
         // set up again after each loss (a mode change, a desktop switch) until stopped
         while !ctl.stop.load(Ordering::Relaxed) {
-            match self.stream(v, ctl, &mut *out, name.as_deref()) {
+            match self.stream(&mut v, ctl, &mut *out, name.as_deref()) {
                 Ok(false) => return Ok(()),
                 Ok(true) => fails = 0,
                 Err(e) => {

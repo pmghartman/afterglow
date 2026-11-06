@@ -54,14 +54,26 @@ struct AddOut {
     target: u32,
 }
 
-pub struct Vda {
-    h: HANDLE,
-    failed: Arc<AtomicBool>,
-}
+/// the driver's handle, closed once both the Vda and its watchdog's pinger let go
+struct Device(HANDLE);
 
 // SAFETY: the device handle is used with synchronous DeviceIoControl from any thread
-unsafe impl Send for Vda {}
-unsafe impl Sync for Vda {}
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        // SAFETY: ours, and no one else's call is in flight: they hold this
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+pub struct Vda {
+    dev: Arc<Device>,
+    failed: Arc<AtomicBool>,
+}
 
 fn call(h: HANDLE, code: u32, input: &[u8], out: &mut [u8]) -> bool {
     let mut n = 0;
@@ -119,14 +131,15 @@ fn device_path() -> Option<Vec<u16>> {
 }
 
 impl Vda {
-    /// the driver opened, its protocol checked, its watchdog fed
-    pub fn open() -> Result<Vda, String> {
+    /// the driver opened, its protocol checked, its watchdog fed. `patient`: its device
+    /// waited for a moment, as it may still be coming up when afterglow starts with Windows
+    pub fn open(patient: bool) -> Result<Vda, String> {
         let mut wait = 20;
         let path = loop {
             if let Some(p) = device_path() {
                 break p;
             }
-            if wait > 320 {
+            if !patient || wait > 320 {
                 return Err("SudoVDA isn't installed".into());
             }
             thread::sleep(Duration::from_millis(wait));
@@ -145,10 +158,9 @@ impl Vda {
             )
         }
         .map_err(|e| format!("SudoVDA won't open: {e}"))?;
+        let dev = Arc::new(Device(h));
         let mut v = [0u8; 4];
         if !call(h, GET_PROTOCOL_VERSION, &[], &mut v) || v[0] != 0 || v[1] < 2 {
-            // SAFETY: ours
-            unsafe { CloseHandle(h).ok() };
             return Err(format!("SudoVDA speaks protocol {}.{}.{}, 0.2 wanted", v[0], v[1], v[2]));
         }
         let failed = Arc::new(AtomicBool::new(false));
@@ -157,14 +169,13 @@ impl Vda {
         if call(h, GET_WATCHDOG, &[], wd_bytes) && wd[0] > 0 {
             // pinged three times a timeout, or the driver removes our displays
             let every = Duration::from_millis(wd[0] as u64 * 1000 / 3);
-            let (hv, f) = (h.0 as usize, failed.clone());
+            let (d, f) = (dev.clone(), failed.clone());
             thread::Builder::new()
                 .name("sudovda-ping".into())
                 .spawn(move || {
-                    let h = HANDLE(hv as *mut c_void);
                     let mut fails = 0;
                     while !f.load(Ordering::Relaxed) {
-                        if call(h, PING, &[], &mut []) {
+                        if call(d.0, PING, &[], &mut []) {
                             fails = 0;
                         } else {
                             fails += 1;
@@ -180,7 +191,7 @@ impl Vda {
                 .map_err(|e| e.to_string())?;
         }
         info!("SudoVDA protocol {}.{}.{}, watchdog {}s", v[0], v[1], v[2], wd[0]);
-        Ok(Vda { h, failed })
+        Ok(Vda { dev, failed })
     }
 
     pub fn ok(&self) -> bool {
@@ -188,7 +199,7 @@ impl Vda {
     }
 
     pub fn set_render_adapter(&self, luid: LUID) -> bool {
-        call(self.h, SET_RENDER_ADAPTER, bytes(&luid), &mut [])
+        call(self.dev.0, SET_RENDER_ADAPTER, bytes(&luid), &mut [])
     }
 
     /// a display added, its GDI name (\\.\DISPLAYn) once Windows has given it one
@@ -201,7 +212,7 @@ impl Vda {
             *d = s;
         }
         let mut out = AddOut::default();
-        if !call(self.h, ADD, bytes(&p), bytes_mut(&mut out)) {
+        if !call(self.dev.0, ADD, bytes(&p), bytes_mut(&mut out)) {
             return Err(format!("SudoVDA didn't add a display: {}", windows::core::Error::from_thread()));
         }
         let mut wait = 20;
@@ -218,16 +229,13 @@ impl Vda {
     }
 
     pub fn remove(&self, guid: GUID) -> bool {
-        call(self.h, REMOVE, bytes(&guid), &mut [])
+        call(self.dev.0, REMOVE, bytes(&guid), &mut [])
     }
 }
 
 impl Drop for Vda {
     fn drop(&mut self) {
+        // the pinger stops at its next turn and lets go of the device: closed then
         self.failed.store(true, Ordering::Relaxed);
-        // SAFETY: ours
-        unsafe {
-            let _ = CloseHandle(self.h);
-        }
     }
 }

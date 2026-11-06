@@ -207,20 +207,21 @@ fn service_main(_args: Vec<OsString>) {
         }
     };
     let Ok(status) = service_control_handler::register(NAME, handler) else { return };
-    let set = |state, accept| {
+    let set = |state, accept, checkpoint| {
         let _ = status.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accept,
             exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::from_secs(30),
+            checkpoint,
+            wait_hint: Duration::from_secs(35),
             process_id: None,
         });
     };
     set(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN | ServiceControlAccept::SESSION_CHANGE,
+        0,
     );
 
     // the config afterglow.exe runs with, as the service's command line names it
@@ -233,9 +234,14 @@ fn service_main(_args: Vec<OsString>) {
     let me = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let log = log_file();
 
+    // afterglow started at once; again a moment after it exits, longer while it keeps
+    // exiting soon after it starts (a crash at start shouldn't spin)
+    let (mut delay, mut backoff) = (0u32, 0u32);
     // SAFETY: handles created and closed in this loop
     unsafe {
-        while WaitForSingleObject(stop.0, 3000) != WAIT_OBJECT_0 {
+        while WaitForSingleObject(stop.0, delay) != WAIT_OBJECT_0 {
+            // no one at the console yet (or between sessions): looked again shortly
+            delay = 1000;
             let session = WTSGetActiveConsoleSessionId();
             if session == u32::MAX {
                 continue;
@@ -253,6 +259,7 @@ fn service_main(_args: Vec<OsString>) {
             };
             let _ = AssignProcessToJobObject(job, pi.hProcess);
             ResumeThread(pi.hThread);
+            let started = std::time::Instant::now();
             loop {
                 let w = WaitForMultipleObjects(&[stop.0, pi.hProcess, session_change.0], false, INFINITE);
                 if w.0 == WAIT_OBJECT_0.0 + 2 {
@@ -264,7 +271,15 @@ fn service_main(_args: Vec<OsString>) {
                     if GetExitCodeProcess(pi.hProcess, &mut code).is_ok() && code == ERROR_SHUTDOWN_IN_PROGRESS {
                         let _ = SetEvent(stop.0);
                     }
+                    // exited soon after it started: waited for longer each time, to a minute
+                    backoff =
+                        if started.elapsed() < Duration::from_secs(30) { (backoff * 2).clamp(2000, 60_000) } else { 0 };
+                    delay = backoff.max(1000);
                     break;
+                }
+                if w.0 == WAIT_OBJECT_0.0 {
+                    // the service manager told it's on its way, not left thinking it hung
+                    set(ServiceState::StopPending, ServiceControlAccept::empty(), 1);
                 }
                 // stopping, or the console moved: asked to exit, made to after 20s
                 let asked = spawn(
@@ -285,6 +300,8 @@ fn service_main(_args: Vec<OsString>) {
                 if !asked || WaitForSingleObject(pi.hProcess, 20_000) != WAIT_OBJECT_0 {
                     let _ = TerminateProcess(pi.hProcess, 1);
                 }
+                // the console moved: started in its session at once
+                delay = 0;
                 break;
             }
             let _ = CloseHandle(pi.hThread);
@@ -294,5 +311,5 @@ fn service_main(_args: Vec<OsString>) {
         }
         let _ = CloseHandle(log);
     }
-    set(ServiceState::Stopped, ServiceControlAccept::empty());
+    set(ServiceState::Stopped, ServiceControlAccept::empty(), 0);
 }

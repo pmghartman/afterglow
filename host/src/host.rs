@@ -70,17 +70,37 @@ pub struct VideoCfg {
     pub draw_cursor: bool,
 }
 
+/// a running video carried on as a new one: its gen and bitrate, the rest the same
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retune {
+    pub vgen: u16,
+    pub kbps: u32,
+}
+
 /// a running video's controls, raised by the link
 #[derive(Default)]
 pub struct Ctl {
     pub stop: AtomicBool,
     /// the next frame a keyframe
     pub idr: AtomicBool,
+    /// a new gen and bitrate for the video, taken at its next frame: the sink told the
+    /// gen, the rate changed, a keyframe sent (Host::retunes)
+    retune: Mutex<Option<Retune>>,
     /// what wakes the capture from its wait, set by the platform that waits
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Ctl {
+    pub fn ask_retune(&self, r: Retune) {
+        *self.retune.lock().unwrap() = Some(r);
+        self.kick();
+    }
+
+    /// a retune asked since last taken
+    pub fn take_retune(&self) -> Option<Retune> {
+        self.retune.lock().unwrap().take()
+    }
+
     pub fn on_wake(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.wake.lock().unwrap() = Some(Box::new(f));
     }
@@ -121,6 +141,9 @@ pub trait Sink {
     fn frame(&mut self, nals: &[&[u8]], key: bool) -> bool;
     /// the pointer's new shape, without draw_cursor
     fn cursor(&mut self, c: &Cursor) -> bool;
+    /// the frames from here on are video `vgen`'s (a retune): its config goes ahead of
+    /// the next keyframe
+    fn regen(&mut self, _vgen: u16) {}
 }
 
 /// what the host tells the driver besides frames: `{t: "title", s}`, `{t: "windows",
@@ -140,6 +163,11 @@ pub trait Host: Inject + Send + Sync + 'static {
     /// capture and encode until ctl.stop is raised or the sink says stop (Ok), or the
     /// capture fails (Err, why). Runs on its own thread; the first frame a keyframe
     fn video(&self, v: &VideoCfg, ctl: &Ctl, out: &mut dyn Sink) -> Result<(), String>;
+    /// whether a video running as `v` takes Ctl::ask_retune, so a new video differing
+    /// only in its bitrate goes on in the same capture rather than starting another
+    fn retunes(&self, _v: &VideoCfg) -> bool {
+        false
+    }
 
     /// where the host's notes go, set once by the link
     fn on_notes(&self, _f: Notes) {}

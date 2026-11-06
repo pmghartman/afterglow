@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::desk::End;
-use crate::host::{Ctl, Cursor, Host, Launch, Login, Sink, VideoCfg};
+use crate::host::{Ctl, Cursor, Host, Launch, Login, Retune, Sink, VideoCfg};
 use crate::input::Input;
 use crate::wire::{self, input as msg_in, output as msg_out};
 use crate::{error, info, warn};
@@ -114,6 +114,12 @@ impl Sink for Out {
     fn cursor(&mut self, c: &Cursor) -> bool {
         self.conn.send(&wire::cursor_message(c))
     }
+
+    fn regen(&mut self, vgen: u16) {
+        self.vgen = vgen;
+        // the next keyframe's config goes out again, under the new gen
+        self.shaper = wire::Shaper::default();
+    }
 }
 
 /// one run of the video on its own thread
@@ -122,6 +128,8 @@ struct Run {
     /// why the capture stopped by itself, once it has
     ended: Arc<Mutex<Option<String>>>,
     vgen: u16,
+    /// what it was asked as, its bitrate as last retuned
+    cfg: VideoCfg,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -565,12 +573,7 @@ impl<H: Host> Link<H> {
             return;
         }
         let mut st = self.lock();
-        self.stop_video(&mut st);
         let vgen = num(&j, "gen", 0, 0, 65535) as u16;
-        if !st.launched {
-            c.json(msg_out::VIDEO_ENDED, json!({"gen": vgen, "why": "no app is running"}));
-            return;
-        }
         let v = VideoCfg {
             w: (num(&j, "w", 1280, 64, 7680) & !1) as u32,
             h: (num(&j, "h", 720, 64, 4320) & !1) as u32,
@@ -579,6 +582,24 @@ impl<H: Host> Link<H> {
             yuv444: j.get("yuv444").and_then(Value::as_bool).unwrap_or(false),
             draw_cursor: j.get("draw_cursor").and_then(Value::as_bool).unwrap_or(false),
         };
+        // only the bitrate changed (a driver's rate control): the capture goes on, its
+        // next frame a keyframe under the new gen, rather than set up again from nothing
+        let launched = st.launched;
+        if let Some(r) = st.video.as_mut() {
+            let alive = r.ended.lock().unwrap().is_none() && r.thread.as_ref().is_some_and(|t| !t.is_finished());
+            if alive && launched && (VideoCfg { kbps: v.kbps, ..r.cfg }) == v && self.host.retunes(&v) {
+                info!("video {vgen}: video {} at {} kbps", r.vgen, v.kbps);
+                r.ctl.ask_retune(Retune { vgen, kbps: v.kbps });
+                r.vgen = vgen;
+                r.cfg = v;
+                return;
+            }
+        }
+        self.stop_video(&mut st);
+        if !st.launched {
+            c.json(msg_out::VIDEO_ENDED, json!({"gen": vgen, "why": "no app is running"}));
+            return;
+        }
         let ctl = Arc::new(Ctl::default());
         let ended: Arc<Mutex<Option<String>>> = Arc::default();
         let (host, ctl2, ended2, conn) = (self.host.clone(), ctl.clone(), ended.clone(), c.clone());
@@ -609,7 +630,7 @@ impl<H: Host> Link<H> {
                 *ended2.lock().unwrap() = Some(why);
             })
             .expect("a thread");
-        st.video = Some(Run { ctl, ended, vgen, thread: Some(thread) });
+        st.video = Some(Run { ctl, ended, vgen, cfg: v, thread: Some(thread) });
     }
 
     /// the running video stopped and joined; the app left running

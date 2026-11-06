@@ -7,12 +7,14 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::GENERIC_ALL;
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, DESKTOP_ACCESS_FLAGS, DF_ALLOWOTHERACCOUNTHOOK, OpenInputDesktop, SetThreadDesktop,
+    CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DF_ALLOWOTHERACCOUNTHOOK, OpenDesktopW,
+    OpenInputDesktop, SetThreadDesktop,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
+use windows::core::w;
 
 use crate::input::Inject;
 
@@ -50,24 +52,43 @@ pub struct WinInput {
     pub rect: Mutex<Rect>,
 }
 
-/// the calling thread moved to the desktop that has the input now
-pub fn sync_desktop() {
+/// the calling thread moved to the desktop that has the input now (the user's, or the
+/// secure one for UAC and the lock screen). False when it couldn't be: a thread that
+/// owns a window or a hook stays where it is
+pub fn sync_desktop() -> bool {
     // SAFETY: plain Win32 calls on handles this function owns
     unsafe {
-        if let Ok(d) = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, false, DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0)) {
-            let _ = SetThreadDesktop(d);
-            let _ = CloseDesktop(d);
-        }
+        let Ok(d) = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, false, DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0)) else {
+            return false;
+        };
+        let ok = SetThreadDesktop(d).is_ok();
+        let _ = CloseDesktop(d);
+        ok
+    }
+}
+
+/// the calling thread moved to the user's own desktop (Default), where the app's windows
+/// are whatever has the input: the window follower's and a close's
+pub fn user_desktop() -> Result<(), String> {
+    // SAFETY: plain Win32 calls on handles this function owns
+    unsafe {
+        let d =
+            OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, GENERIC_ALL.0).map_err(|e| e.to_string())?;
+        let r = SetThreadDesktop(d).map_err(|e| e.to_string());
+        let _ = CloseDesktop(d);
+        r
     }
 }
 
 fn send(inputs: &[INPUT]) {
     // SAFETY: inputs are fully initialised INPUT structs
     unsafe {
-        if SendInput(inputs, size_of::<INPUT>() as i32) as usize != inputs.len() {
-            // the input desktop changed under us (UAC, lock): follow it and try once more
+        let n = SendInput(inputs, size_of::<INPUT>() as i32) as usize;
+        if n < inputs.len() {
+            // the input desktop changed under us (UAC, lock): follow it, and what didn't
+            // go in once more (not what did, which would type it twice)
             sync_desktop();
-            SendInput(inputs, size_of::<INPUT>() as i32);
+            SendInput(&inputs[n..], size_of::<INPUT>() as i32);
         }
     }
 }
@@ -161,11 +182,52 @@ impl Inject for WinInput {
     }
 
     fn text(&self, s: &str) {
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let mut inputs: Vec<INPUT> = units.iter().map(|&u| keyboard(0, u, KEYEVENTF_UNICODE)).collect();
-        inputs.extend(units.iter().map(|&u| keyboard(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)));
-        if !inputs.is_empty() {
-            send(&inputs);
-        }
+        send(&typed(s));
+    }
+}
+
+/// text as key events: each character pressed and let go before the next, a surrogate
+/// pair's two units down together then up together. All of a string's characters down
+/// first and then all up reads, to an app that looks at key state, as keys held at once
+/// and repeating
+fn typed(s: &str) -> Vec<INPUT> {
+    let mut out = Vec::with_capacity(s.len() * 2);
+    let mut units = [0u16; 2];
+    for c in s.chars() {
+        let us = c.encode_utf16(&mut units);
+        out.extend(us.iter().map(|&u| keyboard(0, u, KEYEVENTF_UNICODE)));
+        out.extend(us.iter().map(|&u| keyboard(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn said(i: &INPUT) -> (u16, bool) {
+        // SAFETY: every INPUT typed() makes is a keyboard one
+        let k = unsafe { i.Anonymous.ki };
+        (k.wScan, k.dwFlags.contains(KEYEVENTF_KEYUP))
+    }
+
+    #[test]
+    fn each_character_down_then_up_a_pair_together() {
+        let got: Vec<_> = typed("ab😀").iter().map(said).collect();
+        let (hi, lo) = (0xd83d, 0xde00);
+        assert_eq!(
+            got,
+            [
+                (b'a' as u16, false),
+                (b'a' as u16, true),
+                (b'b' as u16, false),
+                (b'b' as u16, true),
+                (hi, false),
+                (lo, false),
+                (hi, true),
+                (lo, true)
+            ]
+        );
+        assert!(typed("").is_empty());
     }
 }

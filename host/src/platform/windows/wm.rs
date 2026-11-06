@@ -10,6 +10,9 @@
 //! app's too; and what was seen (or wasn't) is logged, so a launch that shows nothing
 //! on its display says why.
 //!
+//! The follower works on the user's own desktop (Default) whatever has the input: a
+//! launch while the screen is locked, or a UAC prompt up, still finds the app's windows.
+//!
 //! An app attached to (a process already running, docs/protocol.md "The desktop") is
 //! followed by its pid instead, and when it's let go its windows are put back where
 //! they were before it was attached.
@@ -26,7 +29,6 @@ use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, 
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
-use windows::Win32::System::JobObjects::IsProcessInJob;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS, EnumDesktopWindows, OpenDesktopW,
 };
@@ -44,8 +46,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use super::display;
-use super::input::sync_desktop;
-use crate::{info, warn};
+use super::input::user_desktop;
+use crate::{debug, info, warn};
 
 /// what the follower knows of the app's windows, for the host to ask
 #[derive(Default)]
@@ -71,6 +73,8 @@ pub struct Follower {
     thread: Option<JoinHandle<()>>,
     seen: Arc<Seen>,
     started: Instant,
+    /// the display's GDI name, which changes when it's added again at another size
+    display: Arc<Mutex<String>>,
 }
 
 impl Follower {
@@ -93,11 +97,18 @@ impl Follower {
         let launched = unsafe { GetSystemTimeAsFileTime() };
         let seen = Arc::new(Seen::default());
         let out = seen.clone();
+        let display = Arc::new(Mutex::new(display));
+        let d = display.clone();
         let thread = thread::Builder::new()
             .name("windows".into())
-            .spawn(move || follow(&owner, &display, &s, ticks(launched), &out))
+            .spawn(move || follow(&owner, &d, &s, ticks(launched), &out))
             .ok();
-        Follower { stop, thread, seen, started: Instant::now() }
+        Follower { stop, thread, seen, started: Instant::now(), display }
+    }
+
+    /// the windows kept to this display from now on (the app's, added again)
+    pub fn set_display(&self, name: &str) {
+        *self.display.lock().unwrap() = name.to_string();
     }
 
     /// the app's windows up now
@@ -200,9 +211,16 @@ fn process_of(pid: u32) -> Option<(String, u64)> {
     }
 }
 
-fn follow(owner: &Owner, display: &str, stop: &AtomicBool, launched: u64, out: &Seen) {
+/// how often a window is asked to its place in a row, the display and the window as they
+/// were each time: past that it keeps where it is (a minimum size bigger than the
+/// display, a window that places itself) until either changes
+const ASKS: u8 = 3;
+
+fn follow(owner: &Owner, shared: &Mutex<String>, stop: &AtomicBool, launched: u64, out: &Seen) {
     // onto the app's desktop before COM: a thread with a window of its own can't change desktops
-    sync_desktop();
+    if let Err(e) = user_desktop() {
+        warn!("the window follower can't reach the user's desktop: {e}");
+    }
     // SAFETY: balanced below; the taskbar's object lives in an apartment
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     // SAFETY: a shell object created and initialised on this thread
@@ -220,19 +238,32 @@ fn follow(owner: &Owner, display: &str, stop: &AtomicBool, launched: u64, out: &
     // told to the taskbar as fullscreen: both undone when it's let go
     let mut placed: Vec<(isize, WINDOWPLACEMENT)> = Vec::new();
     let mut marked: Vec<isize> = Vec::new();
+    let mut asked: HashMap<isize, Asked> = HashMap::new();
+    let mut display = String::new();
     while !stop.load(Ordering::Relaxed) {
-        match display::rect_of(display) {
+        let now = shared.lock().unwrap().clone();
+        if now != display {
+            display = now;
+            said_lost = false;
+            asked.clear();
+        }
+        match display::rect_of(&display) {
             Some(mon) => {
                 said_lost = false;
                 let early = t0.elapsed() < ADOPT_FOR && !own_shown;
                 let mut strangers = Vec::new();
+                // the job's processes, once a pass rather than a process opened a window
+                let in_job: HashSet<u32> = match owner {
+                    Owner::Job(job) => super::process::job_pids(HANDLE(*job as *mut c_void)).into_iter().collect(),
+                    Owner::Pid(_) => HashSet::new(),
+                };
                 for (h, kind, pid) in top_windows() {
                     let ours = match owner {
                         Owner::Pid(p) => {
                             own_shown |= *p == pid;
                             *p == pid
                         }
-                        Owner::Job(job) if in_job(h, HANDLE(*job as *mut c_void)) => {
+                        Owner::Job(_) if in_job.contains(&pid) => {
                             own_shown = true;
                             true
                         }
@@ -274,7 +305,8 @@ fn follow(owner: &Owner, display: &str, stop: &AtomicBool, launched: u64, out: &
                                 placed.push((h.0 as isize, wp));
                             }
                         }
-                        if place(h, kind, mon, first, taskbar.as_ref()) {
+                        let a = asked.entry(h.0 as isize).or_default();
+                        if place(h, kind, mon, first, taskbar.as_ref(), a) {
                             marked.push(h.0 as isize);
                         }
                     }
@@ -304,6 +336,7 @@ fn follow(owner: &Owner, display: &str, stop: &AtomicBool, launched: u64, out: &
         }
         // SAFETY: IsWindow takes any value
         seen.retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
+        asked.retain(|h, _| seen.contains(h));
         out.windows.store(seen.len(), Ordering::Relaxed);
         if !seen.is_empty() {
             out.ever.store(true, Ordering::Relaxed);
@@ -425,16 +458,29 @@ pub fn listed() -> Vec<(HWND, u32, String)> {
     out
 }
 
-fn in_job(h: HWND, job: HANDLE) -> bool {
-    let mut pid = 0u32;
-    // SAFETY: a process opened for a query and closed
-    unsafe {
-        GetWindowThreadProcessId(h, Some(&mut pid));
-        let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
-        let mut r = BOOL(0);
-        let ok = IsProcessInJob(p, Some(job), &mut r).is_ok() && r.as_bool();
-        let _ = CloseHandle(p);
-        ok
+/// a window's asks to be placed, in a row: the display and the window's rect at the last
+#[derive(Default)]
+struct Asked {
+    mon: RECT,
+    wr: RECT,
+    n: u8,
+}
+
+impl Asked {
+    /// whether to ask again: not past ASKS while nothing has changed since the last
+    fn again(&mut self, mon: RECT, wr: RECT, h: HWND) -> bool {
+        if self.mon == mon && self.wr == wr {
+            if self.n >= ASKS {
+                return false;
+            }
+            self.n += 1;
+            if self.n == ASKS {
+                debug!("window {:#x} keeps its own place: left there", h.0 as usize);
+            }
+        } else {
+            *self = Asked { mon, wr, n: 1 };
+        }
+        true
     }
 }
 
@@ -448,7 +494,7 @@ fn frame(h: HWND, wr: RECT) -> RECT {
 }
 
 /// the window placed on the display; true when it was told to the taskbar as fullscreen
-fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarList2>) -> bool {
+fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarList2>, asked: &mut Asked) -> bool {
     let mut marked = false;
     let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
     // SAFETY: window calls on a handle that may have gone, which only fail; async ones
@@ -467,7 +513,7 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
         let fb = frame(h, wr);
         match kind {
             Kind::Fill => {
-                if fb != mon {
+                if fb != mon && asked.again(mon, wr, h) {
                     // the visible frame over the whole display, the invisible borders past its edges
                     let (l, t) = (fb.left - wr.left, fb.top - wr.top);
                     let (r, b) = (wr.right - fb.right, wr.bottom - fb.bottom);
@@ -486,12 +532,13 @@ fn place(h: HWND, kind: Kind, mon: RECT, first: bool, taskbar: Option<&ITaskbarL
             }
             Kind::Centre => {
                 let (cx, cy) = ((fb.left + fb.right) / 2, (fb.top + fb.bottom) / 2);
-                if cx < mon.left || cx >= mon.right || cy < mon.top || cy >= mon.bottom {
+                let off = cx < mon.left || cx >= mon.right || cy < mon.top || cy >= mon.bottom;
+                if off && asked.again(mon, wr, h) {
                     let x = mon.left + ((mon.right - mon.left) - (wr.right - wr.left)) / 2;
                     let y = mon.top + ((mon.bottom - mon.top) - (wr.bottom - wr.top)) / 2;
                     let _ = SetWindowPos(h, None, x.max(mon.left), y.max(mon.top), 0, 0, flags | SWP_NOSIZE);
                     if first {
-                        info!("window {:#x} centred on the display", h.0 as usize);
+                        debug!("window {:#x} centred on the display", h.0 as usize);
                     }
                 }
             }

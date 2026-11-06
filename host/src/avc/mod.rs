@@ -494,6 +494,11 @@ impl Rate {
         qp.ceil().clamp(QP_FIRST as f64, 51.0) as u8
     }
 
+    /// a new bitrate, what's been learnt of the content kept
+    pub fn retarget(&mut self, kbps: u32, fps: u32) {
+        self.share = kbps as f64 * 125.0 / fps.max(1) as f64;
+    }
+
     /// the bytes one refinement frame may take: a share
     pub fn refine_bytes(&self) -> usize {
         self.share as usize

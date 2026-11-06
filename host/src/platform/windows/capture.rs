@@ -18,7 +18,6 @@ use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THR
 use windows::core::{Interface, Result};
 
 use super::display::Output;
-use super::input::sync_desktop;
 use crate::host::Cursor;
 
 pub fn device_for(o: &Output) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -141,6 +140,8 @@ pub struct Dup {
     /// the whole desktop is to be copied into the stage at the next frame
     whole: bool,
     meta: Vec<u8>,
+    /// where the pointer is drawn in, kept from frame to frame at its size
+    ptr_stage: Option<(ID3D11Texture2D, u32, u32)>,
 }
 
 /// a rectangle of the desktop, in pixels
@@ -182,7 +183,6 @@ impl Dup {
         draw: bool,
         cpu: bool,
     ) -> std::result::Result<Dup, Lost> {
-        sync_desktop();
         // SAFETY: COM calls on owned objects
         unsafe {
             let dup = match o.output.cast::<IDXGIOutput5>() {
@@ -242,6 +242,7 @@ impl Dup {
                 rects: Vec::new(),
                 whole: true,
                 meta: Vec::new(),
+                ptr_stage: None,
             })
         }
     }
@@ -434,15 +435,23 @@ impl Dup {
             return Ok(());
         }
         let (bw, bh) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        let stage = texture(
-            &self.dev,
-            bw,
-            bh,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            D3D11_BIND_FLAG(0),
-            D3D11_USAGE_STAGING,
-            D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE,
-        )?;
+        let stage = match &self.ptr_stage {
+            Some((t, w, h)) if (*w, *h) == (bw, bh) => t.clone(),
+            _ => {
+                let t = texture(
+                    &self.dev,
+                    bw,
+                    bh,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    D3D11_BIND_FLAG(0),
+                    D3D11_USAGE_STAGING,
+                    D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE,
+                )?;
+                self.ptr_stage = Some((t.clone(), bw, bh));
+                t
+            }
+        };
+        let p = &self.ptr;
         let bx = D3D11_BOX { left: x0 as u32, top: y0 as u32, front: 0, right: x1 as u32, bottom: y1 as u32, back: 1 };
         // SAFETY: the staging texture is mapped only between Map and Unmap, rows by its pitch
         unsafe {

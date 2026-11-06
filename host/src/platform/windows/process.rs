@@ -216,6 +216,28 @@ pub fn sign_in(login: &Login) -> Result<(), String> {
     Err("the saved sign-in didn't get past the logon screen".into())
 }
 
+/// the processes in a job, up to 1024 of them
+pub fn job_pids(job: HANDLE) -> Vec<u32> {
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST: two u32 counts, then the ids as ULONG_PTRs
+    let mut buf = vec![0usize; 2 + 1024];
+    // SAFETY: buf is large enough for 1024 ids and is what this class of query fills
+    unsafe {
+        if QueryInformationJobObject(
+            Some(job),
+            JobObjectBasicProcessIdList,
+            buf.as_mut_ptr() as *mut c_void,
+            (buf.len() * size_of::<usize>()) as u32,
+            None,
+        )
+        .is_err()
+        {
+            return Vec::new();
+        }
+    }
+    let n = (buf[0] >> 32) as usize; // NumberOfProcessIdsInList, the second u32
+    buf[1..1 + n.min(1024)].iter().map(|&p| p as u32).collect()
+}
+
 impl App {
     /// cmd started, cwd its working directory when given
     pub fn start(cmd: &str, cwd: Option<&str>) -> Result<App, String> {
@@ -355,24 +377,7 @@ impl App {
     }
 
     fn pids(&self) -> Vec<u32> {
-        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two u32 counts, then the ids as ULONG_PTRs
-        let mut buf = vec![0usize; 2 + 1024];
-        // SAFETY: buf is large enough for 1024 ids and is what this class of query fills
-        unsafe {
-            if QueryInformationJobObject(
-                Some(self.job),
-                JobObjectBasicProcessIdList,
-                buf.as_mut_ptr() as *mut c_void,
-                (buf.len() * size_of::<usize>()) as u32,
-                None,
-            )
-            .is_err()
-            {
-                return Vec::new();
-            }
-        }
-        let n = (buf[0] >> 32) as usize; // NumberOfProcessIdsInList, the second u32
-        buf[1..1 + n.min(1024)].iter().map(|&p| p as u32).collect()
+        job_pids(self.job)
     }
 
     /// asked to close (WM_CLOSE to its windows), then made to after the wait

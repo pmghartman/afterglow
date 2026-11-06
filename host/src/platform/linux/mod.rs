@@ -418,6 +418,11 @@ impl Host for Linux {
         std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_default()
     }
 
+    fn retunes(&self, _v: &VideoCfg) -> bool {
+        // afterglow's own encoder takes a new rate as it goes; OpenH264's is set at its start
+        self.encoder != "openh264"
+    }
+
     fn virtual_display(&self) -> bool {
         which(&self.xvfb_bin)
     }
@@ -751,6 +756,14 @@ impl Host for Linux {
                 }
             }
             pending |= !dirty.is_empty();
+            // a new gen and bitrate: the same capture goes on, a keyframe under the new gen
+            if let Some(r) = ctl.take_retune() {
+                if let Enc::Own(_, rate) = &mut enc {
+                    out.regen(r.vgen);
+                    rate.retarget(r.kbps, v.fps);
+                    ctl.idr.store(true, Ordering::Relaxed);
+                }
+            }
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
             let now = Instant::now();
             // a change in its slot, a keyframe asked, once a second the last frame again,
@@ -808,7 +821,6 @@ impl Host for Linux {
                 pending = false;
                 next_slot = (next_slot + period).max(now);
             }
-            last = now;
             let t2 = Instant::now();
             let t_enc;
             let bytes = match &mut enc {
@@ -861,6 +873,12 @@ impl Host for Linux {
                             d.bytes
                         );
                     }
+                    // whether refinement has more to do, frame or not: a refinement that
+                    // found nothing to send leaves nothing coarse, and isn't tried again at once
+                    coarse = e.coarse(crate::avc::QP_FINE) > 0;
+                    if refine {
+                        next_refine = now + period;
+                    }
                     if !d.frame {
                         continue;
                     }
@@ -871,15 +889,12 @@ impl Host for Linux {
                     if change {
                         changed_at = now;
                     }
-                    if refine {
-                        next_refine = now + period;
-                    }
-                    // whether refinement has more to do: looked at once the frame's gone
-                    coarse = e.coarse(crate::avc::QP_FINE) > 0;
                     d.bytes
                 }
             };
             let t3 = Instant::now();
+            // the keepalive counts from the last frame that went out
+            last = now;
             sent = true;
             stats.frame(px_done, bytes, t2 - t1, t_enc - t2, t3 - t_enc);
             // the first frame after an input: how long from it to the app's drawing seen,

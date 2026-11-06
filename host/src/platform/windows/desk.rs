@@ -38,7 +38,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 use windows::core::{PCWSTR, PWSTR};
 
-use super::input::sync_desktop;
+use super::input::user_desktop;
 use super::{from_wide, process, wide, wm};
 use crate::desk::{self, End, Ended, Proc, Style, Windows};
 use crate::warn;
@@ -246,8 +246,8 @@ fn wait(h: HANDLE, ms: u64) -> bool {
 
 /// WM_CLOSE to pid's windows on the user's desktop, as their close buttons would; how many
 pub fn close_windows(pid: u32) -> usize {
-    // the windows' desktop, so the messages reach them
-    sync_desktop();
+    // the windows' desktop (the user's, whatever has the input), so the messages reach them
+    let _ = user_desktop();
     let mut n = 0;
     for (h, p, _) in wm::listed() {
         // SAFETY: a message posted to a window that may have gone, which only fails

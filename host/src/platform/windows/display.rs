@@ -13,12 +13,13 @@ use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFac
 use windows::Win32::Graphics::Gdi::{
     CDS_NORESET, CDS_SET_PRIMARY, CDS_TYPE, CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW,
     DISP_CHANGE_SUCCESSFUL, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
-    DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW, EnumDisplaySettingsW,
+    DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplayDevicesW,
+    EnumDisplaySettingsW,
 };
 use windows::core::PCWSTR;
 
 use super::{from_wide, wide};
-use crate::{info, warn};
+use crate::{debug, info, warn};
 
 pub struct Output {
     pub adapter: IDXGIAdapter1,
@@ -191,11 +192,14 @@ pub fn rect_of(name: &str) -> Option<RECT> {
     Some(RECT { left: p.x, top: p.y, right: p.x + dm.dmPelsWidth as i32, bottom: p.y + dm.dmPelsHeight as i32 })
 }
 
-/// the display set to w×h at the nearest whole rate to millihz
-pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32) -> bool {
+/// the display set to w×h at the nearest whole rate to millihz, or at any rate it has
+/// for that size. `say`: a refusal warned of (else left to the caller)
+pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32, say: bool) -> bool {
     let n = wide(name);
     let Some(mut dm) = current_mode(&n) else {
-        warn!("{name}'s mode can't be read: left as it is");
+        if say {
+            warn!("{name}'s mode can't be read: left as it is");
+        }
         return false;
     };
     if dm.dmPelsWidth == w && dm.dmPelsHeight == h && dm.dmDisplayFrequency == (millihz + 500) / 1000 {
@@ -210,18 +214,51 @@ pub fn set_mode(name: &str, w: u32, h: u32, millihz: u32) -> bool {
     };
     dm.dmPelsWidth = w;
     dm.dmPelsHeight = h;
-    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-    for f in [hz, alt] {
-        dm.dmDisplayFrequency = f;
+    let mut last = DISP_CHANGE_SUCCESSFUL;
+    // the rate asked, the one beside it, then the size at whatever rate it comes in
+    for f in [Some(hz), Some(alt), None] {
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+        if let Some(f) = f {
+            dm.dmFields |= DM_DISPLAYFREQUENCY;
+            dm.dmDisplayFrequency = f;
+        }
         // SAFETY: n is NUL-terminated, dm initialised
-        let r = unsafe { ChangeDisplaySettingsExW(PCWSTR(n.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY, None) };
-        if r == DISP_CHANGE_SUCCESSFUL {
-            info!("{name} set to {w}x{h}@{f}");
+        last = unsafe { ChangeDisplaySettingsExW(PCWSTR(n.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY, None) };
+        if last == DISP_CHANGE_SUCCESSFUL {
+            let at = current_mode(&n).map_or(0, |m| m.dmDisplayFrequency);
+            info!("{name} set to {w}x{h}@{at}");
             return true;
         }
     }
-    warn!("{name} wouldn't take {w}x{h}");
+    let sizes = sizes_of(&n);
+    let has = sizes.contains(&(w, h));
+    debug!(
+        "{name} turned down {w}x{h} ({}): {} sizes offered{}",
+        last.0,
+        sizes.len(),
+        if has { ", that one among them" } else { "" }
+    );
+    if say {
+        warn!("{name} wouldn't take {w}x{h}");
+    }
     false
+}
+
+/// the sizes a display offers, each once
+fn sizes_of(name: &[u16]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for i in 0.. {
+        let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        // SAFETY: name is NUL-terminated, dm sized
+        if !unsafe { EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_DISPLAY_SETTINGS_MODE(i), &mut dm) }.as_bool() {
+            break;
+        }
+        let s = (dm.dmPelsWidth, dm.dmPelsHeight);
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// the display made the primary one: moved to 0,0 and every other moved by as much
