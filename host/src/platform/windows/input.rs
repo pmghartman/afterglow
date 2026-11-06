@@ -5,19 +5,24 @@
 use std::mem::size_of;
 use std::sync::Mutex;
 
-use windows::Win32::Foundation::GENERIC_ALL;
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DF_ALLOWOTHERACCOUNTHOOK, OpenDesktopW,
     OpenInputDesktop, SetThreadDesktop,
 };
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetSystemMetrics, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SPI_GETSCREENSAVERRUNNING, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, WM_CLOSE,
-    XBUTTON1, XBUTTON2,
+    EnumWindows, GetSystemMetrics, GetWindowThreadProcessId, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_CLOSE, XBUTTON1, XBUTTON2,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::w;
 
 use crate::input::Inject;
 
@@ -127,36 +132,71 @@ impl WinInput {
     /// pointer stays where it is and nothing is clicked or typed
     pub fn wake(&self) {
         send(&[mouse(MOUSEEVENTF_MOVE, 0, 0, 0)]);
-        // a screensaver ignores a move of nothing: it's asked to close, as Windows
-        // documents for ending one, so the video shows the app and not it
-        if screensaver_running() {
+        // a screensaver ignores a move of nothing (and some aren't the classic window
+        // class): its process in this session asked to close its windows, ended if it
+        // hasn't in a moment, so the video shows the app and not it
+        for pid in screensavers() {
             sync_desktop();
-            // SAFETY: a message posted to the window found, which only fails if it's gone
+            let asked = close_windows_of(pid);
+            // SAFETY: a process opened to wait on and end, closed after
             unsafe {
-                if let Ok(h) = FindWindowW(w!("WindowsScreenSaverClass"), PCWSTR::null()) {
-                    if PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() {
-                        crate::info!("the screensaver ended, so the display shows");
-                    }
+                let Ok(h) = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) else { continue };
+                if WaitForSingleObject(h, 500) != WAIT_OBJECT_0 {
+                    let _ = TerminateProcess(h, 0);
                 }
+                let _ = CloseHandle(h);
             }
+            crate::info!(
+                "the screensaver (pid {pid}) ended{}, so the display shows",
+                if asked { "" } else { ", made to" }
+            );
         }
     }
 }
 
-/// whether a screensaver is up on the console
-fn screensaver_running() -> bool {
-    let mut on = windows::core::BOOL(0);
-    // SAFETY: the query fills the BOOL it's given
+/// the screensavers (*.scr) running in this process's session
+fn screensavers() -> Vec<u32> {
+    let mut me = 0u32;
+    let mut out = Vec::new();
+    // SAFETY: the snapshot is closed after; the entry is sized as its dwSize says
     unsafe {
-        SystemParametersInfoW(
-            SPI_GETSCREENSAVERRUNNING,
-            0,
-            Some(&mut on as *mut _ as *mut std::ffi::c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .is_ok()
-            && on.as_bool()
+        let _ = ProcessIdToSessionId(GetCurrentProcessId(), &mut me);
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            let name = super::from_wide(&e.szExeFile).to_ascii_lowercase();
+            let mut s = u32::MAX;
+            if name.ends_with(".scr") && ProcessIdToSessionId(e.th32ProcessID, &mut s).is_ok() && s == me {
+                out.push(e.th32ProcessID);
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
     }
+    out
+}
+
+/// WM_CLOSE to a process's top-level windows on the thread's desktop; whether any was asked
+fn close_windows_of(pid: u32) -> bool {
+    unsafe extern "system" fn each(h: HWND, l: LPARAM) -> windows::core::BOOL {
+        // SAFETY: l is the (pid, asked) pair below, alive for the EnumWindows call
+        unsafe {
+            let (pid, asked) = &mut *(l.0 as *mut (u32, bool));
+            let mut p = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut p));
+            if p == *pid && PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() {
+                *asked = true;
+            }
+        }
+        true.into()
+    }
+    let mut st = (pid, false);
+    // SAFETY: the callback writes only to st, alive for the call
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut st as *mut (u32, bool) as isize));
+    }
+    st.1
 }
 
 impl Inject for WinInput {
