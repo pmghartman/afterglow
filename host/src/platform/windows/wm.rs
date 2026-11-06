@@ -242,6 +242,8 @@ fn follow(
     let mut adopted: HashSet<u32> = HashSet::new();
     let mut looked: HashMap<u32, bool> = HashMap::new();
     let (mut own_shown, mut said_none, mut said_lost) = (false, false, false);
+    // since when the display has been missing: a moment of it is the display added again
+    let mut lost_since: Option<Instant> = None;
     // an attached app's windows as they were before they were first placed, and those
     // told to the taskbar as fullscreen: both undone when it's let go
     let mut placed: Vec<(isize, WINDOWPLACEMENT)> = Vec::new();
@@ -261,11 +263,13 @@ fn follow(
             }
             display = now;
             said_lost = false;
+            lost_since = None;
             asked.clear();
         }
         match display::rect_of(&display) {
             Some(mon) => {
                 said_lost = false;
+                lost_since = None;
                 let early = t0.elapsed() < ADOPT_FOR && !own_shown;
                 let mut strangers = Vec::new();
                 // the job's processes, once a pass rather than a process opened a window
@@ -358,7 +362,7 @@ fn follow(
                     );
                 }
             }
-            None if !said_lost => {
+            None if !said_lost && lost_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1) => {
                 said_lost = true;
                 warn!("{display} isn't found among the displays: the app's windows are left where they are");
             }
