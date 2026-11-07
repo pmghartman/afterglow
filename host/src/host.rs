@@ -1,7 +1,7 @@
 //! What the link asks of a platform: start and watch one app, capture and encode its
 //! display, inject the viewer's input.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::desk::{End, Ended, Proc};
@@ -76,6 +76,10 @@ pub struct Ctl {
     pub stop: AtomicBool,
     /// the next frame a keyframe
     pub idr: AtomicBool,
+    /// the bitrate to keep to now, kbps, when the path takes less than the video asked
+    /// for (glow's Event::Scale); 0: the video's own. An encoder that can retarget
+    /// without a keyframe follows it from its next frame
+    pub kbps: AtomicU32,
     /// what wakes the capture from its wait, set by the platform that waits
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }

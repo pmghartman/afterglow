@@ -485,6 +485,11 @@ impl Rate {
         Rate { share: kbps as f64 * 125.0 / fps.max(1) as f64, k: 0.02 }
     }
 
+    /// a new bitrate from the next frame, what's been learnt of the content kept
+    pub fn retarget(&mut self, kbps: u32, fps: u32) {
+        self.share = kbps as f64 * 125.0 / fps.max(1) as f64;
+    }
+
     /// a change over `mbs` macroblocks of this activity: the finest qp whose frame
     /// comes to two shares at most
     pub fn qp(&self, mbs: usize, activity: f64) -> u8 {

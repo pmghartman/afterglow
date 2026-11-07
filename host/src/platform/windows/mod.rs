@@ -310,6 +310,7 @@ impl Windows {
         let cores = thread::available_parallelism().map_or(1, |n| n.get());
         let mut enc = crate::avc::Encoder::new(w, h, v.fps, cores);
         let mut rate = crate::avc::Rate::new(v.kbps, v.fps);
+        let mut kbps = v.kbps;
         let (pw, ph) = enc.padded();
         let mut yuv = crate::convert::Yuv::padded(w, h, pw, ph);
         let period = Duration::from_secs_f64(1.0 / v.fps as f64);
@@ -362,6 +363,13 @@ impl Windows {
                 continue;
             }
             let idr = ctl.idr.swap(false, Ordering::Relaxed) || !sent;
+            // the bitrate the path takes now, from this frame on
+            let k = ctl.kbps.load(Ordering::Relaxed);
+            let k = if k == 0 { v.kbps } else { k.min(v.kbps) };
+            if k != kbps {
+                kbps = k;
+                rate.retarget(k, v.fps);
+            }
             let now = Instant::now();
             let change = (pending && now >= next_slot) || idr;
             let alive = now >= last + keepalive;

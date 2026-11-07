@@ -9,15 +9,16 @@
 //! driver, already let in by ssh: when it goes, the app and afterglow go too.
 
 use std::io::{IoSlice, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::desk::End;
+use crate::glow::{self, Glow};
 use crate::host::{Ctl, Cursor, Host, Launch, Login, Sink, VideoCfg};
 use crate::input::Input;
 use crate::wire::{self, input as msg_in, output as msg_out};
@@ -96,29 +97,88 @@ fn write_both(s: &mut dyn Write, mut a: &[u8], mut b: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-/// a video's frames and pointer shapes, shaped and written as they come
+/// glow's server, once a driver has asked for it
+type GlowSlot = Arc<Mutex<Option<Arc<Glow>>>>;
+
+/// a video's frames and pointer shapes, shaped and written as they come: to the viewer
+/// straight over glow while one is connected, otherwise over the link
 struct Out {
     conn: Arc<Conn>,
+    glow: GlowSlot,
+    ctl: Arc<Ctl>,
     shaper: wire::Shaper,
     vgen: u16,
     w: u16,
     h: u16,
+    /// where frames went last: 0 the link, else the glow viewer's id
+    dest: u64,
+    /// a new destination starts at a keyframe, its config before it
+    need_key: bool,
+    /// the pointer's shape last sent, for a new destination
+    cursor: Option<Vec<u8>>,
+    unit: Vec<u8>,
+}
+
+impl Out {
+    fn viewer(&self) -> Option<Arc<glow::Viewer>> {
+        self.glow.lock().unwrap().as_ref().and_then(|g| g.viewer())
+    }
 }
 
 impl Sink for Out {
     fn frame(&mut self, nals: &[&[u8]], key: bool) -> bool {
+        let v = self.viewer();
+        let dest = v.as_ref().map_or(0, |v| v.id);
+        if dest != self.dest {
+            self.dest = dest;
+            self.shaper = wire::Shaper::default();
+            self.need_key = true;
+            if let Some(c) = self.cursor.clone() {
+                match &v {
+                    Some(v) => v.control(c),
+                    None => drop(self.conn.send(&c)),
+                }
+            }
+        }
+        if self.need_key && !key {
+            self.ctl.ask_idr();
+            return true;
+        }
+        self.need_key = false;
         let s = self.shaper.shape(nals, key, self.vgen, self.w, self.h);
-        self.conn.send2(s.config, s.frame)
+        match v {
+            Some(v) => {
+                self.unit.clear();
+                self.unit.extend_from_slice(s.config);
+                self.unit.extend_from_slice(s.frame);
+                // a viewer gone mid-frame: the next one goes over the link, from a keyframe
+                if !self.unit.is_empty() {
+                    v.send(&self.unit, key);
+                }
+                true
+            }
+            None => self.conn.send2(s.config, s.frame),
+        }
     }
 
     fn cursor(&mut self, c: &Cursor) -> bool {
-        self.conn.send(&wire::cursor_message(c))
+        let m = wire::cursor_message(c);
+        self.cursor = Some(m.clone());
+        match self.viewer() {
+            Some(v) if v.id == self.dest => {
+                v.control(m);
+                true
+            }
+            _ => self.conn.send(&m),
+        }
     }
 }
 
 /// one run of the video on its own thread
 struct Run {
     ctl: Arc<Ctl>,
+    /// the bitrate the driver asked for, kbps
+    kbps: u32,
     /// why the capture stopped by itself, once it has
     ended: Arc<Mutex<Option<String>>>,
     vgen: u16,
@@ -141,6 +201,10 @@ pub struct Link<H: Host> {
     /// the driver the host's notes go to
     notes_to: Arc<Mutex<Option<Arc<Conn>>>>,
     shutdown: Arc<AtomicBool>,
+    /// glow's server, started at the first driver's `direct`, where it binds
+    glow: GlowSlot,
+    direct_at: Mutex<SocketAddr>,
+    me: Weak<Link<H>>,
 }
 
 fn num(j: &Value, k: &str, d: i64, lo: i64, hi: i64) -> i64 {
@@ -169,7 +233,118 @@ impl<H: Host> Link<H> {
                 c.json(msg_out::NOTE, v);
             }
         }));
-        Arc::new(Link { host, token, input, state: Mutex::default(), notes_to, shutdown })
+        Arc::new_cyclic(|me| Link {
+            host,
+            token,
+            input,
+            state: Mutex::default(),
+            notes_to,
+            shutdown,
+            glow: Arc::default(),
+            direct_at: Mutex::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+            me: me.clone(),
+        })
+    }
+
+    /// where glow listens once asked for: the address (all of them by default) and UDP
+    /// port (0: the driver's `direct` names it, or any)
+    pub fn direct_at(&self, at: SocketAddr) {
+        *self.direct_at.lock().unwrap() = at;
+    }
+
+    /// glow's server, started now if it isn't yet
+    fn glow(&self, port: u16) -> Result<Arc<Glow>, String> {
+        let mut g = self.glow.lock().unwrap();
+        if let Some(g) = g.as_ref() {
+            return Ok(g.clone());
+        }
+        let mut at = *self.direct_at.lock().unwrap();
+        if at.port() == 0 {
+            at.set_port(port);
+        }
+        let me = self.me.clone();
+        let started = Glow::start(
+            at,
+            Arc::new(move |e| {
+                if let Some(l) = me.upgrade() {
+                    l.glow_event(e);
+                }
+            }),
+        )?;
+        *g = Some(started.clone());
+        Ok(started)
+    }
+
+    /// the glow viewer sent away: the driver it came through has gone
+    fn drop_viewer(&self, why: &str) {
+        if let Some(g) = self.glow.lock().unwrap().as_ref() {
+            g.drop_viewer(why);
+        }
+    }
+
+    /// what the glow viewer did
+    fn glow_event(&self, e: glow::Event) {
+        match e {
+            glow::Event::Input(p) => {
+                if self.lock().video.is_some() {
+                    self.input.handle(&p);
+                }
+            }
+            glow::Event::Idr => {
+                if let Some(r) = &self.lock().video {
+                    r.ctl.ask_idr();
+                }
+            }
+            glow::Event::Clip(s) => {
+                if self.lock().launched {
+                    self.host.clip(&s);
+                }
+            }
+            glow::Event::Scale(m) => {
+                if let Some(r) = &self.lock().video {
+                    let k = (r.kbps as u64 * m as u64 / 1000).max(1000) as u32;
+                    r.ctl.kbps.store(if m >= 1000 { 0 } else { k }, Ordering::Relaxed);
+                }
+            }
+            glow::Event::Came(from) => {
+                // the running video starts again at a keyframe, over glow
+                if let Some(r) = &self.lock().video {
+                    r.ctl.ask_idr();
+                }
+                if let Some(c) = self.notes_to.lock().unwrap().clone() {
+                    c.json(msg_out::NOTE, json!({"t": "direct", "on": true, "from": from}));
+                }
+            }
+            glow::Event::Went(why) => {
+                // nothing the viewer held stays held; the video goes on over the link
+                self.input.reset();
+                if let Some(r) = &self.lock().video {
+                    r.ctl.ask_idr();
+                }
+                if let Some(c) = self.notes_to.lock().unwrap().clone() {
+                    c.json(msg_out::NOTE, json!({"t": "direct", "on": false, "why": why}));
+                }
+            }
+        }
+    }
+
+    /// a ticket for the driver's viewer to come straight here
+    fn direct(&self, c: &Arc<Conn>, j: Value) {
+        let port = num(&j, "port", 0, 0, 65535) as u16;
+        let mut r = match self.glow(port).and_then(|g| g.ticket()) {
+            Ok(t) => {
+                info!("a glow ticket for udp port {}", t.port);
+                json!({"ok": true, "port": t.port, "hash": t.hash, "ticket": t.ticket, "expires_ms": t.expires_ms})
+            }
+            Err(e) => {
+                warn!("no glow: {e}");
+                json!({"ok": false, "error": e})
+            }
+        };
+        if let Some(id) = j.get("id") {
+            r["id"] = id.clone();
+        }
+        c.json(msg_out::DIRECT, r);
     }
 
     /// serve the one driver on stdin and stdout until it goes (or a signal), then end
@@ -200,6 +375,7 @@ impl<H: Host> Link<H> {
 
     /// the video stopped, the driver let go, the app ended
     fn finish(&self) {
+        self.drop_viewer("afterglow is going");
         let mut st = self.lock();
         self.stop_video(&mut st);
         if let Some(c) = st.current.take() {
@@ -318,6 +494,8 @@ impl<H: Host> Link<H> {
             st.current = None;
             *self.notes_to.lock().unwrap() = None;
             info!("the driver left");
+            drop(st);
+            self.drop_viewer("the driver left");
         }
         c.close();
     }
@@ -328,6 +506,7 @@ impl<H: Host> Link<H> {
             self.stop_video(&mut st);
             old.close();
             info!("a new driver took over");
+            self.drop_viewer("a new driver took over");
         }
         st.current = Some(c.clone());
         *self.notes_to.lock().unwrap() = Some(c.clone());
@@ -341,6 +520,7 @@ impl<H: Host> Link<H> {
                 "hostname": self.host.hostname(),
                 "running": running,
                 "features": self.host.desk_features(),
+                "direct": true,
             }),
         );
     }
@@ -396,6 +576,7 @@ impl<H: Host> Link<H> {
                 self.desk(c, ty, serde_json::from_slice(&body).unwrap_or(Value::Null))
             }
             msg_in::VIDEO => self.video(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
+            msg_in::DIRECT => self.direct(c, serde_json::from_slice(&body).unwrap_or(Value::Null)),
             _ => {}
         }
     }
@@ -580,8 +761,15 @@ impl<H: Host> Link<H> {
             draw_cursor: j.get("draw_cursor").and_then(Value::as_bool).unwrap_or(false),
         };
         let ctl = Arc::new(Ctl::default());
+        // a glow viewer whose path takes less than this keeps its bitrate
+        if let Some(m) = self.glow.lock().unwrap().as_ref().and_then(|g| g.viewer()).map(|v| v.scale()) {
+            if m < 1000 {
+                ctl.kbps.store((v.kbps as u64 * m as u64 / 1000).max(1000) as u32, Ordering::Relaxed);
+            }
+        }
         let ended: Arc<Mutex<Option<String>>> = Arc::default();
         let (host, ctl2, ended2, conn) = (self.host.clone(), ctl.clone(), ended.clone(), c.clone());
+        let glow = self.glow.clone();
         info!(
             "video {vgen}: {}x{} at {} fps, {} kbps{}",
             v.w,
@@ -593,8 +781,19 @@ impl<H: Host> Link<H> {
         let thread = thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                let mut out =
-                    Out { conn: conn.clone(), shaper: wire::Shaper::default(), vgen, w: v.w as u16, h: v.h as u16 };
+                let mut out = Out {
+                    conn: conn.clone(),
+                    glow,
+                    ctl: ctl2.clone(),
+                    shaper: wire::Shaper::default(),
+                    vgen,
+                    w: v.w as u16,
+                    h: v.h as u16,
+                    dest: 0,
+                    need_key: false,
+                    cursor: None,
+                    unit: Vec::new(),
+                };
                 let r = host.video(&v, &ctl2, &mut out);
                 if ctl2.stop.load(Ordering::Relaxed) || conn.dead.load(Ordering::Relaxed) {
                     return;
@@ -609,7 +808,7 @@ impl<H: Host> Link<H> {
                 *ended2.lock().unwrap() = Some(why);
             })
             .expect("a thread");
-        st.video = Some(Run { ctl, ended, vgen, thread: Some(thread) });
+        st.video = Some(Run { ctl, kbps: v.kbps, ended, vgen, thread: Some(thread) });
     }
 
     /// the running video stopped and joined; the app left running

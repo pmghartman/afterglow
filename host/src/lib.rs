@@ -8,6 +8,7 @@ pub mod avc;
 pub mod conf;
 pub mod convert;
 pub mod desk;
+pub mod glow;
 pub mod h264;
 pub mod host;
 pub mod icons;

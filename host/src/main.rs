@@ -13,9 +13,9 @@ use afterglow::{conf, error, icons, info, log, platform};
 
 /// what a driver can count on from this build; icons and attach are Windows only
 const FEATURES: &str = if cfg!(windows) {
-    "stdio argv notes clipboard raise close cursor icons processes attach delete"
+    "stdio argv notes clipboard raise close cursor icons processes attach delete direct"
 } else {
-    "stdio argv notes clipboard raise close cursor processes delete"
+    "stdio argv notes clipboard raise close cursor processes delete direct"
 };
 
 fn main() {
@@ -56,7 +56,9 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = Link::new(host, conf.token.clone(), shutdown).run(conf.port) {
+    let link = Link::new(host, conf.token.clone(), shutdown);
+    link.direct_at(std::net::SocketAddr::new(conf.direct_bind, conf.direct_port));
+    if let Err(e) = link.run(conf.port) {
         error!("{e}");
         std::process::exit(1);
     }
@@ -80,5 +82,7 @@ fn stdio() {
         }
     };
     info!("afterglow {VERSION} on stdio");
-    Link::stdio(host, shutdown).serve_stdio();
+    let link = Link::stdio(host, shutdown);
+    link.direct_at(std::net::SocketAddr::new(conf.direct_bind, conf.direct_port));
+    link.serve_stdio();
 }

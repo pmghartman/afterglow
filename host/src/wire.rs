@@ -32,6 +32,9 @@ pub mod input {
     pub const END: u8 = 0x0e;
     /// JSON `{path, permanent, id}`: a file deleted, answered by output::DELETED
     pub const DELETE: u8 = 0x0f;
+    /// JSON `{port, id}`: a ticket for a viewer to come straight to afterglow over glow
+    /// (src/glow), answered by output::DIRECT
+    pub const DIRECT: u8 = 0x10;
 }
 
 /// afterglow to driver
@@ -49,6 +52,8 @@ pub mod output {
     pub const PONG: u8 = 0x88;
     /// JSON `{ok, id, path, recycled}` or `{ok: false, id, path, error}`
     pub const DELETED: u8 = 0x89;
+    /// JSON `{ok, id, port, hash, ticket, expires_ms}` or `{ok: false, id, error}`
+    pub const DIRECT: u8 = 0x8a;
     /// `[type][pad][u16 vgen][u16 w][u16 h]` then avcC
     pub const CONFIG: u8 = 0x90;
     /// `[type][key][u16 vgen][pad 4]` then AVCC

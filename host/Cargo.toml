@@ -20,6 +20,10 @@ path = "src/svc.rs"
 [dependencies]
 serde_json = "1"
 miniz_oxide = "0.8"
+# glow (src/glow): the viewer served straight over WebTransport, QUIC on UDP
+wtransport = { version = "0.7", default-features = false, features = ["ring", "self-signed", "quinn"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+ring = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

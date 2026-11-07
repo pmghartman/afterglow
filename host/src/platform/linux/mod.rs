@@ -703,6 +703,7 @@ impl Host for Linux {
         // the first damage after the last frame, and the input last timed
         let mut woke: Option<Instant> = None;
         let mut timed_input = 0u64;
+        let mut kbps = v.kbps;
         while !ctl.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
             // refinement once the screen has been still a moment, a frame a slot
@@ -827,6 +828,13 @@ impl Host for Linux {
                     bytes
                 }
                 Enc::Own(e, rate) => {
+                    // the bitrate the path takes now, from this frame on
+                    let k = ctl.kbps.load(Ordering::Relaxed);
+                    let k = if k == 0 { v.kbps } else { k.min(v.kbps) };
+                    if k != kbps {
+                        kbps = k;
+                        rate.retarget(k, v.fps);
+                    }
                     let [y, u, v] = yuv.planes();
                     let frame = crate::avc::Frame { y, u, v };
                     let (opts, act) = if refine {

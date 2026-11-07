@@ -25,7 +25,14 @@ pub struct Conf {
     /// folders a driver's delete may reach besides the user's own (profile, desktops,
     /// home): `delete_roots`, a list as PATH is (crate::desk::roots_of)
     pub delete_roots: Vec<String>,
+    /// glow (src/glow), the viewer served straight over QUIC: the address and UDP port
+    /// it binds once a driver asks for it (`phos_direct_bind`, all addresses by default;
+    /// `phos_direct_port`, 0 for the port the driver names, or any)
+    pub direct_bind: std::net::IpAddr,
+    pub direct_port: u16,
 }
+
+const ANY: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 impl Conf {
     /// for `--stdio`: no port, no token (whatever started us let the driver in)
@@ -41,6 +48,8 @@ impl Conf {
             xvfb: std::env::var("AFTERGLOW_XVFB").unwrap_or_default(),
             stdio: true,
             delete_roots: crate::desk::roots_of(&std::env::var("AFTERGLOW_DELETE_ROOTS").unwrap_or_default()),
+            direct_bind: std::env::var("AFTERGLOW_DIRECT_BIND").ok().and_then(|v| v.parse().ok()).unwrap_or(ANY),
+            direct_port: std::env::var("AFTERGLOW_DIRECT_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
 }
@@ -57,6 +66,8 @@ pub fn parse(text: &str) -> Result<Conf, String> {
         xvfb: String::new(),
         stdio: false,
         delete_roots: Vec::new(),
+        direct_bind: ANY,
+        direct_port: 0,
     };
     for line in text.lines() {
         let line = line.trim();
@@ -75,6 +86,12 @@ pub fn parse(text: &str) -> Result<Conf, String> {
             "encoder" => c.encoder = v.to_ascii_lowercase(),
             "xvfb" => c.xvfb = v.to_string(),
             "delete_roots" => c.delete_roots = crate::desk::roots_of(v),
+            "phos_direct_port" => {
+                c.direct_port = v.parse().map_err(|_| format!("phos_direct_port isn't a port: {v}"))?
+            }
+            "phos_direct_bind" if !v.is_empty() => {
+                c.direct_bind = v.parse().map_err(|_| format!("phos_direct_bind isn't an address: {v}"))?
+            }
             _ => {}
         }
     }
@@ -105,6 +122,18 @@ mod tests {
         assert!(c.primary);
         assert!(c.encoder.is_empty());
         assert!(c.delete_roots.is_empty());
+        assert_eq!((c.direct_bind, c.direct_port), (ANY, 0));
+    }
+
+    #[test]
+    fn glow_bound_where_asked() {
+        let c = parse("phos_link_port = 1\nphos_link_token = abababababababababab\nphos_direct_port = 47101\nphos_direct_bind = 100.64.0.7\n")
+            .unwrap();
+        assert_eq!(c.direct_port, 47101);
+        assert_eq!(c.direct_bind.to_string(), "100.64.0.7");
+        assert!(
+            parse("phos_link_port = 1\nphos_link_token = abababababababababab\nphos_direct_bind = nowhere\n").is_err()
+        );
     }
 
     #[test]
