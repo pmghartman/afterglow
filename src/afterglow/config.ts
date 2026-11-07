@@ -8,6 +8,9 @@ import type { LinkAddr } from "./link.ts";
 
 // the link's port on 127.0.0.1
 export const linkPort = 47100;
+// glow's UDP port (docs/glow.md): where a viewer comes straight to afterglow, through a
+// port forwarded to it from wherever the viewer is
+export const directPort = 47101;
 
 export type AfterglowPaths = { data: string; conf: string; apps: string; link: string; log: string };
 
@@ -20,12 +23,21 @@ export const pathsOf = (data: string): AfterglowPaths => ({
 });
 
 // the config: the link on, the log beside it, and an app's virtual display made the
-// primary one while it streams so its windows open there. The host (host/src/conf.rs)
-// reads these keys and ignores any others, so a config written for the C++ host still works
-export function confText(p: AfterglowPaths, port: number, token: string): string {
+// primary one while it streams so its windows open there; glow on its UDP port once a
+// driver asks for it, on every address unless `direct.bind` names one (the tailnet's,
+// say). The host (host/src/conf.rs) reads these keys and ignores any others, so a config
+// written for the C++ host still works
+export function confText(
+  p: AfterglowPaths,
+  port: number,
+  token: string,
+  direct: { port?: number; bind?: string } = {},
+): string {
   const kv: [string, string | number][] = [
     ["phos_link_port", port],
     ["phos_link_token", token],
+    ["phos_direct_port", direct.port ?? directPort],
+    ...(direct.bind ? ([["phos_direct_bind", direct.bind]] as [string, string][]) : []),
     ["log_path", p.log],
     ["min_log_level", "info"],
     ["dd_configuration_option", "ensure_primary"],

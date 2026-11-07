@@ -29,6 +29,9 @@ export const In = {
   end: 0x0e,
   // JSON {path, permanent, id}: answered by Out.deleted
   delete: 0x0f,
+  // JSON {port, id}: a ticket for the viewer to come straight to afterglow over glow
+  // (docs/glow.md), answered by Out.direct
+  direct: 0x10,
 } as const;
 
 export const Out = {
@@ -45,6 +48,8 @@ export const Out = {
   pong: 0x88,
   // JSON {ok, id, path, recycled} or {ok: false, id, path, error}
   deleted: 0x89,
+  // JSON {ok, id, port, hash, ticket, expires_ms} or {ok: false, id, error}
+  direct: 0x8a,
   config: 0x90,
   frame: 0x91,
   cursor: 0x92,
@@ -160,7 +165,14 @@ export type Ready = {
   running: boolean;
   // what the host's desktop can be asked: some of "processes", "attach", "delete"
   features?: string[];
+  // glow can be asked for: Link.direct
+  direct?: boolean;
 };
+
+// what a viewer needs to come straight to afterglow over glow (docs/glow.md): the UDP
+// port glow listens on (forward one to it from wherever the viewer is), its
+// certificate's SHA-256 (hex) to pin, and a ticket good for one session, for expiresMs
+export type DirectTicket = { port: number; hash: string; ticket: string; expiresMs: number };
 
 // one of the host user's processes: with the pid, `started` (ms since the epoch) says
 // which process it is, for an end or attach that mustn't reach another by that pid
@@ -190,7 +202,7 @@ export type EndOpts = {
 export type Ended = { how: "closed" | "terminated" | "killed"; gone: boolean };
 
 // the replies matched to their asks by id
-const replies = new Set<number>([Out.processes, Out.ended, Out.deleted]);
+const replies = new Set<number>([Out.processes, Out.ended, Out.deleted, Out.direct]);
 
 export type LinkEvents = {
   message(msg: Uint8Array): void;
@@ -376,6 +388,15 @@ export class Link {
   async delete(path: string, permanent = false, timeoutMs = 150_000): Promise<{ recycled: boolean }> {
     const j = await this.ask(In.delete, { path, permanent }, timeoutMs);
     return { recycled: j.recycled === true };
+  }
+
+  // a ticket for the viewer to come straight to afterglow over glow: frames and input
+  // then go between them over QUIC, and the link carries none while it's there. port:
+  // the UDP port glow binds when this starts it, where afterglow's config names none
+  // (0: any). Needs ready.direct
+  async direct(port = 0, timeoutMs = 10_000): Promise<DirectTicket> {
+    const j = await this.ask(In.direct, port ? { port } : {}, timeoutMs);
+    return { port: Number(j.port), hash: String(j.hash), ticket: String(j.ticket), expiresMs: Number(j.expires_ms) };
   }
 
   private flush() {

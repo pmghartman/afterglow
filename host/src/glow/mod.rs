@@ -593,6 +593,42 @@ async fn serve(sh: Arc<Shared>, incoming: IncomingSession) {
     }
 }
 
+/// one of the viewer's datagrams, or a control message of the same type (its body the
+/// datagram after its first byte): a browser sends datagrams late, so it sends these on
+/// the stream
+fn on_up(v: &Viewer, moved: &mut Option<u16>, d: &[u8], stream: bool) {
+    match d.first().copied() {
+        Some(up::NACK) if d.len() >= 4 => {
+            let seq = u16::from_le_bytes([d[2], d[3]]);
+            let idx: Vec<u16> = d[4..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            v.resend(seq, d[1] & 1 == 1, &idx);
+        }
+        Some(up::KEY) => v.want_key(),
+        Some(up::REPORT) if d.len() >= 4 => {
+            let l = u16::from_le_bytes([d[2], d[3]]).min(1000) as u32;
+            let old = v.loss.load(Ordering::Relaxed);
+            v.loss.store((old * 3 + l).div_ceil(4), Ordering::Relaxed);
+        }
+        Some(up::MOVE) if d.len() > 4 => {
+            let seq = u16::from_le_bytes([d[2], d[3]]);
+            if moved.is_none_or(|m| newer(seq, m)) {
+                *moved = Some(seq);
+                (v.events)(Event::Input(d[4..].to_vec()));
+            }
+        }
+        Some(up::PING) if d.len() >= 6 => {
+            let mut p = vec![fec::PONG, 0];
+            p.extend_from_slice(&d[2..6]);
+            if stream {
+                let _ = v.ctl.send(wire::message(msg_out::PONG, &d[2..6]));
+            } else {
+                v.datagram(&p);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// the viewer's datagrams and control stream, until it goes; why it went
 async fn run(v: &Arc<Viewer>, conn: &Connection, ctl_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> String {
     let mut moved: Option<u16> = None;
@@ -602,41 +638,11 @@ async fn run(v: &Arc<Viewer>, conn: &Connection, ctl_rx: &mut mpsc::UnboundedRec
     let mut buf = vec![0u8; 64 << 10];
     // control messages wait here until the viewer has opened the stream
     let mut held: VecDeque<Vec<u8>> = VecDeque::new();
-    let on_move = |moved: &mut Option<u16>, b: &[u8]| {
-        if b.len() < 2 {
-            return;
-        }
-        let seq = u16::from_le_bytes([b[0], b[1]]);
-        if moved.is_none_or(|m| newer(seq, m)) {
-            *moved = Some(seq);
-            (v.events)(Event::Input(b[2..].to_vec()));
-        }
-    };
     loop {
         tokio::select! {
             d = conn.receive_datagram() => {
                 let Ok(d) = d else { return "closed".into() };
-                let d: &[u8] = &d;
-                match d.first().copied() {
-                    Some(up::NACK) if d.len() >= 4 => {
-                        let seq = u16::from_le_bytes([d[2], d[3]]);
-                        let idx: Vec<u16> = d[4..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                        v.resend(seq, d[1] & 1 == 1, &idx);
-                    }
-                    Some(up::KEY) => v.want_key(),
-                    Some(up::REPORT) if d.len() >= 4 => {
-                        let l = u16::from_le_bytes([d[2], d[3]]).min(1000) as u32;
-                        let old = v.loss.load(Ordering::Relaxed);
-                        v.loss.store((old * 3 + l).div_ceil(4), Ordering::Relaxed);
-                    }
-                    Some(up::MOVE) if d.len() > 4 => on_move(&mut moved, &d[2..]),
-                    Some(up::PING) if d.len() >= 6 => {
-                        let mut p = vec![fec::PONG, 0];
-                        p.extend_from_slice(&d[2..6]);
-                        v.datagram(&p);
-                    }
-                    _ => {}
-                }
+                on_up(v, &mut moved, &d, false);
             }
             s = conn.accept_bi(), if recv.is_none() => {
                 let Ok((s, r)) = s else { return "closed".into() };
@@ -665,7 +671,12 @@ async fn run(v: &Arc<Viewer>, conn: &Connection, ctl_rx: &mut mpsc::UnboundedRec
                         msg_in::PING => {
                             let _ = v.ctl.send(wire::message(msg_out::PONG, &body));
                         }
-                        up::MOVE => on_move(&mut moved, &body),
+                        up::NACK | up::KEY | up::REPORT | up::MOVE | up::PING => {
+                            let mut d = Vec::with_capacity(1 + body.len());
+                            d.push(ty);
+                            d.extend_from_slice(&body);
+                            on_up(v, &mut moved, &d, true);
+                        }
                         _ => {}
                     }
                 }

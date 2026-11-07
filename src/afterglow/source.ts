@@ -6,7 +6,18 @@
 
 import type { Opened, Sink, Source, Video, VideoSink } from "../source.ts";
 import { InputPacker } from "./input.ts";
-import { configOf, cursorOf, frameOf, In, jsonOf, Link, type LinkAddr, Out, type Transport } from "./link.ts";
+import {
+  configOf,
+  cursorOf,
+  type DirectTicket,
+  frameOf,
+  In,
+  jsonOf,
+  Link,
+  type LinkAddr,
+  Out,
+  type Transport,
+} from "./link.ts";
 
 export type AfterglowTarget = {
   // where afterglow listens (its link file), or a stream to an `afterglow --stdio`
@@ -181,6 +192,9 @@ export class AfterglowSource implements Source {
         if (j.t === "title") return this.sink?.meta({ t: "title", s: String(j.s ?? "") || this.name });
         if (j.t === "windows") return this.sink?.meta({ t: "windows", list: j.list, main: j.main });
         if (j.t === "clip") return this.sink?.say({ t: "clip", s: String(j.s ?? "") });
+        // a glow viewer came ({on: true, from}) or went ({on: false, why}): while it's
+        // there the frames go to it, not over the link
+        if (j.t === "direct") return this.sink?.say({ ...j, t: "direct" });
         return;
       }
       case Out.exited: {
@@ -213,6 +227,19 @@ export class AfterglowSource implements Source {
 
   keyframe() {
     this.link?.send(In.idr);
+  }
+
+  // whether the host can be asked for glow: the viewer straight to afterglow over QUIC
+  get canDirect(): boolean {
+    return this.link?.ready?.direct === true;
+  }
+
+  // a ticket for the viewer to come straight to afterglow (docs/glow.md), with the
+  // features its input should know of (GlowOptions.features)
+  async direct(port = 0): Promise<DirectTicket & { features: string[] }> {
+    if (!this.link?.alive) throw new Error("afterglow isn't open");
+    if (!this.canDirect) throw new Error("this afterglow has no glow");
+    return { ...(await this.link.direct(port)), features: [...this.features] };
   }
 
   input(m: unknown[], w: number, h: number) {

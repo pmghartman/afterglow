@@ -2,9 +2,9 @@
 
 One TCP connection on `127.0.0.1`, from the driver (`src/afterglow/link.ts`) to afterglow (`host/src/link.rs`). The framing is `host/src/wire.rs`, tested with it; `host/tests/link.rs` serves the link on a real socket.
 
-afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token. It serves nothing else and captures no audio.
+afterglow serves the link on the port its config's `phos_link_port` names, with `phos_link_token` as the token, and captures no audio. Asked for it on the link, it also serves its viewer straight over [glow](glow.md): the frames and input over WebTransport on a UDP port (`phos_direct_port`), the link staying the driver's.
 
-Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version> proto=<n>` and what it serves (`stdio argv notes clipboard raise close cursor processes delete`, and `icons` and `attach` on Windows), for a driver probing a host.
+Or `afterglow --stdio` serves one driver on its stdin and stdout, the same messages either way: what Phosphorus runs over ssh, as the viewer's login on a Linux host. There's no port and no token (ssh let the driver in; any `hello` is taken); stdout carries nothing but the link, the log goes to stderr (warnings and worse, or `AFTERGLOW_LOG`'s level) or `AFTERGLOW_LOG_FILE`. When stdin closes, or on SIGTERM, the app is ended and afterglow exits. `afterglow --features` prints `afterglow <version> proto=<n>` and what it serves (`stdio argv notes clipboard raise close cursor processes delete direct`, and `icons` and `attach` on Windows), for a driver probing a host. Over `--stdio`, glow binds `AFTERGLOW_DIRECT_BIND` and `AFTERGLOW_DIRECT_PORT` when they're set.
 
 ## Protocol number
 
@@ -37,20 +37,22 @@ A length outside that range breaks the link. One driver at a time: a new connect
 | `0x0d` | `attach` | JSON `{pid, started, shell, name, w, h, fps, dpi, scale, virtual_display}`: a process already running taken as the app, nothing started; answered by `launched` |
 | `0x0e` | `end` | JSON `{pid, started, kill, shell, wait_ms, id}`: one of the user's processes asked to close, or killed; answered by `ended` |
 | `0x0f` | `delete` | JSON `{path, permanent, id}`: a file or folder in the user's folders deleted, to the Recycle Bin (Linux: the trash) unless `permanent`; answered by `deleted` |
+| `0x10` | `direct` | JSON `{port, id}`: a ticket for the viewer to come straight to afterglow over [glow](glow.md), glow started first if it isn't (on `port` when the config names none, else any); answered by `direct` |
 
 ## afterglow to driver
 
 | Type | Name | Body |
 | --- | --- | --- |
-| `0x81` | `ready` | JSON `{version, proto, virtual_display, hostname, running, features}`, after a good `hello`. `features`: what the host's desktop can be asked, some of `processes`, `attach`, `delete` |
+| `0x81` | `ready` | JSON `{version, proto, virtual_display, hostname, running, features, direct}`, after a good `hello`. `features`: what the host's desktop can be asked, some of `processes`, `attach`, `delete`; `direct`: glow can be asked for |
 | `0x82` | `launched` | JSON `{ok, resumed, attached, ms, features}` or `{ok: false, attached, error, code}`, for a `launch` or an `attach` (`attached: true`). `features`: what this app can be asked besides input, some of `notes`, `clipboard`, `raise`, `close`, then what the desktop can (as `ready`'s) |
 | `0x83` | `exited` | JSON `{code, log, error}`, any of them: the app is gone, its exit code, the last of what it wrote, why when it never showed a window |
 | `0x84` | `video_ended` | JSON `{gen, why}`: the capture stopped by itself |
-| `0x85` | `note` | JSON: `{t: "title", s}` the main window's title, `{t: "windows", list: [[id, title]], main}` the app's windows, `{t: "clip", s}` what the app copied. Each as it changes, and all again when a driver comes |
+| `0x85` | `note` | JSON: `{t: "title", s}` the main window's title, `{t: "windows", list: [[id, title]], main}` the app's windows, `{t: "clip", s}` what the app copied. Each as it changes, and all again when a driver comes. And `{t: "direct", on: true, from}` when a glow viewer comes, `{t: "direct", on: false, why}` when it goes: while one's there, the video's frames and pointer shapes go to it, not over the link |
 | `0x86` | `processes` | JSON `{ok, id, list}` or `{ok: false, id, error}` |
 | `0x87` | `ended` | JSON `{ok, id, pid, how, gone}` or `{ok: false, id, pid, error}` |
 | `0x88` | `pong` | `u32` |
 | `0x89` | `deleted` | JSON `{ok, id, path, recycled}` or `{ok: false, id, path, error}` |
+| `0x8a` | `direct` | JSON `{ok, id, port, hash, ticket, expires_ms}` or `{ok: false, id, error}`: glow's UDP port, its certificate's SHA-256 (hex) for the viewer to pin, and a ticket good for one session |
 | `0x90` | `config` | `[pad][u16 gen][u16 w][u16 h]` then the avcC record |
 | `0x91` | `frame` | `[u8 key][u16 gen][pad 4]` then the frame as AVCC |
 | `0x92` | `cursor` | `[u8 visible][u16 hot x][u16 hot y][u16 w][u16 h]` then the pointer's shape as a PNG (straight-alpha RGBA), nothing when hidden |
@@ -157,4 +159,4 @@ Only what's within the user's folders: on Windows their profile, their Desktop (
 
 ## Security
 
-The link listens on loopback only. The token (16 characters or more; `phos_link_token`) is, as Phosphorus writes it, 48 hex characters from a CSPRNG, written by the installer into a folder only SYSTEM and Administrators can read. Anyone holding it can launch apps and type into the console's session, end the console user's processes and delete their files, so treat it as a credential.
+The link listens on loopback only. Glow listens on UDP on every address (or `phos_direct_bind`'s), but a session needs a ticket only a driver holding the token can get, single-use and alive for a minute; its viewer has the driver's rights over the app's video and input and nothing on the desktop, and goes when the driver does. The token (16 characters or more; `phos_link_token`) is, as Phosphorus writes it, 48 hex characters from a CSPRNG, written by the installer into a folder only SYSTEM and Administrators can read. Anyone holding it can launch apps and type into the console's session, end the console user's processes and delete their files, so treat it as a credential.

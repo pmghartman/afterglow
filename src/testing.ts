@@ -26,6 +26,8 @@ export class FakeAfterglow {
   private sock?: { write(b: Uint8Array): number };
   // the token the client said first
   hello = "";
+  // fields of its ready besides the stand-in's own: { direct: true } says it has glow
+  readyExtra: Record<string, unknown> = {};
 
   constructor(
     readonly token: string,
@@ -55,7 +57,15 @@ export class FakeAfterglow {
       this.hello = new TextDecoder().decode(body);
       // a wrong token gets no answer, as afterglow gives none
       if (this.hello !== this.token) return;
-      this.send(jsonMessage(Out.ready, { version: "test", virtual_display: true, hostname: "box", running: false }));
+      this.send(
+        jsonMessage(Out.ready, {
+          version: "test",
+          virtual_display: true,
+          hostname: "box",
+          running: false,
+          ...this.readyExtra,
+        }),
+      );
       return;
     }
     this.onMsg(this, type, body);

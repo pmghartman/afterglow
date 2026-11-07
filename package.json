@@ -1,7 +1,7 @@
 {
   "name": "@phosphorus/afterglow",
   "version": "0.0.0",
-  "description": "Native apps streamed as low-latency H.264: afterglow, a Rust host for Windows and Linux driven over one loopback link, and its client",
+  "description": "Native apps streamed as low-latency H.264: afterglow, a Rust host for Windows and Linux driven over one loopback link and serving its viewer straight over QUIC (glow), and its client",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
@@ -17,6 +17,7 @@
   },
   "exports": {
     ".": "./src/index.ts",
+    "./glow": "./src/glow/index.ts",
     "./testing": "./src/testing.ts"
   },
   "scripts": {

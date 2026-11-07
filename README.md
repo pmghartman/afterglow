@@ -1,7 +1,8 @@
 <h1 align="center">afterglow</h1>
 
 <p align="center">
-  Native apps streamed as low-latency H.264, driven over one loopback socket.<br>
+  Native apps streamed as low-latency H.264, driven over one loopback socket<br>
+  and served to the viewer straight over QUIC.<br>
   A Rust host for Windows and Linux, and the TypeScript client that drives it.
 </p>
 
@@ -13,6 +14,7 @@
 <p align="center">
   <a href="#whats-here">What's here</a> ·
   <a href="#the-protocol">The protocol</a> ·
+  <a href="#glow-straight-to-the-viewer">glow</a> ·
   <a href="#using-the-client">Using the client</a> ·
   <a href="#the-host">The host</a> ·
   <a href="#development">Development</a> ·
@@ -30,8 +32,10 @@ afterglow is how [Phosphorus](https://github.com/pmghartman/phosphorus) streams 
 | --- | --- | --- |
 | [`host/`](host) | **afterglow**, the host, in Rust. It launches one app at a time, captures and encodes its display as H.264, and injects the viewer's input. Its own H.264 encoder ([`host/src/avc`](host/src/avc)) codes only the macroblocks that changed, so a frame costs what changed in it, not its size. On Windows: DXGI capture reading back only its dirty rectangles (or Media Foundation's encoders, asked for), SendInput, a SudoVDA virtual display per app, and the `afterglowsvc.exe` service. On Linux: an Xvfb per app (or the session's display), its framebuffer read in place where XDamage says it changed (or OpenH264, asked for), XTest. | GPL-3.0-only |
 | [`src/afterglow/`](src/afterglow) | `AfterglowSource`, the client: launch an app, get its frames already shaped as AVCC, send input back. Also the config, link file, service line and systemd unit an installer writes. | Apache-2.0 |
+| [`src/glow/`](src/glow) | `GlowViewer`, the viewer's end of glow for a page or its worker: frames straight from the host over WebTransport, put back together through loss, input back ([`@phosphorus/afterglow/glow`](src/glow/index.ts)). | Apache-2.0 |
 | [`src/source.ts`](src/source.ts) | The contract a source keeps with whatever drives it. | Apache-2.0 |
 | [`docs/protocol.md`](docs/protocol.md) | The link's wire format. | |
+| [`docs/glow.md`](docs/glow.md) | glow's: units of datagrams with parity, what the viewer asks for, the control stream. | |
 
 ## The protocol
 
@@ -58,6 +62,26 @@ Measured on Linux (Xvfb, xterm, 120 fps at 20 Mb/s as Phosphorus asks, 4 cores; 
 Of a typed key's 0.9 ms, about 80 µs is afterglow's: the rest is xterm, its shell and Xvfb drawing the glyph. Encoding alone: a glyph 10 µs at 720p and 12 µs at 1080p; a terminal flipped to reverse video 1.0 ms and 1.7 ms.
 
 Windows hasn't been measured on GPU hardware yet.
+
+## glow: straight to the viewer
+
+The link's frames used to reach a browser through the driver: loopback TCP, then a WebSocket, then often a second WebSocket between two drivers. That's three TCP connections, two JavaScript relays, and on the internet one lost packet stalled every frame and keypress behind it. With [glow](docs/glow.md) afterglow serves the viewer itself over WebTransport (QUIC on UDP), with the driver keeping the link for everything else:
+
+- **One hop:** the browser's QUIC connection ends in afterglow. The video thread hands each datagram straight to QUIC.
+- **Datagrams, not a stream:** a lost packet holds up nothing that doesn't need it.
+- **Parity on every frame:** a typed glyph is one datagram and its copy, and a keyframe carries one parity piece in sixteen, more as the viewer reports loss. Most losses are rebuilt where they land, with no round trip. The rest are asked for at once and sent again from the frames afterglow keeps. Only a frame that can't be had at all costs a keyframe.
+- **BBR, and a bitrate that follows the path:** short queues, and the encoder retargeted at the next frame when the path takes less, not a restart at a keyframe.
+- **Pinned, ticketed:** a self-signed certificate the page pins by its hash (no CA, no name), and a one-time ticket from the link as the session's path.
+
+Chromium against afterglow on Linux, xterm at 1280x720, from the page's key to its echo decoded by WebCodecs (`test/e2e/glow.test.ts`, `GLOW_KEYS=40`, loopback; over a network, add the round trip):
+
+| | median | max |
+| --- | --- | --- |
+| no loss | 2.4 ms | 4.7 ms |
+| 10% of the frames' datagrams dropped | 2.5 ms | 6.6 ms |
+| 25% dropped | 2.3 ms | 8.7 ms |
+
+It connects in 6 to 10 ms, with the first frame decoded 8 to 13 ms after the page started. On Windows and Linux alike glow is the same code (quinn, its own runtime thread).
 
 ## Using the client
 
@@ -95,6 +119,32 @@ src.quit();
 ```
 
 On Linux the target is a program's path (`/usr/bin/gedit`), or `argv` the program and its arguments; with `virtualDisplay` it runs on an Xvfb of its own, otherwise on the session's `$DISPLAY`.
+
+Straight to the viewer over [glow](docs/glow.md): the driver asks for a ticket and hands it to its page, which reaches afterglow's UDP port (or one forwarded to it, a hub's public port, say):
+
+```ts
+// the driver
+const t = await src.direct(); // { port, hash, ticket, expiresMs, features }; src.canDirect says whether the host has glow
+sendToPage({ url: `https://hub.example.com:${forwardedPort}`, hash: t.hash, ticket: t.ticket, features: t.features });
+
+// the page, or its worker
+import { codecOf, GlowViewer } from "@phosphorus/afterglow/glow";
+const ticket = await fromDriver(); // { url, hash, ticket, features }
+const viewer = new GlowViewer(
+  {
+    config: (avcc, w, h) => decoder.configure({ codec: codecOf(avcc), description: avcc, codedWidth: w, codedHeight: h, optimizeForLatency: true }),
+    frame: (key, msg) => decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: n++, data: msg.subarray(8) })),
+    cursor: (c) => {}, // the pointer's shape, as the link's
+    closed: (why) => {}, // fall back to the link's frames
+  },
+  { features: ticket.features },
+);
+await viewer.connect(ticket); // { url, hash, ticket }
+viewer.input(["k", true, "KeyA", "a", false], 1280, 720); // the link's input messages
+// decoder error: viewer.keyframe()
+```
+
+While a viewer is connected, the frames go to it and not over the link. The driver hears `{t: "direct", on}` through `sink.say` and the video goes on over the link when the viewer leaves. `GlowViewer.supported()` says whether the browser has WebTransport.
 
 Or drive `afterglow --stdio` over any byte stream, ssh's as the viewer's login say: no port, no token, the app ended when the stream closes.
 
@@ -156,7 +206,8 @@ To install it, an app (Phosphorus's is [`packages/host/host/src/win/afterglow.ts
 
 1. writes `afterglow.conf` and `link.json` with `confText` and `linkText` into a folder only SYSTEM and Administrators can read (whoever reads the token can type into the console's session);
 2. installs SudoVDA with `drivers\sudovda\install.bat` unless the machine already has it;
-3. creates a service running `tools\afterglowsvc.exe "<path to afterglow.conf>"` (`svcBinPath`).
+3. creates a service running `tools\afterglowsvc.exe "<path to afterglow.conf>"` (`svcBinPath`);
+4. for glow, lets UDP in on `directPort` (47101, `phos_direct_port`) to `afterglow.exe` through the firewall, from wherever viewers come (the hub's tailnet address, say).
 
 `afterglow-X.Y-linux-x86_64.tar.gz` and `afterglow-X.Y-linux-aarch64.tar.gz` hold `afterglow` and the same text files. It needs glibc 2.36 or later, X11 and, for apps on displays of their own, `Xvfb` (Debian and Ubuntu: `xvfb`). To install it, an app:
 
@@ -165,7 +216,7 @@ To install it, an app (Phosphorus's is [`packages/host/host/src/win/afterglow.ts
 
 It needs no desktop session: each app gets an Xvfb that only afterglow and the app hold the cookie for, and a window manager inside afterglow keeps the app's windows filling it.
 
-afterglow then listens on `127.0.0.1:47100` (`linkPort`) and nowhere else. The token is a credential: whoever holds it can launch apps and type into them. See [`host/README.md`](host/README.md) for how the host is built and laid out.
+afterglow then listens on `127.0.0.1:47100` (`linkPort`), and once a driver asks for glow on UDP `47101` (`directPort`; every address unless `phos_direct_bind` names one), where only a viewer with a ticket from the link gets a session. The token is a credential: whoever holds it can launch apps and type into them. See [`host/README.md`](host/README.md) for how the host is built and laid out.
 
 Verify a download:
 
@@ -193,15 +244,15 @@ bun run test:host && bun run test:e2e
 bun run bench
 ```
 
-- `bun test` runs the client's tests anywhere: the input packets and key mapping, the link's framing, `AfterglowSource` against `FakeAfterglow`, and the installer's files.
-- `test:host` runs the host's tests: framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, the desktop's rules (which processes are never ended, which paths may be deleted) and on Linux its processes, windows on a real Xvfb, the trash, capture's colour conversion, and the encoder: its streams decoded by `ffmpeg` (where it's installed) to exactly the pictures it reconstructed, keyframes, skips, slices, cropping, refinement and every qp.
+- `bun test` runs the client's tests anywhere: glow's pieces and receiver through loss against a stand-in host, the input packets and key mapping, the link's framing, `AfterglowSource` against `FakeAfterglow`, and the installer's files.
+- `test:host` runs the host's tests: glow on loopback with a WebTransport client (a quarter of the datagrams dropped and every unit put back, input as datagrams and on the control stream, a ticket good once, the video back on the link when the viewer goes), framing and frame shaping, input decoding and key repeat, the link on a real socket against a stand-in platform, the desktop's rules (which processes are never ended, which paths may be deleted) and on Linux its processes, windows on a real Xvfb, the trash, capture's colour conversion, and the encoder: its streams decoded by `ffmpeg` (where it's installed) to exactly the pictures it reconstructed, keyframes, skips, slices, cropping, refinement and every qp.
 - `test:e2e` builds the host and runs it for real (needs `Xvfb`, `xterm` and `ffmpeg`). `AfterglowSource` launches xterm on an Xvfb of the host's own and checks that:
   - it fills the display, and ffmpeg decodes the stream;
   - a typed command runs; the pointer's shape comes as a PNG and is never in the frames;
   - after a resize the display follows;
   - quit closes it.
 
-  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display. Over `--stdio`: an app by its argv, its title and windows as notes, the viewer's clipboard pasted by its own paste, a polite close, an app that dies before a window with its code and output; the desktop's processes listed, one asked to end and one killed, afterglow itself refused, a file trashed and one deleted for good, one outside the home refused.
+  Then the pointer drawn in where it moved and nowhere else, and xterm on the session's own display. Over glow, where Playwright's Chromium is at hand: the page connects straight to afterglow, decodes with WebCodecs, and times keys to their echoes, again with a tenth and a quarter of the datagrams dropped. Over `--stdio`: an app by its argv, its title and windows as notes, the viewer's clipboard pasted by its own paste, a polite close, an app that dies before a window with its code and output; the desktop's processes listed, one asked to end and one killed, afterglow itself refused, a file trashed and one deleted for good, one outside the home refused.
 - `bench` builds the host and times input to frame: a key echoed and a key that flips the whole screen, at 720p and 1080p, and open to first frame. With `BENCH_LOG=debug BENCH_KEEP=1` the host's log says where each frame's time went and how long from an input to the app's drawing and to its frame.
 
 The Windows host builds on Windows with `cargo build --release`, or from Linux with mingw-w64 installed (`cargo build --target x86_64-pc-windows-gnu`). A release build, staged as the archive lays it out:
@@ -210,7 +261,7 @@ The Windows host builds on Windows with `cargo build --release`, or from Linux w
 host/scripts/stage.sh "$PWD/afterglow-out" 0.0.0
 ```
 
-Format with `bun run fmt` and `cargo fmt --manifest-path host/Cargo.toml`. A change to the link's wire format touches both ends (`host/src/wire.rs`, `host/src/link.rs`, `host/src/input.rs` and `src/afterglow/`) and `docs/protocol.md`.
+Format with `bun run fmt` and `cargo fmt --manifest-path host/Cargo.toml`. A change to the link's wire format touches both ends (`host/src/wire.rs`, `host/src/link.rs`, `host/src/input.rs` and `src/afterglow/`) and `docs/protocol.md`; one to glow's, `host/src/glow/`, `src/glow/` and `docs/glow.md`.
 
 ## Releases
 

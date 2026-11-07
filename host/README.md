@@ -11,13 +11,15 @@ The streaming host, in Rust, for Windows and Linux: one app at a time launched, 
 | `src/convert.rs` | BGRX to I420 with AVX2, only what changed, big rectangles across cores; scaled for a display of another size |
 | `src/h264.rs` | Annex B split, the avcC record, every SPS rewritten so nothing is held back for reordering |
 | `src/png.rs` | the pointer's shape as a PNG |
-| `src/link.rs` | the link: the token, one driver at a time, launch, videos and their generations, input, the app's exit |
+| `src/link.rs` | the link: the token, one driver at a time, launch, videos and their generations, input, the app's exit; a video's frames to the glow viewer while one's connected |
+| `src/glow/` | glow, the viewer served straight over WebTransport (wtransport on quinn, BBR, a tokio runtime of its own): tickets and a self-signed certificate pinned by its hash, units cut into datagrams with stride-XOR parity (`fec.rs`), pieces sent again when asked, the encoder's bitrate kept to what the path takes, input back |
 | `src/input.rs` | input packets into events; held keys repeated, everything let go when a video stops |
 | `src/conf.rs` | `afterglow.conf` (`key = value`); unknown keys ignored, so a config written for the C++ host works |
 | `src/host.rs` | what the link asks of a platform |
 | `src/platform/windows/` | DXGI desktop duplication with the pointer as shapes or drawn in, its dirty rectangles mirrored into memory the CPU reads (`capture.rs`), the D3D11 video processor and Media Foundation's H.264 encoder, asked for (`encode.rs`), SendInput (`input.rs`), the app in a job in the console user's session (`process.rs`), SudoVDA (`vdisplay.rs`), the app's windows kept to its display (`wm.rs`), display modes and the primary display (`display.rs`), and the service (`svc.rs`) |
 | `src/platform/linux/` | an Xvfb per app with its cookie, its framebuffer on `/dev/shm` and RandR resizing (`xserver.rs`); the window manager that keeps the app's windows filling it, its titles, windows, close and clipboard (`wm.rs`); XDamage rectangles read in place from that framebuffer or with MIT-SHM, the pointer from XFixes (`capture.rs`); OpenH264 through its C API, asked for (`encode.rs`); XTest, a spare Xvfb and the app as a process group (`mod.rs`) |
 | `tests/link.rs` | the link on a real socket against a stand-in platform |
+| `tests/glow.rs` | glow on loopback with a WebTransport client through a quarter of the datagrams lost |
 
 ## On Windows
 

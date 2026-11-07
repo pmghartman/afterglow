@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
   appsText,
   confText,
+  directPort,
   driverVer,
   linkPort,
   linkText,
@@ -32,6 +33,12 @@ test("the config: the link on, its log, the virtual display primary", () => {
   expect(kv.phos_link_token).toBe("ab".repeat(24));
   expect(kv.log_path).toBe(p.log);
   expect(kv.dd_configuration_option).toBe("ensure_primary");
+  // glow on its port, on every address
+  expect(kv.phos_direct_port).toBe(String(directPort));
+  expect(kv.phos_direct_bind).toBeUndefined();
+  const bound = confText(p, linkPort, "ab".repeat(24), { port: 50_000, bind: "100.64.0.7" });
+  expect(bound).toContain("phos_direct_port = 50000\r\n");
+  expect(bound).toContain("phos_direct_bind = 100.64.0.7\r\n");
   expect(JSON.parse(appsText())).toEqual({ env: {}, apps: [] });
   expect(svcBinPath("C:\\h\\afterglow", "C:\\d\\afterglow.conf")).toBe(
     `"${join("C:\\h\\afterglow", "tools", "afterglowsvc.exe")}" "C:\\d\\afterglow.conf"`,
